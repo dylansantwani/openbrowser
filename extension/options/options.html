@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OpenBrowser Settings</title>
+    <link rel="stylesheet" href="../sidepanel/panel.css" />
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body class="options">
+    <div class="wrap">
+      <header class="page-head">
+        <div class="brand">
+          <span class="logo" aria-hidden="true"></span>
+          <h1>OpenBrowser</h1>
+        </div>
+        <p class="muted">
+          Open-source browser automation for AI agents. Everything the extension
+          can do is also available over MCP.
+        </p>
+      </header>
+
+      <!-- ── Getting started ───────────────────────────────────────────── -->
+      <section class="panel" id="setup">
+        <div class="panel-head"><h2>Getting started</h2></div>
+
+        <ol class="steps">
+          <li>
+            <strong>Start the MCP server.</strong> Point your MCP client at it, or
+            run it yourself from the project directory:
+            <code class="snippet">node mcp-server/src/index.js</code>
+          </li>
+          <li>
+            <strong>Check the connection.</strong> The badge on the toolbar icon
+            clears when the extension is connected. Current status:
+            <span id="live-status" class="status status--disconnected">
+              <span class="status-dot"></span><span id="live-status-text">checking…</span>
+            </span>
+          </li>
+          <li>
+            <strong>Try it.</strong> Open the side panel (toolbar icon, or
+            <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>U</kbd>) and hit
+            <em>Snapshot page</em>.
+          </li>
+        </ol>
+      </section>
+
+      <!-- ── Connection ────────────────────────────────────────────────── -->
+      <section class="panel">
+        <div class="panel-head"><h2>Connection</h2></div>
+
+        <label class="field">
+          <span>Hub port</span>
+          <input type="number" id="port" min="1024" max="65535" />
+          <small class="muted">
+            Must match the MCP server. Change it with <code>--port</code> or the
+            <code>OPENBROWSER_PORT</code> environment variable.
+          </small>
+        </label>
+
+        <label class="check">
+          <input type="checkbox" id="autoConnect" />
+          <span>
+            <strong>Connect automatically</strong>
+            <small class="muted">Reconnect on browser start and after the service worker restarts.</small>
+          </span>
+        </label>
+      </section>
+
+      <!-- ── Automation ────────────────────────────────────────────────── -->
+      <section class="panel">
+        <div class="panel-head"><h2>Automation</h2></div>
+
+        <label class="check">
+          <input type="checkbox" id="useDebugger" />
+          <span>
+            <strong>Use trusted input events</strong>
+            <small class="muted">
+              Attaches Chrome's debugger so clicks and keystrokes are
+              indistinguishable from a real user's. Required for payment forms,
+              login pages, and most drag-and-drop. Chrome shows a "being
+              debugged" banner while it is attached. Turning this off will make
+              many sites silently ignore the agent.
+            </small>
+          </span>
+        </label>
+
+        <label class="check">
+          <input type="checkbox" id="highlightActions" />
+          <span>
+            <strong>Highlight elements as they are used</strong>
+            <small class="muted">Draws a brief outline so you can follow along.</small>
+          </span>
+        </label>
+
+        <label class="check">
+          <input type="checkbox" id="captureBodies" />
+          <span>
+            <strong>Capture request and response bodies</strong>
+            <small class="muted">
+              Useful for debugging APIs. Off by default — bodies are large and
+              often contain credentials or personal data.
+            </small>
+          </span>
+        </label>
+
+        <label class="field">
+          <span>Snapshot size budget (characters)</span>
+          <input type="number" id="maxSnapshotChars" min="1000" max="200000" step="1000" />
+          <small class="muted">Larger reads cost proportionally more tokens. 20,000 suits most pages.</small>
+        </label>
+      </section>
+
+      <!-- ── Site access ───────────────────────────────────────────────── -->
+      <section class="panel">
+        <div class="panel-head"><h2>Site access</h2></div>
+
+        <label class="field">
+          <span>Blocklist</span>
+          <textarea id="blocklist" rows="4" spellcheck="false" placeholder="one hostname per line"></textarea>
+          <small class="muted">
+            Never automate these. Subdomains are included, so
+            <code>example.com</code> also covers <code>app.example.com</code>.
+            Pre-seeded with identity providers, where an automation mistake is
+            expensive to undo.
+          </small>
+        </label>
+
+        <label class="field">
+          <span>Allowlist</span>
+          <textarea id="allowlist" rows="4" spellcheck="false" placeholder="leave empty to allow all sites"></textarea>
+          <small class="muted">
+            If this has any entries, <em>only</em> these sites can be automated.
+            Empty means every site is allowed (minus the blocklist).
+          </small>
+        </label>
+      </section>
+
+      <div class="actions">
+        <button class="btn btn--primary" id="save" type="button">Save changes</button>
+        <button class="btn btn--ghost" id="reset" type="button">Reset to defaults</button>
+        <span class="saved" id="saved" hidden>Saved</span>
+      </div>
+
+      <footer class="page-foot muted">
+        <span id="version"></span> · MIT licensed · Fully local — nothing leaves
+        your machine except the pages you ask it to visit.
+      </footer>
+    </div>
+
+    <script src="options.js" type="module"></script>
+  </body>
+</html>

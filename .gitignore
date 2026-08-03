@@ -1,0 +1,25 @@
+# ─── Dependencies / build artifacts ───────────────────────────
+# This project has zero runtime dependencies by design, but tooling
+# may still create these locally.
+node_modules/
+dist/
+
+# ─── Logs / temp ──────────────────────────────────────────────
+*.log
+*.tmp
+.playwright-mcp/
+
+# ─── Secrets / environment ────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# ─── Local editor / agent settings ────────────────────────────
+.claude/settings.local.json
+
+# ─── OS / editor junk ─────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini

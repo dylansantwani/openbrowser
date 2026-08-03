@@ -1,0 +1,400 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>OpenBrowser — accessibility tree tests</title>
+    <style>
+      body { font: 13px ui-monospace, monospace; margin: 0; display: flex; height: 100vh; }
+      #fixture { width: 40%; padding: 16px; overflow: auto; border-right: 1px solid #ccc; font-family: system-ui, sans-serif; }
+      #results { width: 60%; padding: 16px; overflow: auto; background: #fbfbfc; }
+      .pass { color: #15803d; }
+      .fail { color: #b91c1c; font-weight: 600; }
+      pre { background: #fff; border: 1px solid #e3e6ea; padding: 10px; white-space: pre-wrap; }
+      .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+    </style>
+  </head>
+  <body>
+    <!--
+      Fixture: a deliberately awkward page. Every construct here is one that
+      naive accessibility-tree extraction gets wrong, and each is asserted below.
+    -->
+    <div id="fixture">
+      <header>
+        <nav aria-label="Main">
+          <a href="/">Home</a>
+          <a href="/pricing">Pricing</a>
+        </nav>
+      </header>
+
+      <main>
+        <h1>Create your account</h1>
+
+        <!-- Wrapper soup: five nested divs carrying no meaning. -->
+        <div><div><div class="card"><div class="card-body"><div>
+          <form id="signup">
+            <label for="email">Email address</label>
+            <input id="email" name="email" type="email" required />
+
+            <!-- Label association by wrapping, not `for`. -->
+            <label>Password
+              <input name="password" type="password" />
+            </label>
+
+            <!-- Name only from placeholder. -->
+            <input name="coupon" type="text" placeholder="Coupon code" />
+
+            <select name="plan">
+              <option value="free">Free</option>
+              <option value="pro" selected>Pro — $20/mo</option>
+            </select>
+
+            <label><input type="checkbox" name="tos" /> I accept the terms</label>
+            <label><input type="radio" name="billing" value="monthly" checked /> Monthly</label>
+            <label><input type="radio" name="billing" value="yearly" /> Yearly</label>
+
+            <button type="submit">Create account</button>
+            <button type="button" disabled>Invite team</button>
+          </form>
+        </div></div></div></div></div>
+
+        <!-- A div acting as a button. Extremely common, no ARIA at all. -->
+        <div class="btn" onclick="void 0" style="cursor:pointer;width:120px;height:32px">Skip for now</div>
+
+        <!-- Icon-only control named solely by aria-label. -->
+        <button aria-label="Dismiss notification">&times;</button>
+
+        <!-- States that must be reported. -->
+        <button aria-expanded="false" aria-controls="adv">Advanced options</button>
+        <div id="adv" hidden><input name="hidden-field" /></div>
+
+        <input type="hidden" name="csrf" value="abc123" />
+        <div style="display:none"><button>Never rendered</button></div>
+        <div aria-hidden="true"><button>Hidden from a11y</button></div>
+
+        <!-- Screen-reader-only text is a real control, not noise. -->
+        <a href="/skip" class="visually-hidden">Skip to content</a>
+
+        <!--
+          Patterns found on real sites (Wikipedia), each of which broke an
+          earlier version of the extractor.
+        -->
+
+        <!-- Logo link: decorative icon first, meaningful wordmark second. The
+             name must come from the wordmark, not the empty alt. -->
+        <a href="/home" id="logo-link">
+          <img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" alt="" aria-hidden="true" width="20" height="20" />
+          <span class="wordmark"><img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" alt="Acme Corp" width="60" height="20" /></span>
+        </a>
+
+        <!-- `cursor: pointer` inherits, so this span looks clickable but is not
+             separately actionable. It must not get its own ref. -->
+        <a href="/deals" style="cursor:pointer"><span class="inner" style="cursor:pointer">Today's deals</span></a>
+
+        <!-- Tracking parameters must be elided, short meaningful ones kept. -->
+        <a href="/donate?wmf_source=sidebar&wmf_medium=nav&wmf_campaign=en.wikipedia.org&utm_content=xyz">Donate</a>
+        <a href="/search?q=laptop">Search laptops</a>
+
+        <!-- `display: contents` generates no box, so checkVisibility() reports
+             it invisible — but its children render normally. React apps wrap
+             whole subtrees in these; dropping them loses most of the page. -->
+        <span style="display: contents">
+          <span style="display: contents">
+            <button id="contents-btn">Buried under display:contents</button>
+          </span>
+        </span>
+
+        <!-- Web component with an open shadow root. -->
+        <my-widget></my-widget>
+
+        <p>Some body copy that only appears in full mode.</p>
+      </main>
+
+      <footer><a href="https://example.org/privacy">Privacy policy</a></footer>
+    </div>
+
+    <div id="results">running…</div>
+
+    <script>
+      // Shadow DOM fixture — controls inside must still be found.
+      customElements.define(
+        'my-widget',
+        class extends HTMLElement {
+          connectedCallback() {
+            const root = this.attachShadow({ mode: 'open' });
+            root.innerHTML =
+              '<button id="shadow-btn">Inside shadow DOM</button>' +
+              '<input id="shadow-input" placeholder="Shadow field" />';
+          }
+        }
+      );
+    </script>
+
+    <script src="../extension/content/a11y.js"></script>
+    <script src="../extension/content/actions.js"></script>
+
+    <script type="module">
+      // format.js registers a chrome listener at import time.
+      globalThis.chrome = { tabs: { onRemoved: { addListener() {} } } };
+      const fmt = await import('../extension/background/format.js');
+
+      const out = [];
+      let pass = 0;
+      let fail = 0;
+
+      function check(name, condition, detail = '') {
+        if (condition) { pass++; out.push(`<div class="pass">ok   ${name}</div>`); }
+        else { fail++; out.push(`<div class="fail">FAIL ${name}${detail ? ` — ${escapeHtml(detail)}` : ''}</div>`); }
+      }
+      const escapeHtml = (s) => String(s).replace(/[<>&]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
+
+      // Scope to the fixture so the results pane cannot pollute the tree.
+      const { nodes } = OB.a11y.buildTree({ mode: 'interactive', selector: '#fixture' });
+      const rendered = fmt.renderTree(nodes);
+      const text = rendered.text;
+
+      // --- Structure ---------------------------------------------------------
+      check('emits a tree', nodes.length > 0);
+      check('collapses wrapper divs', !/^\s*generic\s*$/m.test(text));
+      check('keeps landmarks', /navigation/.test(text) && /form/.test(text));
+      check('keeps heading with level', /heading "Create your account" h1/.test(text));
+
+      // --- Naming ------------------------------------------------------------
+      check('name from <label for>', /textbox "Email address"/.test(text));
+      check('name from wrapping label', /password "Password"/.test(text));
+      check('name from placeholder', /textbox "Coupon code"/.test(text));
+      check('name from aria-label', /button "Dismiss notification"/.test(text));
+      check('link name from text', /link "Home"/.test(text));
+
+      // --- Roles -------------------------------------------------------------
+      check('password input gets its own role', /password "Password"/.test(text));
+      check('select becomes combobox', /combobox/.test(text));
+      check('div with onclick + pointer becomes a button', /button "Skip for now"/.test(text));
+
+      // --- State -------------------------------------------------------------
+      check('required is reported', /textbox "Email address" \[e\d+\] required/.test(text));
+      check('disabled is reported', /button "Invite team" \[e\d+\] disabled/.test(text));
+      check('unchecked checkbox is reported', /checkbox "I accept the terms" \[e\d+\] unchecked/.test(text));
+      check('checked radio is reported', /radio "Monthly" \[e\d+\] checked/.test(text));
+      check('aria-expanded is reported', /button "Advanced options" \[e\d+\] collapsed/.test(text));
+      check('selected option value is shown', /combobox .*=.*Pro/.test(text));
+
+      // --- Visibility --------------------------------------------------------
+      check('hidden input excluded', !/csrf/.test(text));
+      check('display:none excluded', !/Never rendered/.test(text));
+      check('aria-hidden excluded', !/Hidden from a11y/.test(text));
+      check('[hidden] container excluded', !/hidden-field/.test(text));
+      check('visually-hidden link included', /link "Skip to content"/.test(text));
+
+      // --- Real-site regressions ---------------------------------------------
+      // Each of these was found by running against Wikipedia, not by design.
+      check('logo name skips the decorative alt=""', /link "Acme Corp"/.test(text), firstLineMatching(/\/home/));
+      check('decorative image is not emitted', !/img ""/.test(text) && !/^\s*img\s*$/m.test(text));
+      check('span inside a link gets no ref of its own',
+        !/generic .*\[e\d+\]/.test(text) && /link "Today's deals"/.test(text));
+      check('tracking query is elided', /\/donate\?…/.test(text), firstLineMatching(/donate/));
+      check('short meaningful query is kept', /\/search\?q=laptop/.test(text));
+      check('no href exceeds 72 chars',
+        [...text.matchAll(/\[e\d+\] (\S+)/g)].every((m) => m[1].length <= 72));
+
+      function firstLineMatching(re) {
+        return text.split('\n').find((l) => re.test(l)) || '(no matching line)';
+      }
+
+      check('display:contents wrappers do not hide their children',
+        /button "Buried under display:contents"/.test(text), firstLineMatching(/Buried/));
+
+      // --- Shadow DOM --------------------------------------------------------
+      check('pierces open shadow root (button)', /button "Inside shadow DOM"/.test(text));
+      check('pierces open shadow root (input)', /textbox "Shadow field"/.test(text));
+
+      // --- Links -------------------------------------------------------------
+      check('same-origin href shown as a path', /link "Pricing" \[e\d+\] \/pricing/.test(text));
+      check('cross-origin href shown in full', /example\.org\/privacy/.test(text));
+
+      // --- Modes -------------------------------------------------------------
+      const full = fmt.renderTree(OB.a11y.buildTree({ mode: 'full', selector: '#fixture' }).nodes).text;
+      check('full mode adds body copy', /only appears in full mode/.test(full));
+      check('interactive mode omits body copy', !/only appears in full mode/.test(text));
+      check('full mode is larger than interactive', full.length > text.length);
+
+      // --- Refs --------------------------------------------------------------
+      const refs = [...text.matchAll(/\[(e\d+)\]/g)].map((m) => m[1]);
+      check('refs are assigned', refs.length >= 12, `got ${refs.length}`);
+      check('refs are unique', new Set(refs).size === refs.length);
+      check('refs resolve to live elements', refs.every((r) => OB.a11y.resolveRef(r)?.isConnected));
+
+      // Ref stability is what makes mode:"diff" and multi-step plans work.
+      const before = new Map(refs.map((r) => [r, OB.a11y.resolveRef(r)]));
+      OB.a11y.buildTree({ mode: 'interactive', selector: '#fixture' });
+      check('refs are stable across snapshots', [...before].every(([r, el]) => OB.a11y.resolveRef(r) === el));
+
+      // --- Mutation counting -------------------------------------------------
+      // The settling signal reads this counter to tell "the app has not reacted
+      // yet" from "the click went nowhere". Our own highlight box appends and
+      // removes itself around every action, so counting it made a dead button
+      // report that the page was still changing — the tool drowning out its own
+      // signal.
+      OB.a11y.buildTree({ mode: 'interactive', selector: '#fixture' }); // start the observer
+      const mutationsBefore = OB.a11y.mutationCount();
+
+      OB.actions.highlight(document.getElementById('email'), 'click');
+      await new Promise((r) => setTimeout(r, 60));
+      check('our own highlight box does not count as page activity',
+        OB.a11y.mutationCount() === mutationsBefore,
+        `${mutationsBefore} -> ${OB.a11y.mutationCount()}`);
+
+      const realChange = document.createElement('p');
+      realChange.textContent = 'the page actually did something';
+      document.querySelector('#fixture main').appendChild(realChange);
+      await new Promise((r) => setTimeout(r, 60));
+      check('a real DOM change does count',
+        OB.a11y.mutationCount() > mutationsBefore,
+        `${mutationsBefore} -> ${OB.a11y.mutationCount()}`);
+      realChange.remove();
+
+      // --- Scoping to a single element ---------------------------------------
+      // Scoping used to walk only the root's children, so pointing a selector
+      // at one control returned nothing — indistinguishable from "not on the
+      // page", which is the opposite of the truth.
+      const scopedToControl = OB.a11y.buildTree({ mode: 'interactive', selector: '#signup button[type=submit]' });
+      check('scoping to a single control returns that control',
+        scopedToControl.nodes.length === 1 && scopedToControl.nodes[0].name === 'Create account',
+        JSON.stringify(scopedToControl.nodes.map((n) => n.name)));
+
+      // Scoping to a container must be unchanged: a wrapper with no role still
+      // splices its children in place of itself rather than adding a level.
+      const scopedToForm = OB.a11y.buildTree({ mode: 'interactive', selector: '#signup' });
+      check('scoping to a container still returns its contents',
+        scopedToForm.nodes.length > 5,
+        `${scopedToForm.nodes.length} nodes`);
+
+      // --- Waiting for text --------------------------------------------------
+      // browser_wait must agree with what browser_find shows. Snapshot names
+      // come from aria-label/title/alt/placeholder as often as from text nodes,
+      // and a wait that cannot see those times out on a string the tool just
+      // displayed — 40 seconds of dead waiting in one real checkout run.
+      check('textPresent finds rendered text', OB.actions.textPresent('Create your account'));
+      check('textPresent finds a placeholder-named control', OB.actions.textPresent('Coupon code'));
+
+      const iconButton = document.createElement('button');
+      iconButton.title = 'Add to Cart';
+      iconButton.textContent = '';
+      document.querySelector('#fixture main').appendChild(iconButton);
+      check('textPresent finds a title-named icon button', OB.actions.textPresent('Add to Cart'));
+      check('textPresent is case-insensitive', OB.actions.textPresent('add to cart'));
+      iconButton.remove();
+      check('textPresent stops finding it once removed', !OB.actions.textPresent('Add to Cart'));
+
+      // --- Tree cache --------------------------------------------------------
+      // A second read of an unchanged page must not walk again — that repeat
+      // walk was 3.6s on Gmail. Identity is the assertion: an equal-but-new
+      // object would mean the walk ran.
+      const opts = { mode: 'interactive', selector: '#fixture' };
+      const firstRead = OB.a11y.buildTree(opts);
+      check('an unchanged page is served from cache', OB.a11y.buildTree(opts) === firstRead);
+
+      // Scope is part of the identity of a tree. Serving one scope's nodes for
+      // another would be the worst possible cache bug: plausible, and wrong.
+      check('a different scope is not served the cached tree',
+        OB.a11y.buildTree({ mode: 'interactive', selector: '#signup' }) !== firstRead);
+      check('returning to the first scope still reflects it',
+        OB.a11y.buildTree(opts).nodes.length === firstRead.nodes.length);
+
+      // Synchronous mutate-then-read. The observer's callback is a microtask,
+      // so without draining its queue this call would be served the tree from
+      // before the change — invisibly, and only under this timing.
+      const canary = document.createElement('button');
+      canary.textContent = 'Cache canary';
+      document.querySelector('#fixture main').appendChild(canary);
+      const afterMutation = OB.a11y.buildTree(opts);
+      check('a same-tick DOM mutation invalidates the cache', afterMutation !== firstRead);
+      check('the mutation is actually in the new tree',
+        fmt.renderTree(afterMutation.nodes).text.includes('Cache canary'));
+      canary.remove();
+
+      // The subtle one. `input.value` is a live property: typing reflects to no
+      // attribute and queues no mutation record, so an observer-only cache
+      // would keep reporting the old value forever.
+      const cachedBeforeTyping = OB.a11y.buildTree(opts);
+      const emailField = document.getElementById('email');
+      emailField.value = 'dylan@example.com';
+      emailField.dispatchEvent(new InputEvent('input', { bubbles: true }));
+      const afterTyping = OB.a11y.buildTree(opts);
+      check('typing invalidates the cache despite mutating no attribute',
+        afterTyping !== cachedBeforeTyping);
+      check('the typed value is visible in the fresh tree',
+        fmt.renderTree(afterTyping.nodes).text.includes('dylan@example.com'));
+      emailField.value = '';
+      emailField.dispatchEvent(new InputEvent('input', { bubbles: true }));
+
+      // Focus, which no listener can catch. Chrome updates activeElement at
+      // once but withholds focus/focusin until the document has system focus —
+      // so in a background tab, the case parallel agent work makes normal, a
+      // focusin listener never fires. This test runs with the document
+      // unfocused precisely so that shortcut cannot pass.
+      const cachedBeforeFocus = OB.a11y.buildTree(opts);
+      document.getElementById('email').focus();
+      check('a focus change invalidates the cache without a focus event',
+        OB.a11y.buildTree(opts) !== cachedBeforeFocus);
+      check('the fresh tree reports the new focus',
+        fmt.renderTree(OB.a11y.buildTree(opts).nodes).text.includes('focused'));
+      document.getElementById('email').blur();
+
+      // --- Search ------------------------------------------------------------
+      const hits = OB.a11y.findElements('create account button').results;
+      check('find ranks the intended element first', hits[0]?.name === 'Create account', hits[0]?.name);
+      check('find returns positions', typeof hits[0]?.rect?.x === 'number');
+      const emailHits = OB.a11y.findElements('email').results;
+      check('find matches a field by name', emailHits.some((h) => h.name === 'Email address'));
+
+      // Ranking regression, found on Gmail: a long label picking up incidental
+      // substring hits used to outrank the short control actually being asked
+      // for. `e11` here is the long "You are encouraged to create an account…"
+      // style link; the real Coupon field must win.
+      const longLabel = document.createElement('button');
+      longLabel.textContent =
+        'Reply to this message to send a note about your account, or click to view the full subject line and body of the coupon thread';
+      document.querySelector('#fixture main').appendChild(longLabel);
+      OB.a11y.buildTree({ mode: 'interactive', selector: '#fixture' });
+      const couponHits = OB.a11y.findElements('coupon code field').results;
+      check('short control outranks a long incidental label',
+        couponHits[0]?.name === 'Coupon code', couponHits[0]?.name);
+      longLabel.remove();
+
+      // --- Geometry ----------------------------------------------------------
+      const submit = OB.a11y.resolveRef(refs.find((r) => OB.a11y.resolveRef(r)?.textContent === 'Create account'));
+      // Mirror real usage: the router scrolls a target into view before asking
+      // for its click point. Skipping that here made the test depend on the
+      // window happening to be tall enough.
+      await OB.actions.scrollIntoView(submit);
+      const point = OB.actions.clickPoint(submit);
+      check('click point is computed', point && point.x > 0 && point.y > 0);
+      check('click point is unobstructed', point && !point.obstructed);
+      check('click point lands on the element', document.elementFromPoint(point.x, point.y) === submit);
+
+      // Off screen must be distinguishable from covered — the fixes differ.
+      const offscreen = document.createElement('button');
+      offscreen.textContent = 'Far below';
+      offscreen.style.cssText = 'position:absolute;top:99999px;left:0';
+      document.body.appendChild(offscreen);
+      const offPoint = OB.actions.clickPoint(offscreen);
+      check('off-screen target is reported as off-screen, not covered',
+        offPoint?.offscreen === true && /outside the viewport/.test(offPoint.obstructedBy || ''),
+        offPoint?.obstructedBy);
+      offscreen.remove();
+
+      // --- Token cost --------------------------------------------------------
+      const domBytes = document.getElementById('fixture').innerHTML.length;
+      const ratio = (domBytes / text.length).toFixed(1);
+      check('tree is far smaller than the DOM', domBytes / text.length > 2, `${ratio}x`);
+
+      document.getElementById('results').innerHTML =
+        `<h3>${pass} passed, ${fail} failed</h3>` +
+        out.join('') +
+        `<p>tree ${text.length} chars vs DOM ${domBytes} chars (${ratio}x smaller)</p>` +
+        `<pre>${escapeHtml(text)}</pre>`;
+
+      window.__results = { pass, fail, text, failures: out.filter((o) => o.includes('FAIL')) };
+    </script>
+  </body>
+</html>

@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OpenBrowser</title>
+    <link rel="stylesheet" href="panel.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo" aria-hidden="true"></span>
+        <span class="brand-name">OpenBrowser</span>
+      </div>
+      <button
+        id="connection"
+        class="status status--disconnected"
+        type="button"
+        title="Click to connect or disconnect"
+      >
+        <span class="status-dot" aria-hidden="true"></span>
+        <span id="status-text">Disconnected</span>
+      </button>
+    </header>
+
+    <nav class="tabs" role="tablist">
+      <button class="tab is-active" role="tab" data-view="control" aria-selected="true">Control</button>
+      <button class="tab" role="tab" data-view="tools" aria-selected="false">Tools</button>
+      <button class="tab" role="tab" data-view="macros" aria-selected="false">Macros</button>
+      <button class="tab" role="tab" data-view="activity" aria-selected="false">Activity</button>
+    </nav>
+
+    <main>
+      <!-- ─────────────────────────── Control ─────────────────────────── -->
+      <section class="view is-active" id="view-control" role="tabpanel">
+        <div id="connection-help" class="callout callout--warn" hidden>
+          <p><strong>No MCP server found on port <span data-port>8848</span>.</strong></p>
+          <p>
+            Start it from the project directory, or let your MCP client launch it:
+          </p>
+          <code class="snippet">node mcp-server/src/index.js</code>
+          <p class="muted">The extension reconnects on its own once the server is up.</p>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Open tabs</h2>
+            <button class="btn btn--ghost btn--sm" id="refresh-tabs" type="button">Refresh</button>
+          </div>
+          <ul class="tab-list" id="tab-list">
+            <li class="empty">Loading…</li>
+          </ul>
+          <form class="inline-form" id="open-tab-form">
+            <input
+              type="text"
+              id="new-tab-url"
+              placeholder="Open a URL in a new background tab…"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <button class="btn btn--primary btn--sm" type="submit">Open</button>
+          </form>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Quick actions</h2>
+          </div>
+          <div class="quick-grid">
+            <button class="btn" data-quick="snapshot" type="button">Snapshot page</button>
+            <button class="btn" data-quick="screenshot" type="button">Screenshot</button>
+            <button class="btn" data-quick="page_info" type="button">Page info</button>
+            <button class="btn" data-quick="console" type="button">Console</button>
+            <button class="btn" data-quick="network" type="button">Network</button>
+            <button class="btn" data-quick="frames" type="button">Frames</button>
+          </div>
+          <form class="inline-form" id="find-form">
+            <input
+              type="text"
+              id="find-query"
+              placeholder="Find an element — e.g. “sign in button”"
+              autocomplete="off"
+            />
+            <button class="btn btn--primary btn--sm" type="submit">Find</button>
+          </form>
+        </div>
+
+        <div class="panel panel--output" id="output-panel" hidden>
+          <div class="panel-head">
+            <h2 id="output-title">Result</h2>
+            <div class="panel-actions">
+              <span class="badge" id="output-meta"></span>
+              <button class="btn btn--ghost btn--sm" id="copy-output" type="button">Copy</button>
+              <button class="btn btn--ghost btn--sm" id="close-output" type="button" aria-label="Close">✕</button>
+            </div>
+          </div>
+          <img id="output-image" alt="" hidden />
+          <pre id="output"></pre>
+        </div>
+      </section>
+
+      <!-- ──────────────────────────── Tools ──────────────────────────── -->
+      <section class="view" id="view-tools" role="tabpanel">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Run a tool</h2>
+            <span class="badge">14 available</span>
+          </div>
+          <p class="muted">
+            The same dispatcher your agent uses. Useful for checking what a tool
+            returns before wiring it into a prompt.
+          </p>
+
+          <label class="field">
+            <span>Tool</span>
+            <select id="tool-select"></select>
+          </label>
+
+          <p class="muted tool-desc" id="tool-desc"></p>
+
+          <label class="field">
+            <span>Arguments (JSON)</span>
+            <textarea id="tool-args" rows="7" spellcheck="false">{}</textarea>
+          </label>
+
+          <div class="row">
+            <button class="btn btn--primary" id="run-tool" type="button">Run</button>
+            <button class="btn btn--ghost" id="insert-tab-id" type="button">Insert active tabId</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ─────────────────────────── Macros ──────────────────────────── -->
+      <section class="view" id="view-macros" role="tabpanel">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Saved macros</h2>
+          </div>
+          <p class="muted">
+            Replay a saved sequence in one call. Agents create these with
+            <code>browser_macro</code>; you can run and delete them here.
+          </p>
+          <ul class="macro-list" id="macro-list">
+            <li class="empty">No macros saved yet.</li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- ────────────────────────── Activity ─────────────────────────── -->
+      <section class="view" id="view-activity" role="tabpanel">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Recent calls</h2>
+            <button class="btn btn--ghost btn--sm" id="clear-activity" type="button">Clear</button>
+          </div>
+          <ul class="activity-list" id="activity-list">
+            <li class="empty">Nothing yet. Tool calls will appear here as they run.</li>
+          </ul>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Session</h2>
+          </div>
+          <dl class="stats">
+            <div><dt>Calls</dt><dd id="stat-calls">0</dd></div>
+            <div><dt>Errors</dt><dd id="stat-errors">0</dd></div>
+            <div><dt>Debugger attached</dt><dd id="stat-attached">0 tabs</dd></div>
+          </dl>
+          <button class="btn btn--ghost btn--sm" id="detach-all" type="button">
+            Detach debugger from all tabs
+          </button>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <button class="link" id="open-options" type="button">Settings</button>
+      <span class="sep">·</span>
+      <span class="muted" id="version">v1.0.0</span>
+    </footer>
+
+    <script src="panel.js" type="module"></script>
+  </body>
+</html>

@@ -1,0 +1,54 @@
+/*
+ * Visual feedback for actions taken by an agent.
+ *
+ * Injected into every page, so every rule is namespaced and every property is
+ * forced — a page's own `div { all: unset }` or aggressive resets must not be
+ * able to make the overlay invisible or, worse, make it intercept clicks.
+ */
+
+.ob-highlight {
+  position: fixed !important;
+  z-index: 2147483647 !important;
+  pointer-events: none !important;
+  box-sizing: border-box !important;
+  border: 2px solid #4f8cff !important;
+  border-radius: 3px !important;
+  background: rgba(79, 140, 255, 0.12) !important;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.7) !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  animation: ob-highlight-fade 0.9s ease-out forwards !important;
+}
+
+.ob-highlight[data-ob-label]::after {
+  content: attr(data-ob-label);
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  transform: translateY(-2px);
+  background: #4f8cff;
+  color: #fff;
+  font: 500 11px/1.4 ui-sans-serif, system-ui, -apple-system, sans-serif;
+  padding: 2px 6px;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+
+@keyframes ob-highlight-fade {
+  0%   { opacity: 0; transform: scale(1.04); }
+  15%  { opacity: 1; transform: scale(1); }
+  70%  { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+/* Respect the user's motion preference — the outline still appears, it just
+   does not animate. */
+@media (prefers-reduced-motion: reduce) {
+  .ob-highlight {
+    animation: ob-highlight-hold 0.9s steps(1, end) forwards !important;
+  }
+  @keyframes ob-highlight-hold {
+    0%, 99% { opacity: 1; }
+    100%    { opacity: 0; }
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "name": "openbrowser-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for the OpenBrowser Chrome extension — full browser automation for AI agents.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "openbrowser-mcp": "src/index.js"
+  },
+  "main": "src/index.js",
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "start": "node src/index.js",
+    "health": "node src/index.js --health",
+    "hub": "node src/index.js --hub --verbose",
+    "test": "node ../test/run.mjs"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "browser-automation",
+    "chrome-extension",
+    "ai-agent"
+  ],
+  "dependencies": {},
+  "devDependencies": {}
+}

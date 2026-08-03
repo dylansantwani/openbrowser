@@ -1,0 +1,21 @@
+{
+  "name": "openbrowser",
+  "version": "1.0.0",
+  "description": "Open-source browser automation for AI agents: a Chrome extension with a side-panel UI, plus a zero-dependency MCP server.",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node mcp-server/src/index.js",
+    "health": "node mcp-server/src/index.js --health",
+    "hub": "node mcp-server/src/index.js --hub --verbose",
+    "icons": "node scripts/make-icons.mjs",
+    "test": "node test/run.mjs",
+    "preview": "node scripts/serve-preview.mjs"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}

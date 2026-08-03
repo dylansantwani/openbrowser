@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "ui-preview",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["scripts/serve-preview.mjs"],
+      "port": 8850,
+      "url": "http://localhost:8850"
+    }
+  ]
+}
