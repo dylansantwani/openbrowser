@@ -406,10 +406,17 @@ export const TOOLS = [
   {
     name: 'browser_window',
     description:
-      'Resize, emulate a device, force light/dark, set zoom, or throttle the network.',
+      'Pick the Chrome window this session works in, or resize/emulate a device/force light-dark/zoom/throttle.',
     inputSchema: {
       type: 'object',
       properties: {
+        action: {
+          type: 'string',
+          enum: ['list', 'use', 'pick'],
+          description:
+            'Window choice. "list" shows open windows; "use" takes windowId; "pick" asks the user in the browser and waits. Only needed when a call reports several windows are open — relay the list and let the user choose, never guess.',
+        },
+        windowId: { type: 'number', description: 'For "use".' },
         tabId: TAB,
         preset: { type: 'string', enum: ['mobile', 'tablet', 'desktop', 'wide'] },
         width: { type: 'number' },

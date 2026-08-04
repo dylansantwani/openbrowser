@@ -92,6 +92,20 @@ var OB = globalThis.OB || (globalThis.OB = {});
       return { shown: actions.agentFrame(on, label) };
     },
 
+    /**
+     * Show/hide "an agent wants to work in this window".
+     *
+     * Returns as soon as it is drawn — the answer comes back separately over
+     * chrome.runtime, because the caller is waiting on a human and this reply
+     * would otherwise have to be held open for a minute and a half.
+     */
+    window_pick({ on = true, token, label }) {
+      // `token` matters on the way out as much as on the way in: several
+      // sessions can have a card up here at once, and clearing must take only
+      // the one that belongs to the caller.
+      return { shown: actions.windowPick(on, { token, label }) };
+    },
+
     snapshot({ mode = 'interactive', selector, viewportOnly, maxChars = 20000 }) {
       if (mode === 'text') {
         return { text: a11y.pageText(maxChars), ...pageMeta() };

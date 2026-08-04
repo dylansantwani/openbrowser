@@ -49,11 +49,55 @@
   z-index: 2147483646 !important;
   pointer-events: none !important;
   box-sizing: border-box !important;
-  border: 3px solid #f97316 !important;
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.55) !important;
+  border-width: 3px !important;
+  border-style: solid !important;
   background: none !important;
   margin: 0 !important;
   padding: 0 !important;
+  /*
+   * A slow breath, not a blink.
+   *
+   * A static border is read once and then stops being seen — which is a problem
+   * for a marker whose whole job is to still be saying "something else is
+   * driving this" ten minutes into a long run. Motion is what survives that.
+   *
+   * The rate is deliberately slower than anything a page animates: at 2.6s a
+   * cycle it reads as ambient rather than as a notification, and it never
+   * competes for attention with the page's own content. The border is never
+   * fully dim, so the tab is unmistakable at any point in the cycle.
+   */
+  animation: ob-agent-pulse 2.6s ease-in-out infinite !important;
+
+  /*
+   * The two properties the animation drives are deliberately *not* `!important`,
+   * which is the opposite of the rule the rest of this file follows.
+   *
+   * `!important` author declarations outrank CSS animations in the cascade, so
+   * forcing these here does not make them safer — it makes the keyframes do
+   * nothing at all, and the border sits at a fixed colour looking exactly like
+   * it works. That is precisely how this shipped once.
+   *
+   * Nothing is really given up. An animation already beats every *normal*
+   * declaration a page can write, and the only thing that could still win is a
+   * page marking `border-color` or `box-shadow` important against our own class
+   * — and if that ever happens the border is still a 3px solid box in the right
+   * place, which is the part that matters.
+   */
+  border-color: #f97316;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.55);
+}
+
+@keyframes ob-agent-pulse {
+  0%, 100% {
+    border-color: rgba(249, 115, 22, 0.6);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.45);
+  }
+  50% {
+    border-color: rgba(249, 115, 22, 1);
+    box-shadow:
+      inset 0 0 0 1px rgba(255, 255, 255, 0.6),
+      inset 0 0 12px rgba(249, 115, 22, 0.3);
+  }
 }
 
 .ob-agent-frame::after {
@@ -71,9 +115,123 @@
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.28) !important;
 }
 
+/*
+ * "An agent wants to work in this window."
+ *
+ * Shown in one tab per window when a session has to choose between several.
+ * The only overlay here that takes pointer events — a prompt nobody can click
+ * is not a prompt. Everything is still forced, for the same reason as the rest
+ * of this file: a page's reset must not be able to hide the question or, worse,
+ * leave it visible but unclickable.
+ */
+.ob-window-pick {
+  position: fixed !important;
+  inset: 0 !important;
+  z-index: 2147483647 !important;
+  /* The backdrop stays inert so the page underneath keeps working — this asks
+     a question, it does not seize the browser. Only the card takes clicks. */
+  pointer-events: none !important;
+  /*
+   * A column, because several agents can be asking at the same time. Three
+   * sessions starting together is the normal case for a hub, and one card
+   * covering another is a question the user cannot answer.
+   */
+  display: flex !important;
+  flex-direction: column !important;
+  align-items: center !important;
+  justify-content: flex-start !important;
+  gap: 8px !important;
+  padding: 24px 0 0 0 !important;
+  margin: 0 !important;
+  background: none !important;
+  border: none !important;
+  overflow: hidden !important;
+}
+
+.ob-window-pick-card {
+  pointer-events: auto !important;
+  box-sizing: border-box !important;
+  margin: 0 !important;
+  flex: 0 0 auto !important;
+  padding: 16px 18px !important;
+  max-width: 420px !important;
+  border: 1px solid rgba(249, 115, 22, 0.55) !important;
+  border-radius: 12px !important;
+  background: #1c1917 !important;
+  color: #fafaf9 !important;
+  font: 400 13px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif !important;
+  text-align: left !important;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.06) !important;
+  animation: ob-window-pick-in 0.18s ease-out !important;
+}
+
+.ob-window-pick-title {
+  font: 600 14px/1.4 ui-sans-serif, system-ui, -apple-system, sans-serif !important;
+  color: #fafaf9 !important;
+  margin: 0 0 4px 0 !important;
+}
+
+.ob-window-pick-sub {
+  color: #a8a29e !important;
+  margin: 0 0 14px 0 !important;
+  font-size: 12.5px !important;
+}
+
+.ob-window-pick-actions {
+  display: flex !important;
+  gap: 8px !important;
+  margin: 0 !important;
+}
+
+.ob-window-pick-btn {
+  pointer-events: auto !important;
+  box-sizing: border-box !important;
+  cursor: pointer !important;
+  border: 1px solid rgba(255, 255, 255, 0.16) !important;
+  border-radius: 7px !important;
+  background: rgba(255, 255, 255, 0.06) !important;
+  color: #fafaf9 !important;
+  font: 500 13px/1 ui-sans-serif, system-ui, -apple-system, sans-serif !important;
+  padding: 9px 14px !important;
+  margin: 0 !important;
+  text-transform: none !important;
+  letter-spacing: normal !important;
+  min-width: 0 !important;
+  min-height: 0 !important;
+  width: auto !important;
+  height: auto !important;
+}
+
+.ob-window-pick-btn:hover {
+  background: rgba(255, 255, 255, 0.12) !important;
+}
+
+.ob-window-pick-yes {
+  background: #f97316 !important;
+  border-color: #f97316 !important;
+  color: #1c1917 !important;
+  font-weight: 600 !important;
+}
+
+.ob-window-pick-yes:hover {
+  background: #fb923c !important;
+  border-color: #fb923c !important;
+}
+
+.ob-window-pick-btn:focus-visible {
+  outline: 2px solid #fdba74 !important;
+  outline-offset: 2px !important;
+}
+
+@keyframes ob-window-pick-in {
+  from { opacity: 0; transform: translateY(-6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
 /* Printing a page should not print the chrome around it. */
 @media print {
-  .ob-agent-frame { display: none !important; }
+  .ob-agent-frame,
+  .ob-window-pick { display: none !important; }
 }
 
 @keyframes ob-highlight-fade {
@@ -92,5 +250,16 @@
   @keyframes ob-highlight-hold {
     0%, 99% { opacity: 1; }
     100%    { opacity: 0; }
+  }
+
+  /* The frame is a safety marker, so it stays — at full strength, since it can
+     no longer draw the eye by moving. Only the motion is dropped. */
+  .ob-agent-frame {
+    animation: none !important;
+    border-color: #f97316 !important;
+  }
+
+  .ob-window-pick-card {
+    animation: none !important;
   }
 }

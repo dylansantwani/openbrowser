@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>OpenBrowser — overlay preview</title>
+
+<!--
+  The overlays, on a page, at full size.
+
+  Everything drawn on a real page comes from `content/actions.js`, which needs a
+  live extension to run — so the two markers people actually look at (the "an
+  agent is driving this" frame and the "which window?" prompt) could only be
+  checked by reloading Chrome and starting a session. That is a slow loop for
+  work that is entirely about how something looks.
+
+  This loads the real `overlay.css` and mirrors the markup those two functions
+  build. It is a *mirror*, so it can drift: if you change the DOM in
+  `agentFrame()` or `windowPick()`, change it here too. The CSS is the genuine
+  article and cannot drift.
+
+    npm run preview   ->  http://localhost:8850/test/overlay-preview.html
+-->
+
+<link rel="stylesheet" href="../extension/content/overlay.css" />
+<style>
+  body {
+    margin: 0;
+    font: 15px/1.6 ui-sans-serif, system-ui, -apple-system, sans-serif;
+    color: #1c1917;
+    background: #fff;
+  }
+  .page { max-width: 620px; margin: 0 auto; padding: 88px 24px 64px; }
+  h1 { font-size: 26px; margin: 0 0 6px; }
+  p { color: #57534e; }
+  .controls {
+    position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+    display: flex; gap: 8px; z-index: 2147483647;
+    background: #1c1917; padding: 8px; border-radius: 10px;
+  }
+  .controls button {
+    font: 500 13px/1 ui-sans-serif, system-ui, sans-serif;
+    padding: 8px 12px; border-radius: 6px; cursor: pointer;
+    border: 1px solid rgba(255,255,255,.18);
+    background: rgba(255,255,255,.08); color: #fafaf9;
+  }
+  #log { position: fixed; bottom: 64px; left: 50%; transform: translateX(-50%);
+         font: 12px ui-monospace, monospace; color: #78716c; }
+</style>
+</head>
+<body>
+
+<div class="page">
+  <h1>A page an agent is driving</h1>
+  <p>
+    The border around this viewport is the persistent agent marker. It breathes
+    on a 2.6s cycle — slow enough to read as ambient rather than as an alert,
+    and never dim enough to be missed. Set “reduce motion” in your OS and it
+    should hold steady at full strength instead.
+  </p>
+  <p>
+    The card at the top is what appears in every window when a session has to be
+    told which one to work in. Only the card takes clicks; the page behind it
+    stays usable.
+  </p>
+</div>
+
+<div class="controls">
+  <button id="toggle-frame">Toggle agent frame</button>
+  <button id="toggle-pick">Toggle window prompt</button>
+</div>
+<div id="log"></div>
+
+<script>
+  // Mirrors actions.js: agentFrame()
+  function agentFrame(on, label = 'OpenBrowser · claude · meadow') {
+    document.querySelector('.ob-agent-frame')?.remove();
+    if (!on) return;
+    const box = document.createElement('div');
+    box.className = 'ob-agent-frame';
+    box.dataset.obAgent = label;
+    document.body.appendChild(box);
+  }
+
+  // Mirrors actions.js: windowPick()
+  function windowPick(on, label = 'claude · meadow') {
+    document.querySelector('.ob-window-pick')?.remove();
+    if (!on) return;
+
+    const box = document.createElement('div');
+    box.className = 'ob-window-pick';
+    box.setAttribute('role', 'dialog');
+    box.setAttribute('aria-label', label + ' is asking to work in this window');
+
+    const card = document.createElement('div');
+    card.className = 'ob-window-pick-card';
+
+    const title = document.createElement('div');
+    title.className = 'ob-window-pick-title';
+    title.textContent = `⚡ ${label} wants to work in this window`;
+
+    const sub = document.createElement('div');
+    sub.className = 'ob-window-pick-sub';
+    sub.textContent = 'It will open its own tab group here. Your existing tabs are left alone.';
+
+    const row = document.createElement('div');
+    row.className = 'ob-window-pick-actions';
+
+    const yes = document.createElement('button');
+    yes.className = 'ob-window-pick-btn ob-window-pick-yes';
+    yes.type = 'button';
+    yes.textContent = 'Use this window';
+    yes.addEventListener('click', () => { log('chose: use this window'); box.remove(); });
+
+    const no = document.createElement('button');
+    no.className = 'ob-window-pick-btn';
+    no.type = 'button';
+    no.textContent = 'Not this one';
+    no.addEventListener('click', () => { log('chose: not this one'); box.remove(); });
+
+    row.append(yes, no);
+    card.append(title, sub, row);
+    box.append(card);
+    document.body.appendChild(box);
+  }
+
+  const log = (m) => { document.getElementById('log').textContent = m; };
+
+  document.getElementById('toggle-frame').addEventListener('click', () =>
+    agentFrame(!document.querySelector('.ob-agent-frame')));
+  document.getElementById('toggle-pick').addEventListener('click', () =>
+    windowPick(!document.querySelector('.ob-window-pick')));
+
+  agentFrame(true);
+  windowPick(true);
+
+  /*
+   * Does the pulse actually pulse?
+   *
+   * This is checked rather than eyeballed because the way it breaks is
+   * invisible: `!important` author declarations outrank CSS animations in the
+   * cascade, so a base `border: … !important` leaves the animation attached,
+   * `running`, and completely inert. The border looks exactly right and never
+   * moves. Reading `animationName` does not catch it either — the animation is
+   * genuinely there. The only proof is that the computed value changes across
+   * the cycle, so that is what this samples.
+   */
+  function selfCheck() {
+    const results = [];
+    const el = document.querySelector('.ob-agent-frame');
+    const anim = el.getAnimations()[0];
+
+    if (!anim) {
+      results.push(['FAIL', 'the agent frame has no animation attached']);
+    } else {
+      const duration = anim.effect.getTiming().duration;
+      const at = (pct) => {
+        anim.currentTime = duration * pct;
+        const cs = getComputedStyle(el);
+        return { border: cs.borderTopColor, width: cs.borderTopWidth };
+      };
+      const start = at(0);
+      const mid = at(0.5);
+      anim.currentTime = 0;
+
+      results.push([
+        start.border !== mid.border ? 'ok' : 'FAIL',
+        `border colour changes across the cycle (${start.border} → ${mid.border})`,
+      ]);
+      results.push([
+        start.width === mid.width ? 'ok' : 'FAIL',
+        `border width holds steady at ${start.width} — only the colour breathes`,
+      ]);
+    }
+
+    const card = document.querySelector('.ob-window-pick-card');
+    const r = card.getBoundingClientRect();
+    results.push([
+      document.elementFromPoint(r.left + r.width / 2, r.top + 8) === card ? 'ok' : 'FAIL',
+      'the prompt card takes clicks',
+    ]);
+    results.push([
+      getComputedStyle(document.querySelector('.ob-window-pick')).pointerEvents === 'none' ? 'ok' : 'FAIL',
+      'the backdrop stays inert, so the page behind it still works',
+    ]);
+
+    const failed = results.filter(([s]) => s === 'FAIL');
+    log(results.map(([s, m]) => `${s}  ${m}`).join('\n'));
+    document.getElementById('log').style.color = failed.length ? '#dc2626' : '#78716c';
+    document.getElementById('log').style.whiteSpace = 'pre';
+    document.getElementById('log').style.textAlign = 'left';
+  }
+
+  selfCheck();
+</script>
+
+</body>
+</html>

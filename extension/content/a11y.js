@@ -472,8 +472,15 @@ var OB = globalThis.OB || (globalThis.OB = {});
    * so leaving it out here would report page activity on every single call and
    * destroy the settling signal outright, which is worse than the highlight bug
    * this function was written for.
+   *
+   * `.ob-window-pick` is the "which window should I work in?" prompt, and it
+   * matters for a second reason: this list is also what keeps our own overlays
+   * out of the reported tree. That prompt is the one thing on the page an agent
+   * must never be able to see or click — it is the human's answer to a question
+   * about the agent, and an agent that could find its buttons in a snapshot
+   * could answer on their behalf.
    */
-  const OWN_DECORATION = '.ob-highlight, .ob-agent-frame';
+  const OWN_DECORATION = '.ob-highlight, .ob-agent-frame, .ob-window-pick';
 
   function isDecoration(node) {
     const el = node?.nodeType === 1 ? node : node?.parentElement;

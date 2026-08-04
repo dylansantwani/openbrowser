@@ -17,6 +17,7 @@ import * as recorder from './recorder.js';
 import * as fmt from './format.js';
 import * as macros from './macros.js';
 import * as groups from './groups.js';
+import * as windows from './windows.js';
 import { encodeGif } from './gif.js';
 import { getSettings, checkUrlAllowed } from './settings.js';
 
@@ -106,8 +107,17 @@ async function activeTabId() {
   return candidates[0].id;
 }
 
-async function resolveTab(args) {
+/**
+ * @param {object} args
+ * @param {{create?: boolean}} [opts] `create: false` for calls that act *on* a
+ *   tab rather than through one — closing, reloading, selecting. Opening a fresh
+ *   tab so it can immediately be closed is not a sensible reading of "close",
+ *   and the error that replaces it says the one thing that helps.
+ */
+async function resolveTab(args, { create = true } = {}) {
+  const label = args.group || args._session;
   let tabId;
+
   if (args.tabId != null) {
     try {
       await chrome.tabs.get(args.tabId);
@@ -115,23 +125,94 @@ async function resolveTab(args) {
     } catch {
       throw new Error(`tab ${args.tabId} no longer exists. Use browser_tabs action:"list" to see open tabs.`);
     }
+    // Naming a tab explicitly is how you hand one of your own pages to an
+    // agent, and from that point it is part of the session's work — so it joins
+    // the session's group like everything else it touches. See `claimTab`.
+    await claimTab(tabId, label);
   } else {
-    tabId = (await sessionTabId(args)) ?? (await adoptActiveTab(args));
+    tabId = await sessionTabId(args);
+    if (tabId == null) {
+      if (!create && label) {
+        throw new Error(
+          `"${label}" has no open tab, so there is nothing to act on — pass tabId, ` +
+            'or see what is open with browser_tabs action:"list".'
+        );
+      }
+      tabId = await openSessionTab(args);
+    }
   }
 
-  // Remembered, not claimed.
-  //
-  // Grouping a tab marks it as *owned*, and ownership outlives the session that
-  // took it — cleanup only closes tabs a session opened, so an adopted tab kept
-  // its dead owner's label forever and every later session was refused it. Point
-  // an agent at your Gmail tab once and no agent could ever touch it again.
-  //
-  // So a session only ever owns tabs it opened itself. Tabs of yours that it
-  // merely worked on are remembered, which is enough to keep it on the same tab
-  // between calls, without claiming them from anyone.
-  await rememberSessionTab(args.group || args._session, tabId);
-  noteAgentLabel(tabId, args.group || args._session);
+  await rememberSessionTab(label, tabId);
+  noteAgentLabel(tabId, label);
   return tabId;
+}
+
+/**
+ * Every tab a session works in belongs to that session's group.
+ *
+ * This used to be untrue on purpose: grouping a tab marked it *owned*, and
+ * ownership outlived the session, so pointing an agent at your Gmail tab once
+ * meant no later session could ever touch it. The fix at the time was to never
+ * group a tab the agent did not open — which left agent tabs scattered among
+ * yours with nothing to tell them apart, exactly the problem groups exist for.
+ *
+ * The real bug was the leak, not the grouping. `endSession` now releases the
+ * whole workstream when a session ends, so a tab lent to an agent goes back to
+ * being an ordinary tab of yours the moment the agent is gone. With that closed,
+ * grouping every tab a session touches is safe, and the tab strip finally tells
+ * the truth: everything inside the group is being driven, everything outside it
+ * is yours.
+ *
+ * Cosmetic, so it never fails a call — a tab that could not be grouped still
+ * works perfectly.
+ */
+async function claimTab(tabId, label) {
+  if (!label) return; // the side panel is a human driving their own tabs
+
+  // Naming a tab used to be the documented way to *override* this check, back
+  // when the alternative was an agent stuck with no tab at all. It is not any
+  // more — a session that wants a tab opens one — so the override has become
+  // nothing but the one thing the hard rule forbids: two agents on one tab,
+  // where a navigate for a fresh page wipes out another session's work mid-task.
+  const owner = await groups.workstreamFor(tabId);
+  if (owner && owner !== label) {
+    throw new Error(
+      `tab ${tabId} belongs to workstream "${owner}", not "${label}" — refusing to take over another session's tab. ` +
+        'Open your own with browser_tabs action:"new".'
+    );
+  }
+
+  const settings = await getSettings();
+  if (settings.groupTabs === false) return;
+  await groups.assign(tabId, label).catch(() => {});
+}
+
+/**
+ * A session with no tab yet opens its own, in the window it was given.
+ *
+ * The old behaviour was to adopt whatever tab the human was looking at. That
+ * reads well in a demo and badly everywhere else: it makes an agent follow you
+ * around as you switch tabs, it puts two agents on one tab when both start with
+ * nothing, and it means a background job's first act is to take over the page
+ * you are reading. A session opening its own tab, in its own group, in a window
+ * it was told to use, is unambiguous — and pointing it at an existing page is
+ * still one explicit `tabId` away.
+ *
+ * `ensureWindow` is what throws the "which window?" question, so it happens
+ * here, before anything is created. A session that cannot answer it has opened
+ * nothing and left no mess.
+ */
+async function openSessionTab(args) {
+  const label = args.group || args._session;
+  if (!label) return activeTabId(); // side panel: the window the human is in
+
+  const settings = await getSettings();
+  const windowId = await windows.ensureWindow(label, settings);
+
+  const tab = await chrome.tabs.create({ url: 'about:blank', active: false, windowId });
+  await claimTab(tab.id, label);
+  await rememberCreatedTab(args._session || label, tab.id);
+  return tab.id;
 }
 
 /**
@@ -167,12 +248,40 @@ const CREATED_TABS_KEY = 'createdTabs';
 /** Tabs each session last worked on, opened by it or not. Most recent first. */
 const RECENT_TABS_KEY = 'recentTabs';
 
+/**
+ * Serialised, one queue per storage key.
+ *
+ * `chrome.storage` has no read-modify-write, so this shape — read the map, edit
+ * one session's entry, write the map back — loses updates whenever two sessions
+ * do it at once: the second read happens before the first write lands, and the
+ * second write puts back a map that never had the first session's change in it.
+ * Three agents working in parallel hit it constantly. The damage here is a
+ * session's tab list silently emptying, so its tabs are never cleaned up and it
+ * loses track of the tab it was working on.
+ *
+ * One service worker means one JS context, so a promise chain is a sufficient
+ * lock. `windows.js` has the same guard for the same reason, and the failure
+ * there is worse — see the comment on `mutate`.
+ */
+const storageQueues = new Map();
+
+function mutateStored(key, fn) {
+  const run = (storageQueues.get(key) || Promise.resolve()).then(async () => {
+    const all = (await chrome.storage.session.get(key))[key] || {};
+    const result = fn(all);
+    await chrome.storage.session.set({ [key]: all });
+    return result;
+  });
+  storageQueues.set(key, run.then(() => {}, () => {}));
+  return run;
+}
+
 async function remember(key, label, tabId, limit) {
   if (!label) return;
   try {
-    const all = (await chrome.storage.session.get(key))[key] || {};
-    all[label] = [tabId, ...(all[label] || []).filter((id) => id !== tabId)].slice(0, limit);
-    await chrome.storage.session.set({ [key]: all });
+    await mutateStored(key, (all) => {
+      all[label] = [tabId, ...(all[label] || []).filter((id) => id !== tabId)].slice(0, limit);
+    });
   } catch {
     // Bookkeeping for a convenience feature. Never fail a real call over it.
   }
@@ -205,11 +314,14 @@ async function endSession(label) {
   // when auto-close is off, or a later session inherits stale tab ids.
   const forget = async (key) => {
     try {
-      const all = (await chrome.storage.session.get(key))[key] || {};
-      const ids = all[label] || [];
-      delete all[label];
-      await chrome.storage.session.set({ [key]: all });
-      return ids;
+      // Through the same queue as `remember`: a session ending while two others
+      // are opening tabs is the ordinary case, and an unguarded read-modify-write
+      // here would erase their bookkeeping on the way out.
+      return await mutateStored(key, (all) => {
+        const ids = all[label] || [];
+        delete all[label];
+        return ids;
+      });
     } catch {
       return [];
     }
@@ -217,6 +329,11 @@ async function endSession(label) {
 
   const ids = await forget(CREATED_TABS_KEY);
   const recent = await forget(RECENT_TABS_KEY);
+
+  // The window choice was made for this session and dies with it. Leaving it
+  // behind would drop the next session carrying the same name straight into a
+  // window nobody chose for it.
+  await windows.unbind(label);
 
   // Take the border off every tab this session touched. Tabs it merely adopted
   // are the ones that matter — those are the user's own, they outlive the
@@ -264,34 +381,6 @@ async function endSession(label) {
 }
 
 /**
- * Fall back to the active tab, unless it belongs to someone else.
- *
- * A session with no tabs of its own has to start somewhere, and the tab the
- * user is looking at is the right guess — that is how "open the extension and
- * ask it about this page" works. But if that tab is already in another
- * workstream, taking it means two sessions driving one tab, which is how a
- * navigate meant for a fresh page destroyed a different agent's work mid-task.
- * Refusing is cheap and the message says exactly what to do instead.
- */
-async function adoptActiveTab(args) {
-  const tabId = await activeTabId();
-  const label = args.group || args._session;
-  if (!label) return tabId; // the side panel, driven by a human
-
-  // Only agent-*opened* tabs are ever grouped, so a workstream label here means
-  // another session opened this tab for its own task. Your tabs are never
-  // labelled and stay available to everyone.
-  const owner = await groups.workstreamFor(tabId);
-  if (owner && owner !== label) {
-    throw new Error(
-      `the active tab was opened by workstream "${owner}", not "${label}" — refusing to take over another session's tab. ` +
-        'Open your own with browser_tabs action:"new", or pass tabId explicitly to override.'
-    );
-  }
-  return tabId;
-}
-
-/**
  * The tab this session is already working on.
  *
  * Without this, a call that omits `tabId` targets the globally active tab —
@@ -319,15 +408,6 @@ async function sessionTabId(args) {
   }
   return null;
 }
-
-/**
- * Grouping happens only where a tab is opened — see `browser_tabs action:"new"`.
- *
- * It used to happen here too, on every call, which meant simply *looking* at a
- * tab of yours put it in an agent's group and marked it owned. That ownership
- * outlived the session, and every later session was then refused the tab. Tabs
- * an agent did not open are never grouped now.
- */
 
 /**
  * Get a tab ready to be driven: permission check, content scripts present,
@@ -707,11 +787,18 @@ const HANDLERS = {
           const check = checkUrlAllowed(url, settings);
           if (!check.allowed) throw new Error(check.reason);
         }
+        // An explicit windowId wins; otherwise the session's own window, which
+        // is the whole point of binding one. Asking here — before the tab
+        // exists — is what stops a "which window?" question from arriving after
+        // a tab has already been opened in the wrong one.
+        const sessionLabel = args.group || args._session;
+        const windowId = args.windowId ?? (await windows.ensureWindow(sessionLabel, settings)) ?? undefined;
+
         // Background by default: opening ten tabs should not yank focus ten times.
         const tab = await chrome.tabs.create({
           url,
           active: args.background === false,
-          ...(args.windowId ? { windowId: args.windowId } : {}),
+          ...(windowId ? { windowId } : {}),
         });
         // Group before waiting for load, so the tab is visibly labelled the
         // moment it appears rather than after the page settles. An explicit
@@ -755,21 +842,21 @@ const HANDLERS = {
       }
 
       case 'close': {
-        const ids = args.tabIds?.length ? args.tabIds : [await resolveTab(args)];
+        const ids = args.tabIds?.length ? args.tabIds : [await resolveTab(args, { create: false })];
         await chrome.tabs.remove(ids);
         for (const id of ids) fmt.clearSnapshot(id);
         return `closed tab(s): ${ids.join(', ')}`;
       }
 
       case 'select': {
-        const tabId = await resolveTab(args);
+        const tabId = await resolveTab(args, { create: false });
         const tab = await chrome.tabs.update(tabId, { active: true });
         await chrome.windows.update(tab.windowId, { focused: true });
         return `tab ${tabId} is now active\n${fmt.pageHeader(await pageMeta(tabId), tabId)}`;
       }
 
       case 'reload': {
-        const ids = args.tabIds?.length ? args.tabIds : [await resolveTab(args)];
+        const ids = args.tabIds?.length ? args.tabIds : [await resolveTab(args, { create: false })];
         await Promise.all(ids.map((id) => chrome.tabs.reload(id)));
         await Promise.all(ids.map((id) => waitForLoad(id, 20000).catch(() => {})));
         for (const id of ids) fmt.clearSnapshot(id);
@@ -777,7 +864,7 @@ const HANDLERS = {
       }
 
       case 'duplicate': {
-        const tabId = await resolveTab(args);
+        const tabId = await resolveTab(args, { create: false });
         const tab = await chrome.tabs.duplicate(tabId);
         return `duplicated tab ${tabId} as ${tab.id}`;
       }
@@ -1542,6 +1629,55 @@ const HANDLERS = {
 
   // -------------------------------------------------------------- window ----
   async browser_window(args) {
+    const label = args.group || args._session;
+
+    // Window selection is handled before anything touches a tab. It has to be:
+    // this is the call an agent makes *because* it has no window yet, and
+    // resolving a tab first would either open one in the wrong window or throw
+    // the very question this call exists to answer.
+    if (args.action) {
+      switch (args.action) {
+        case 'list': {
+          const wins = await windows.summary();
+          const bound = label ? await windows.boundWindowId(label) : null;
+          return [
+            `${wins.length} window(s):`,
+            ...wins.map((w, i) => {
+              // Who is already working here matters more than anything else on
+              // the line: it is the difference between an empty window and one
+              // another agent is mid-task in.
+              const who = w.sessions.length
+                ? `  ← ${w.sessions.map((s) => (s === label ? `${s} (you)` : s)).join(', ')}`
+                : '';
+              return windows.describeWindow(w, i + 1) + who;
+            }),
+            bound == null
+              ? `"${label || 'this session'}" has no window yet — bind one with action:"use" windowId:<id>, ` +
+                'or action:"pick" to let the user choose in the browser.'
+              : `"${label}" works in window ${bound}.`,
+          ].join('\n');
+        }
+
+        case 'use': {
+          if (args.windowId == null) throw new Error('pass `windowId` — which window this session should work in.');
+          const id = await windows.use(label, args.windowId);
+          return `"${label}" will work in window ${id}. Its tabs open there, in their own group.`;
+        }
+
+        case 'pick': {
+          const res = await windows.pick(label);
+          if (!res.asked) return `only one window is open; "${label}" will work in window ${res.windowId}.`;
+          return (
+            `the user chose window ${res.windowId} (${res.tabCount} tab(s)); "${label}" works there now.` +
+            (res.skipped ? ` ${res.skipped} window(s) could not show the prompt.` : '')
+          );
+        }
+
+        default:
+          throw new Error(`unknown window action: ${args.action}. Use "list", "use", or "pick".`);
+      }
+    }
+
     const tabId = await resolveTab(args);
     await prepareTab(tabId, { needsScripts: false });
     const done = [];

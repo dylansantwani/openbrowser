@@ -427,6 +427,122 @@ var OB = globalThis.OB || (globalThis.OB = {});
     return true;
   }
 
+  /**
+   * "An agent wants to work in this window — is it this one?"
+   *
+   * Shown in one tab per window when a session starts and more than one window
+   * is open. Unlike everything else this file draws, it is *interactive*: it is
+   * the only overlay with `pointer-events`, because the click is the whole
+   * point.
+   *
+   * Deliberately not focus-stealing. The obvious thing is to focus the primary
+   * button so Enter takes it, but this appears unannounced on a page someone may
+   * be typing into, and swallowing a keystroke meant for a text field to answer
+   * a question they had not read yet is worse than one extra click.
+   */
+  function windowPick(on, { token, label } = {}) {
+    if (window.top !== window) return false; // one prompt per window, not per frame
+    const root = document.body || document.documentElement;
+    if (!root) return false;
+
+    // Several agents can be asking at once — that is the whole point of the hub
+    // — so prompts stack rather than replace. Keying on the token is what makes
+    // that safe: one session finishing must clear its own card and nobody
+    // else's, or it strands the others waiting on a question that is no longer
+    // on screen.
+    const box = document.querySelector('.ob-window-pick');
+    const existing = token && box?.querySelector(`[data-ob-token="${CSS.escape(token)}"]`);
+
+    if (!on) {
+      if (token) existing?.remove();
+      else box?.remove();
+      if (box && !box.children.length) box.remove();
+      return false;
+    }
+
+    existing?.remove();
+
+    const stack = box || document.createElement('div');
+    if (!box) {
+      stack.className = 'ob-window-pick';
+      root.appendChild(stack);
+    } else if (stack.parentElement !== root) {
+      root.appendChild(stack);
+    }
+
+    const card = document.createElement('div');
+    card.className = 'ob-window-pick-card';
+    card.setAttribute('role', 'dialog');
+    card.setAttribute('aria-modal', 'false');
+    card.setAttribute('aria-label', `${label || 'An agent'} is asking to work in this window`);
+    if (token) card.dataset.obToken = token;
+
+    const title = document.createElement('div');
+    title.className = 'ob-window-pick-title';
+    // textContent throughout: the label is a session name, but it reaches here
+    // from another process and this is a page the user is trusting.
+    title.textContent = `⚡ ${label || 'An agent'} wants to work in this window`;
+
+    const sub = document.createElement('div');
+    sub.className = 'ob-window-pick-sub';
+    sub.textContent = 'It will open its own tab group here. Your existing tabs are left alone.';
+
+    const row = document.createElement('div');
+    row.className = 'ob-window-pick-actions';
+
+    const dismiss = () => {
+      card.remove();
+      removeEventListener('keydown', onKey, true);
+      if (!stack.children.length) stack.remove();
+    };
+
+    const answer = (choice) => {
+      try {
+        // May reject if the worker is gone. Nothing here waits on the reply, so
+        // the rejection is swallowed rather than surfacing as a page error.
+        const sent = chrome.runtime.sendMessage({ type: 'ob_window_pick', token, label, choice });
+        if (sent && typeof sent.catch === 'function') sent.catch(() => {});
+      } catch {
+        /* worker gone; the prompt clearing itself is still the right thing */
+      }
+      dismiss();
+    };
+
+    const yes = document.createElement('button');
+    yes.className = 'ob-window-pick-btn ob-window-pick-yes';
+    yes.type = 'button';
+    yes.textContent = 'Use this window';
+    yes.addEventListener('click', () => answer('use'));
+
+    const no = document.createElement('button');
+    no.className = 'ob-window-pick-btn';
+    no.type = 'button';
+    no.textContent = 'Not this one';
+    no.addEventListener('click', () => answer('decline'));
+
+    row.append(yes, no);
+    card.append(title, sub, row);
+    stack.append(card);
+
+    // Escape declines the *newest* card only. With three agents stacked,
+    // dismissing all of them on one keypress would answer for sessions the user
+    // has not looked at yet.
+    function onKey(e) {
+      if (e.key !== 'Escape' || !card.isConnected) return;
+      if (stack.lastElementChild !== card) return;
+      e.stopPropagation();
+      answer('decline');
+    }
+    addEventListener('keydown', onKey, true);
+
+    // Self-destruct. The background clears these once a choice is made, but an
+    // MV3 worker can die with the prompt still up, and a question nobody is
+    // listening to the answer of must not sit on the page forever.
+    setTimeout(dismiss, 120_000);
+
+    return true;
+  }
+
   OB.actions = {
     clickPoint,
     isPointOn,
@@ -439,6 +555,7 @@ var OB = globalThis.OB || (globalThis.OB = {});
     textPresent,
     highlight,
     agentFrame,
+    windowPick,
     setFrameOffset,
     frameOffset,
     describe,

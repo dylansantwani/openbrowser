@@ -57,12 +57,26 @@ stamped by the server *after* the argument spread so a model cannot assert
 someone else's identity by emitting `_session` itself.
 
 **Never act on a tab the session did not choose.** A call with no `tabId`
-resolves to the session's own last-driven tab, and only falls back to the
-human's active tab when it has none. Resolving straight to the active tab means
-two agents fight over one tab, and that an agent follows the human around as
-they switch tabs. A tab acquired by that fallback is deliberately left
-ungrouped: pulling the page someone is reading into an agent's group moves and
-re-colours it in the tab strip, which looks like the browser acting on its own.
+resolves to the session's own last-driven tab, and opens a fresh one in the
+session's group when it has none. It never falls back to whatever the human is
+looking at — that is how two agents ended up fighting over one tab, and how an
+agent followed the human around as they switched tabs. Pointing a session at an
+existing page is an explicit `tabId`, and that tab is then pulled into the
+session's group like everything else it drives.
+
+**A session works in one window, and it is told which.** Tab groups only
+organise tabs inside a window, so with two windows open an agent's first tab
+lands in whichever one Chrome considers current — the one the human was last
+looking at. `windows.js` binds a session to a window before it opens anything;
+with several open, `ensureWindow` throws a chooser instead of guessing, and the
+human answers either through the agent (`browser_window action:"use"`) or by
+clicking the prompt `action:"pick"` paints in every window. Bindings are keyed
+by session label in `chrome.storage.session` and released when the session ends,
+so a name reused later never inherits a window nobody chose for it.
+
+The pick prompt is the one thing on a page an agent must not be able to see:
+it is in `OWN_DECORATION` in `a11y.js`, so it never enters a snapshot, so no
+agent can find its buttons and answer a question about itself.
 
 ---
 
@@ -77,9 +91,10 @@ of every task.
 
 Guard rails already in place:
 
-- `test/run.mjs` asserts the tool schemas stay under 13.5KB. They ship on every
+- `test/run.mjs` asserts the tool schemas stay under 14.1KB. They ship on every
   request. Raise it only for guidance that demonstrably prevents a failed call —
-  never to make room for prose. The comment there records why it moved once.
+  never to make room for prose. The comment there records every time it moved
+  and what failure each raise bought.
 - `test/a11y-browser.html` asserts a login form renders under 250 characters.
 
 Before changing either file, run both. If output grows, justify it.
@@ -131,6 +146,50 @@ Chrome defers focus events while a document lacks system focus, and backgrounded
 tabs are the normal case here, so `document.activeElement` is compared directly
 rather than listened for.
 
+**`chrome.storage` has no read-modify-write, and three agents will find that
+out.** The natural shape — read the map, edit your session's key, write the map
+back — spans two awaits, so a second session's read lands before the first's
+write and the first's change is simply gone. Two agents survive it by luck;
+three hit it constantly, which is exactly the configuration the hub exists for.
+The damage is not a missing entry but a *wrong* one: a session whose window
+binding vanished asks again, and with one window open it is answered silently
+with the focused window — where the other agents already are. Reported live as
+"agents are using the wrong window". Everything touching a shared storage key
+now goes through a per-key promise chain (`mutate` in `windows.js`,
+`mutateStored` in `router.js`). One service worker means one JS context, so a
+promise chain is a sufficient lock.
+
+`groups.assign` had the same shape against Chrome's own state: look for the
+group, miss, create it. Two tabs grouped at once made *two* groups with one
+title, and a lookup taking the first match then saw half a workstream — in
+whichever window it happened to pick. It is serialised per workstream now, and
+the lookups gather every matching group rather than the first, so a duplicate
+from an older run cannot hide tabs. `test/run.mjs` covers both; the group one
+was verified to fail when the guard is removed.
+
+**The service worker dies while a prompt is waiting for a human.** The window
+picker asks the user a question and waits up to 90s. MV3 tore the worker down
+in the middle of that repeatedly — visible in the hub log as a disconnect and
+reconnect with the prompt still on screen — and the click then arrived at a
+*fresh* worker whose `pending` map was empty. The answer was dropped, silently,
+and the call hung until it timed out. The bridge's 20s heartbeat did not prevent
+it: a WebSocket send does not reliably reset Chrome's idle timer, while an
+extension API call does. So `windows.js` runs a `getPlatformInfo` keepalive for
+as long as a prompt is up, *and* keeps the tally in `chrome.storage.session` so
+a respawned worker still counts the answer and the retry can report it. Anything
+else that waits on a human needs both halves — the keepalive is not a guarantee.
+
+**`!important` beats a CSS animation, so forcing a property makes it inert.**
+Author `!important` declarations sit *above* animations in the cascade. Every
+rule in `overlay.css` is forced, because a page's own reset must not be able to
+hide our overlays — so when the agent frame was given a pulse, the base
+`border: … !important` silently won and the animation did nothing. It is
+attached, `playState` is `running`, `animationName` is right, and the computed
+value never moves. Nothing about it looks broken. Any property a keyframe drives
+must therefore be declared *without* `!important`, which is the one place this
+file breaks its own rule. `test/overlay-preview.html` samples the computed value
+across the cycle rather than trusting that the animation exists.
+
 **MutationObserver does not cross a shadow boundary, but the tree walk does.**
 `subtree: true` stops at the shadow root; `childrenOf` walks straight through
 open ones. Every shadow root met during a walk is observed explicitly, or a web
@@ -177,6 +236,7 @@ extension/
     frames.js         iframe enumeration, injection, ref routing (fN prefix)
     recorder.js       console/network ring buffers, captured continuously
     groups.js         tab groups, one per MCP session
+    windows.js        which window a session works in; the in-browser chooser
     bridge.js         WebSocket client + reconnection + MV3 keepalive
   content/            injected into every frame
   sidepanel/          the UI — calls the same dispatch() as MCP
@@ -189,8 +249,9 @@ mcp-server/src/
   tools.js            the 14 tool schemas — token-critical
 
 test/
-  run.mjs             75 tests, no browser needed
-  a11y-browser.html   68 tests, needs a browser (npm run preview)
+  run.mjs             99 tests, no browser needed
+  a11y-browser.html   73 tests, needs a browser (npm run preview)
+  overlay-preview.html the on-page overlays, self-checking (same server)
 ```
 
 ---
@@ -245,7 +306,7 @@ presence — a `.value` can be empty while the control visibly shows a value
 ## Testing
 
 ```bash
-npm test          # 75 tests — run before and after every change
+npm test          # 99 tests — run before and after every change
 npm run preview   # then open /test/a11y-browser.html for 68 DOM tests
 ```
 

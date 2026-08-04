@@ -46,10 +46,27 @@ export function isSupported() {
  * matching is a glob — a workstream called "checkout *" would collect its
  * neighbours.
  */
-async function findGroup(name) {
+async function findGroups(name) {
   const wanted = PREFIX + name;
   const all = await chrome.tabGroups.query({});
-  return all.find((g) => g.title === wanted) || null;
+  return all.filter((g) => g.title === wanted);
+}
+
+/**
+ * @param {string} name
+ * @param {number} [preferWindowId] when a workstream somehow has more than one
+ *   group, take the one in this window. Duplicates should no longer be created
+ *   — see `assign` — but they can still exist from an older run or be made by
+ *   hand, and picking arbitrarily is how a session ends up acting in a window
+ *   it never chose.
+ */
+async function findGroup(name, preferWindowId) {
+  const found = await findGroups(name);
+  if (preferWindowId != null) {
+    const here = found.find((g) => g.windowId === preferWindowId);
+    if (here) return here;
+  }
+  return found[0] || null;
 }
 
 /**
@@ -62,7 +79,30 @@ async function findGroup(name) {
  * @param {number} tabId
  * @param {string} name workstream label, e.g. "checkout flow"
  */
-export async function assign(tabId, name = 'agent') {
+/**
+ * One `assign` at a time per workstream.
+ *
+ * `assign` looks for the group, finds nothing, and creates one — across two
+ * awaits. Two tabs being grouped into the same workstream at once therefore
+ * both look, both miss, and both create, leaving *two* Chrome groups carrying
+ * the same title. Nothing errors. But `findGroup` returns the first match, so
+ * `tabsFor` from then on reports only half the workstream, and a session asking
+ * "which tab am I working on" can be handed one from the wrong half — in the
+ * wrong window, if the user has since dragged one group elsewhere.
+ *
+ * An agent opening several tabs in one batch does this to itself; several
+ * agents make it routine. Serialising per name costs nothing — grouping is
+ * already off the critical path — and removes the whole class.
+ */
+const assignQueues = new Map();
+
+export function assign(tabId, name = 'agent') {
+  const run = (assignQueues.get(name) || Promise.resolve()).then(() => assignNow(tabId, name));
+  assignQueues.set(name, run.then(() => {}, () => {}));
+  return run;
+}
+
+async function assignNow(tabId, name) {
   if (!isSupported()) return null;
 
   const tab = await chrome.tabs.get(tabId);
@@ -71,7 +111,7 @@ export async function assign(tabId, name = 'agent') {
   // service worker would create a duplicate group with the same title.
   let existing = groups.get(name);
   if (!existing) {
-    const found = await findGroup(name).catch(() => null);
+    const found = await findGroup(name, tab.windowId).catch(() => null);
     if (found) existing = { groupId: found.id, windowId: found.windowId, color: found.color };
   }
 
@@ -137,10 +177,14 @@ export async function rename(name, title) {
 export async function release(name) {
   groups.delete(name);
   try {
-    const group = await findGroup(name);
-    if (!group) return false;
-    const tabs = await chrome.tabs.query({ groupId: group.id });
-    if (tabs.length) await chrome.tabs.ungroup(tabs.map((t) => t.id));
+    // Every group carrying this name, not just the first: releasing half a
+    // workstream leaves the rest labelled and owned by a session that is gone.
+    const found = await findGroups(name);
+    if (!found.length) return false;
+    for (const group of found) {
+      const tabs = await chrome.tabs.query({ groupId: group.id });
+      if (tabs.length) await chrome.tabs.ungroup(tabs.map((t) => t.id));
+    }
     return true;
   } catch {
     return false;
@@ -151,12 +195,14 @@ export async function release(name) {
 export async function closeWorkstream(name) {
   groups.delete(name);
   try {
-    const group = await findGroup(name);
-    if (!group) return 0;
-    const tabs = await chrome.tabs.query({ groupId: group.id });
-    if (!tabs.length) return 0;
-    await chrome.tabs.remove(tabs.map((t) => t.id));
-    return tabs.length;
+    const ids = [];
+    for (const group of await findGroups(name)) {
+      const tabs = await chrome.tabs.query({ groupId: group.id });
+      ids.push(...tabs.map((t) => t.id));
+    }
+    if (!ids.length) return 0;
+    await chrome.tabs.remove(ids);
+    return ids.length;
   } catch {
     return 0;
   }
@@ -199,11 +245,11 @@ export async function list() {
 export async function tabsFor(name) {
   if (!isSupported() || !name) return [];
   try {
-    const group = await findGroup(name);
-    if (!group) return [];
-
-    const tabs = await chrome.tabs.query({ groupId: group.id });
-    return tabs
+    const all = [];
+    for (const group of await findGroups(name)) {
+      all.push(...(await chrome.tabs.query({ groupId: group.id })));
+    }
+    return all
       .sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))
       .map((t) => t.id);
   } catch {

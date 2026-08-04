@@ -71,6 +71,20 @@
         <div style="display:none"><button>Never rendered</button></div>
         <div aria-hidden="true"><button>Hidden from a11y</button></div>
 
+        <!--
+          Our own overlays. The window prompt is the one that matters: it asks
+          the human which window an agent may work in, so an agent that could
+          see its buttons in a snapshot could click "Use this window" itself.
+        -->
+        <div class="ob-agent-frame" data-ob-agent="OpenBrowser · test"></div>
+        <div class="ob-window-pick" role="dialog">
+          <div class="ob-window-pick-card">
+            <div class="ob-window-pick-title">claude · test wants to work in this window</div>
+            <button class="ob-window-pick-btn ob-window-pick-yes">Use this window</button>
+            <button class="ob-window-pick-btn">Not this one</button>
+          </div>
+        </div>
+
         <!-- Screen-reader-only text is a real control, not noise. -->
         <a href="/skip" class="visually-hidden">Skip to content</a>
 
@@ -184,6 +198,13 @@
       check('aria-hidden excluded', !/Hidden from a11y/.test(text));
       check('[hidden] container excluded', !/hidden-field/.test(text));
       check('visually-hidden link included', /link "Skip to content"/.test(text));
+
+      // Our own overlays never enter the tree we report. For the window prompt
+      // that is not tidiness — it is the only thing stopping an agent from
+      // answering a question the human was asked about it.
+      check('the window prompt is invisible to a snapshot',
+        !/Use this window/.test(text) && !/Not this one/.test(text));
+      check('the agent frame is invisible to a snapshot', !/OpenBrowser · test/.test(text));
 
       // --- Real-site regressions ---------------------------------------------
       // Each of these was found by running against Wikipedia, not by design.

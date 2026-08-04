@@ -37,6 +37,21 @@ const DEFAULTS = {
   groupTabs: true,
 
   /**
+   * Ask which window a session should work in, when more than one is open.
+   *
+   * A tab group only organises tabs inside one window, so without this an
+   * agent's first tab lands wherever Chrome considers current — which is the
+   * window the human was last looking at. With a work window and a personal
+   * one open, that is a coin flip every session.
+   *
+   * Off means "use the focused window and never ask", which is the right
+   * setting for one agent and one window, and the wrong one for anybody who
+   * keeps their browsing separate from what the agent is doing. One window
+   * open is never a question either way.
+   */
+  chooseWindow: true,
+
+  /**
    * When an MCP client disconnects, close the tabs that session opened.
    *
    * Only tabs the session created itself are closed — never one it adopted
@@ -150,6 +165,19 @@ chrome.storage.onChanged.addListener((changes, area) => {
  */
 export function checkUrlAllowed(url, settings) {
   let host;
+
+  // A session that has just started owns exactly one tab and it is blank —
+  // that is what opening its own tab in its own window leaves behind. Reaching
+  // this with `about:blank` is therefore the *normal* first step of a session,
+  // not a mistake, and it deserves the instruction rather than the generic
+  // "browser restriction" answer that reads like something went wrong.
+  if (url === 'about:blank' || url === '') {
+    return {
+      allowed: false,
+      reason: 'this tab is blank — open a page in it first with browser_navigate url:"…".',
+    };
+  }
+
   try {
     const parsed = new URL(url);
     // Browser-internal pages cannot be scripted at all; say so plainly rather

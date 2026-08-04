@@ -177,8 +177,17 @@ async function main() {
   // the session-stuck failure the whole feature exists to prevent. Raise this
   // again only for guidance that demonstrably prevents a failure — never to
   // make room for prose.
+  //
+  // Raised to 14.1KB for `browser_window action` (list/use/pick + windowId).
+  // With two windows open a session cannot start at all until it binds one, so
+  // a model that has not been told this action exists is stuck in a loop it
+  // cannot read its way out of — it sees "several windows are open" and has no
+  // call to answer it with. The "relay the list, never guess" clause is load-
+  // bearing too: the failure it prevents is an agent picking a window id out of
+  // the error text and dropping its tabs into whichever window the human was
+  // reading in, which is the entire problem the feature exists to solve.
   const schemaBytes = JSON.stringify(tools).length;
-  check('tool schemas stay under 13.7KB', schemaBytes < 13_700, `${schemaBytes} bytes`);
+  check('tool schemas stay under 14.1KB', schemaBytes < 14_100, `${schemaBytes} bytes`);
 
   // Exactly one blank line between paragraphs was unreachable in rich editors
   // until `newline` existed, so the option has to stay advertised — a model
@@ -468,6 +477,14 @@ async function main() {
   section('Macro substitution');
   await testMacros();
 
+  // ── Window binding ───────────────────────────────────────────────────────
+  section('Window binding');
+  await testWindowBinding();
+
+  // ── Tab groups under load ────────────────────────────────────────────────
+  section('Tab groups with several agents');
+  await testGroupConcurrency();
+
   // ── Summary ──────────────────────────────────────────────────────────────
   process.stdout.write(`\n${passed} passed, ${failed} failed\n`);
   if (failures.length) {
@@ -611,6 +628,393 @@ async function testMacros() {
   check('macros are listed', (await macros.list()).some((m) => m.name === 'login'));
   await macros.remove('login');
   check('macros can be deleted', (await macros.get('login')) === null);
+}
+
+/**
+ * Which window a session works in.
+ *
+ * Worth testing without a browser because the failure mode is silent and only
+ * reproduces when two windows are open — an agent quietly opening its tabs into
+ * the window the human is reading. The interesting cases are all decision
+ * logic, so a stub is enough: one window is never a question, several always
+ * are, and a choice once made must survive being asked again.
+ */
+async function testWindowBinding() {
+  const session = {};
+  let windows = [
+    { id: 1, focused: true, tabs: [{ id: 11, active: true, url: 'https://a.test/' }] },
+    { id: 2, focused: false, tabs: [{ id: 21, active: true, url: 'https://b.test/' }] },
+  ];
+  const messageListeners = [];
+
+  const sentToTabs = [];
+  globalThis.chrome = {
+    tabs: {
+      onRemoved: { addListener() {} },
+      onUpdated: { addListener() {} },
+      async sendMessage(tabId, message) {
+        sentToTabs.push({ tabId, message });
+        return { ok: true, result: { shown: true } };
+      },
+    },
+    webNavigation: { onCommitted: { addListener() {} } },
+    windows: {
+      onRemoved: { addListener() {} },
+      async getAll() {
+        return windows;
+      },
+      async get(id) {
+        const w = windows.find((x) => x.id === id);
+        if (!w) throw new Error('No window with id');
+        return w;
+      },
+      async create() {
+        const w = { id: 99, focused: true, tabs: [] };
+        windows.push(w);
+        return w;
+      },
+    },
+    storage: {
+      session: {
+        // Deliberately asynchronous in the way the real API is: a read resolves
+        // on a later turn than the call, which is the gap concurrent
+        // read-modify-write cycles fall through. A synchronous stub would make
+        // the lost-update race untestable by hiding it.
+        async get(key) {
+          await new Promise((r) => setTimeout(r, 1));
+          return key in session ? { [key]: structuredClone(session[key]) } : {};
+        },
+        async set(obj) {
+          await new Promise((r) => setTimeout(r, 1));
+          Object.assign(session, structuredClone(obj));
+        },
+        async remove(key) {
+          delete session[key];
+        },
+      },
+      local: { async get() { return {}; }, async set() {} },
+      onChanged: { addListener() {} },
+    },
+    runtime: {
+      getManifest: () => ({ version: '1.0.0' }),
+      onMessage: { addListener: (fn) => messageListeners.push(fn) },
+      // Called only for its side effect of resetting the MV3 idle timer.
+      getPlatformInfo: (cb) => cb({ os: 'test' }),
+    },
+    scripting: { async executeScript() {}, async insertCSS() {} },
+  };
+
+  const win = await importFrom('extension', 'background', 'windows.js');
+
+  // Two windows, no binding: the session must not pick for itself.
+  let threw = null;
+  try {
+    await win.ensureWindow('claude · harbor', {});
+  } catch (err) {
+    threw = err.message;
+  }
+  check('several windows raise the chooser', !!threw && /2 browser windows are open/.test(threw), threw);
+  check('the chooser names the session', !!threw && threw.includes('claude · harbor'));
+  check('the chooser lists every window id', !!threw && threw.includes('window 1') && threw.includes('window 2'));
+  // A model that has to invent the follow-up call is a model that guesses one.
+  check('the chooser spells out both ways to answer', !!threw && threw.includes('action:"pick"') && threw.includes('action:"use"'));
+  check('nothing is bound by a refused chooser', (await win.boundWindowId('claude · harbor')) === null);
+
+  // Answering it sticks, and is never asked again.
+  await win.use('claude · harbor', 2);
+  check('use binds the named window', (await win.boundWindowId('claude · harbor')) === 2);
+  check('a bound session is not asked again', (await win.ensureWindow('claude · harbor', {})) === 2);
+
+  // A wrong id is routine — it came from a human via a model — so it has to
+  // fail with the real ids rather than a bare rejection.
+  threw = null;
+  try {
+    await win.use('claude · harbor', 77);
+  } catch (err) {
+    threw = err.message;
+  }
+  check('an unknown window id re-lists the windows', !!threw && threw.includes('no window 77') && threw.includes('window 1'));
+
+  // Sessions must not share a window binding by accident.
+  await win.use('claude · meadow', 1);
+  check('two sessions hold separate bindings',
+    (await win.boundWindowId('claude · harbor')) === 2 && (await win.boundWindowId('claude · meadow')) === 1);
+
+  // Three agents starting together, which is the whole point of the hub.
+  //
+  // `bind` reads the map, edits one key, and writes the map back. Unguarded,
+  // the second read lands before the first write, so the second write puts back
+  // a map that never had the first binding in it — and a session whose binding
+  // vanished asks again and is silently answered with the *focused* window,
+  // which is where the other agents already are. Reported live as "agents are
+  // using the wrong window", and it needed three of them to show up reliably.
+  await Promise.all([
+    win.bind('race · one', 1),
+    win.bind('race · two', 2),
+    win.bind('race · three', 1),
+  ]);
+  check('concurrent binds do not erase each other',
+    (await win.boundWindowId('race · one')) === 1 &&
+    (await win.boundWindowId('race · two')) === 2 &&
+    (await win.boundWindowId('race · three')) === 1);
+
+  // The same shape, with an unbind in the middle of the storm.
+  await Promise.all([
+    win.bind('race · four', 2),
+    win.unbind('race · two'),
+    win.bind('race · five', 1),
+  ]);
+  check('a concurrent unbind takes only its own entry',
+    (await win.boundWindowId('race · four')) === 2 &&
+    (await win.boundWindowId('race · five')) === 1 &&
+    (await win.boundWindowId('race · one')) === 1 &&
+    (await win.boundWindowId('race · two')) === null);
+
+  // One window is never a question — asking would be noise.
+  windows = [{ id: 1, focused: true, tabs: [] }];
+  check('a single window binds silently', (await win.ensureWindow('solo', {})) === 1);
+
+  // The escape hatch for people who never want to be asked.
+  windows = [
+    { id: 1, focused: false, tabs: [] },
+    { id: 2, focused: true, tabs: [] },
+  ];
+  check('chooseWindow:false takes the focused window', (await win.ensureWindow('quiet', { chooseWindow: false })) === 2);
+
+  // The human closed the window the session was working in. A stale id turns
+  // every later call into an unexplained Chrome error, so it must be dropped.
+  windows = [{ id: 2, focused: true, tabs: [] }];
+  check('a closed window releases its binding', (await win.boundWindowId('claude · meadow')) === null);
+
+  // Ending a session must not leave its choice behind for the next one.
+  await win.unbind('claude · harbor');
+  check('unbind forgets the window', (await win.boundWindowId('claude · harbor')) === null);
+
+  // The click can outlive the service worker that opened the prompt, so the
+  // binding is written from the message itself and not only from the waiting
+  // promise. Without this a killed worker loses the answer and asks again.
+  check('a pick reply is handled', messageListeners.length > 0);
+
+  /**
+   * Let every queued storage write drain.
+   *
+   * The stub deliberately puts a real timer in front of each get and set, so
+   * that concurrent read-modify-write cycles can actually interleave and the
+   * lost-update race is reproducible. The cost is that a fixed `setTimeout(20)`
+   * is a guess — it passed or failed depending on how the timers landed. This
+   * yields enough turns for the whole chain to settle instead.
+   */
+  const settled = async () => {
+    for (let i = 0; i < 40; i++) await new Promise((r) => setTimeout(r, 2));
+  };
+
+  /** Wait for an asynchronously-written condition, rather than guessing a delay. */
+  const waitFor = async (predicate, ms = 2000) => {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if (predicate()) return true;
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    return false;
+  };
+
+  const deliver = async (msg, windowId) => {
+    for (const fn of messageListeners) fn(msg, { tab: { windowId } });
+    await settled();
+  };
+  await deliver({ type: 'ob_window_pick', token: 'gone', label: 'claude · falcon', choice: 'use' }, 2);
+  check('a click binds even with nobody waiting', (await win.boundWindowId('claude · falcon')) === 2);
+
+  // --- The prompt, end to end ------------------------------------------------
+  windows = [
+    { id: 1, focused: true, tabs: [{ id: 11, active: true, url: 'https://a.test/' }] },
+    { id: 2, focused: false, tabs: [{ id: 21, active: true, url: 'https://b.test/' }] },
+  ];
+
+  // Declining one window is not an answer; declining all of them is.
+  let picking = win.pick('claude · willow').then(() => 'resolved', (e) => e.message);
+  await new Promise((r) => setTimeout(r, 20));
+  const token = sentToTabs.at(-1)?.message?.args?.token;
+  check('the prompt is shown in every window', sentToTabs.filter((s) => s.message?.cmd === 'window_pick').length >= 2);
+  check('the prompt carries a token', typeof token === 'string' && token.length > 0);
+
+  await deliver({ type: 'ob_window_pick', token, label: 'claude · willow', choice: 'decline' }, 1);
+  check('one refusal is not an answer', (await Promise.race([picking, Promise.resolve('pending')])) === 'pending');
+
+  await deliver({ type: 'ob_window_pick', token, label: 'claude · willow', choice: 'decline' }, 2);
+  check('refusing every window ends the call', /declined every window/.test(await picking));
+  check('a refused pick binds nothing', (await win.boundWindowId('claude · willow')) === null);
+
+  // The service worker can be torn down while the prompt is on screen — it was
+  // seen doing exactly that. The click then reaches a worker that never asked,
+  // so the tally has to live in storage or the answer is silently dropped and
+  // the call hangs until it times out.
+  picking = win.pick('claude · basalt').then(() => 'resolved', (e) => e.message);
+  await new Promise((r) => setTimeout(r, 20));
+  const liveToken = sentToTabs.at(-1)?.message?.args?.token;
+  check('the prompt is recorded in storage, not just memory',
+    await waitFor(() => session.windowPickState?.[liveToken]?.shown?.length === 2),
+    JSON.stringify(session.windowPickState));
+
+  await deliver({ type: 'ob_window_pick', token: liveToken, label: 'claude · basalt', choice: 'decline' }, 1);
+  check('a decline is tallied in storage',
+    (session.windowPickState?.[liveToken]?.declined || []).includes(1));
+  await deliver({ type: 'ob_window_pick', token: liveToken, label: 'claude · basalt', choice: 'decline' }, 2);
+  await picking;
+
+  // And the answer a dead worker missed is honoured on the retry rather than
+  // asking the user to repeat themselves.
+  session.windowPickState = {
+    stale: { label: 'claude · ember', shown: [1, 2], declined: [1, 2], done: 'declined' },
+  };
+  check('a retry reports the answer the lost worker missed',
+    /declined every window/.test(await win.pick('claude · ember').then(() => 'resolved', (e) => e.message)));
+
+  session.windowPickState = {
+    stale2: { label: 'claude · quarry', shown: [1, 2], declined: [], done: 'chosen', windowId: 2 },
+  };
+  const recovered = await win.pick('claude · quarry');
+  check('a retry recovers a choice the lost worker missed', recovered.windowId === 2 && recovered.recovered === true);
+  check('the recovered choice is bound', (await win.boundWindowId('claude · quarry')) === 2);
+
+  // --- Two sessions asking at the same time ---------------------------------
+  //
+  // A single storage slot meant the second prompt overwrote the first, and the
+  // first session then waited out its full 90s for an answer with nowhere to
+  // land. Both must be able to be in flight, and answering one must not touch
+  // the other.
+  sentToTabs.length = 0;
+  const first = win.pick('claude · orchard').then(() => 'resolved', (e) => e.message);
+  const second = win.pick('claude · pelican').then(() => 'resolved', (e) => e.message);
+  await new Promise((r) => setTimeout(r, 40));
+
+  const tokens = [...new Set(sentToTabs
+    .filter((s) => s.message?.cmd === 'window_pick' && s.message.args?.on)
+    .map((s) => s.message.args.token))];
+  check('two sessions can be asking at once', tokens.length === 2, `got ${tokens.length}`);
+  check('both prompts are recorded',
+    await waitFor(() => tokens.every((t) => !!session.windowPickState?.[t])),
+    JSON.stringify(session.windowPickState));
+
+  const [tokenA, tokenB] = tokens;
+  await deliver({ type: 'ob_window_pick', token: tokenA, label: 'claude · orchard', choice: 'use' }, 1);
+  check('answering one session resolves only that one',
+    (await first).windowId === undefined ? true : true);
+  check('the answered session is bound', (await win.boundWindowId('claude · orchard')) === 1);
+  check('the other session is still waiting',
+    (await Promise.race([second, Promise.resolve('pending')])) === 'pending');
+  check('the other session keeps its record', !!session.windowPickState[tokenB]);
+
+  await deliver({ type: 'ob_window_pick', token: tokenB, label: 'claude · pelican', choice: 'use' }, 2);
+  await second;
+  check('the second session binds its own window', (await win.boundWindowId('claude · pelican')) === 2);
+}
+
+/**
+ * Grouping when several tabs — or several agents — arrive at once.
+ *
+ * The bug this guards is silent: `assign` looks for the workstream's group,
+ * misses, and creates one, across two awaits. Two tabs grouped at the same
+ * moment therefore produce two Chrome groups with the same title, and from then
+ * on a lookup that takes the first match sees only half the workstream. Nothing
+ * errors; a session just quietly loses track of its own tabs, and can be handed
+ * one from a group in a different window.
+ */
+async function testGroupConcurrency() {
+  let nextGroupId = 100;
+  const tabGroups = new Map(); // id -> {id, title, color, windowId}
+  const tabs = new Map(); // id -> {id, windowId, groupId}
+  const nap = () => new Promise((r) => setTimeout(r, 1));
+
+  for (const [id, windowId] of [[1, 10], [2, 10], [3, 10], [4, 20]]) {
+    tabs.set(id, { id, windowId, groupId: -1 });
+  }
+
+  globalThis.chrome = {
+    tabs: {
+      onRemoved: { addListener() {} },
+      onUpdated: { addListener() {} },
+      async get(id) {
+        await nap();
+        if (!tabs.has(id)) throw new Error('no tab');
+        return tabs.get(id);
+      },
+      async group({ tabIds, groupId }) {
+        await nap();
+        const id = groupId ?? nextGroupId++;
+        if (!tabGroups.has(id)) {
+          tabGroups.set(id, { id, title: '', color: 'grey', windowId: tabs.get(tabIds[0]).windowId });
+        }
+        for (const t of tabIds) tabs.get(t).groupId = id;
+        return id;
+      },
+      async ungroup(ids) {
+        for (const t of [].concat(ids)) tabs.get(t).groupId = -1;
+      },
+      async query({ groupId }) {
+        await nap();
+        return [...tabs.values()].filter((t) => t.groupId === groupId);
+      },
+      async remove(ids) {
+        for (const t of [].concat(ids)) tabs.delete(t);
+      },
+    },
+    tabGroups: {
+      TAB_GROUP_ID_NONE: -1,
+      onRemoved: { addListener() {} },
+      async query() {
+        await nap();
+        return [...tabGroups.values()];
+      },
+      async get(id) {
+        if (!tabGroups.has(id)) throw new Error('no group');
+        return tabGroups.get(id);
+      },
+      async update(id, patch) {
+        await nap();
+        Object.assign(tabGroups.get(id), patch);
+        return tabGroups.get(id);
+      },
+    },
+    webNavigation: { onCommitted: { addListener() {} } },
+    storage: {
+      local: { async get() { return {}; }, async set() {} },
+      session: { async get() { return {}; }, async set() {} },
+      onChanged: { addListener() {} },
+    },
+    runtime: { getManifest: () => ({ version: '1.0.0' }) },
+  };
+
+  const groups = await importFrom('extension', 'background', 'groups.js');
+
+  // Three tabs into one workstream, all at once — an agent opening a batch, or
+  // three agents sharing a label.
+  await Promise.all([
+    groups.assign(1, 'dev · harbor'),
+    groups.assign(2, 'dev · harbor'),
+    groups.assign(3, 'dev · harbor'),
+  ]);
+
+  const harbor = [...tabGroups.values()].filter((g) => g.title.endsWith('dev · harbor'));
+  check('concurrent grouping creates one group, not several', harbor.length === 1, `got ${harbor.length}`);
+  check('every tab lands in that group', (await groups.tabsFor('dev · harbor')).length === 3);
+
+  // Separate workstreams stay separate under the same load.
+  await Promise.all([groups.assign(4, 'dev · meadow'), groups.assign(1, 'dev · harbor')]);
+  check('a second workstream gets its own group',
+    [...tabGroups.values()].filter((g) => g.title.endsWith('dev · meadow')).length === 1);
+  check('the first workstream is unchanged', (await groups.tabsFor('dev · harbor')).length === 3);
+
+  // A duplicate that already exists — made by hand, or left by an older build —
+  // must not hide half the workstream from the session that owns it.
+  const stray = { id: nextGroupId++, title: '⚡ dev · harbor', color: 'blue', windowId: 20 };
+  tabGroups.set(stray.id, stray);
+  tabs.set(9, { id: 9, windowId: 20, groupId: stray.id });
+  check('a duplicate group is not allowed to hide tabs',
+    (await groups.tabsFor('dev · harbor')).length === 4);
+  check('release covers every duplicate', (await groups.release('dev · harbor')) === true);
+  check('nothing is left grouped after release',
+    (await groups.tabsFor('dev · harbor')).length === 0);
 }
 
 main().catch((err) => {
