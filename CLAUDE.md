@@ -284,10 +284,12 @@ If you must:
 ## Known rough edges
 
 `TODO.md` lists them with reproduction details, and marks each as not started,
-built-but-unverified, or verified live. The highest-value open ones:
-`full_page` screenshots fail outright on tall pages after a 15-second stall,
-`find` ranks href-only matches alongside real controls, and session labels are
-opaque hex that tells a human nothing about the work.
+built-but-unverified, or verified live. The highest-value open ones: session
+labels are opaque hex that tells a human nothing about the work, and there is
+no explicit "page is settling" signal after a click that changed nothing.
+Native-dialog handling (`browser_act action:"dialog"`), the tall-page
+`full_page` fail-fast, and the `find` href-ranking fix are done and verified
+live.
 
 ---
 

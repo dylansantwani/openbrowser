@@ -135,7 +135,13 @@ const server = new McpServer({
     // Every call carries the session label. The browser uses it to group this
     // session's tabs; an explicit `group` argument still wins, so an agent can
     // still split its own work into sub-workstreams.
-    return transport.call(name, { _session: sessionName(), ...args }, { timeout });
+    //
+    // Stamped *after* the spread, and that order is load-bearing. `checkArgs`
+    // deliberately exempts underscore-prefixed keys, so a model emitting
+    // `_session: "claude · harbor"` passes validation — and with the spread last
+    // it would overwrite this one and be handed another session's tab group.
+    // Identity is asserted here or nowhere.
+    return transport.call(name, { ...args, _session: sessionName() }, { timeout });
   },
 }).start();
 

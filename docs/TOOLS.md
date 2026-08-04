@@ -106,12 +106,14 @@ Cheaper than a full snapshot when you already know what you are looking for.
 | `coordinate` | `[x,y]` | viewport CSS pixels; for canvas/maps/PDF |
 | `to` / `toRef` | `[x,y]` / string | drag destination |
 | `value` | string \| string[] | for `select_option` |
+| `accept` | boolean | for `dialog`: true = OK/Leave, false = Cancel/Stay |
+| `promptText` | string | for `dialog`: text to type for `prompt()` |
 | `modifiers` | `Alt` \| `Control` \| `Meta` \| `Shift` | |
 | `force` | boolean | skip the visible/enabled precheck |
 
 **Actions:** `click`, `double_click`, `right_click`, `middle_click`, `hover`,
 `focus`, `blur`, `scroll_to`, `scroll`, `drag`, `select_option`, `check`,
-`uncheck`, `clear`, `submit`
+`uncheck`, `clear`, `submit`, `dialog`
 
 Pointer actions dispatch trusted events through the debugger. The target is
 scrolled into view and allowed to settle first.
@@ -120,6 +122,26 @@ If something covers the target, you get an error naming it:
 
 > `e12` is covered by `<div.cookie-banner>`. Dismiss the overlay first, or pass
 > `force: true` to click through it.
+
+### Native dialogs (`alert` / `confirm` / `beforeunload` / `prompt`)
+
+A native dialog pauses the page's renderer. It is invisible to the
+accessibility tree, unclickable, and it makes every page-side call hang until
+timeout — so instead, while one is open, every call fails fast with the
+diagnosis:
+
+> `a confirm() dialog is open: "Leave site?" — answer it with browser_act action:"dialog" accept:true (OK/Leave) or accept:false (Cancel/Stay)`
+
+Answer it with `action: "dialog"`:
+
+```json
+{ "action": "dialog", "accept": false }
+```
+
+`accept: true` answers OK/Leave (including the beforeunload "leave this page"
+case); `accept: false` cancels. For a `prompt()` dialog, pass the text to type
+with `promptText`. The page sees the answered result — a `confirm()` that was
+dismissed returns `false`, exactly as if a user had clicked Cancel.
 
 ---
 

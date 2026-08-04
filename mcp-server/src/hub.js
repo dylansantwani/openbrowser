@@ -97,9 +97,66 @@ export class Hub {
      * Session names currently in use. Handing these out centrally is what makes
      * them safe: two sessions sharing a name would share a tab group and drive
      * each other's tabs.
+     *
+     * This set is process memory, and a hub owner is an ordinary MCP server
+     * that can be killed at any time. So it is seeded from the browser on
+     * connect — see `_seedTakenNames` — and topped up by every peer that
+     * re-registers a label it is already using.
      */
     this.takenNames = new Set();
-    this.sessionName = this._claimName();
+
+    /**
+     * True once the browser has told us which names are already spoken for.
+     * Until then no name is handed out, because handing one out early is
+     * exactly how a restarted hub drops a fresh session into a dead one's tabs.
+     */
+    this._seeded = false;
+  }
+
+  /**
+   * This process's own session name. Claimed lazily: the constructor runs
+   * before any browser is connected, and a name claimed then is claimed against
+   * an empty set.
+   */
+  get sessionName() {
+    return (this._sessionName ??= this._claimName());
+  }
+
+  /**
+   * Mark a label as spoken for, both whole and by its distinguishing half.
+   *
+   * Labels arrive as `client · name` ("claude · harbor"). Reserving only the
+   * whole string would let opencode claim `harbor` while Claude Code is still
+   * on it — different labels, so different tab groups, but a human reading the
+   * tab strip now sees two "harbor"s, which defeats the point of readable
+   * names.
+   */
+  _reserve(label) {
+    if (typeof label !== 'string' || !label) return;
+    this.takenNames.add(label);
+    const cut = label.lastIndexOf(' · ');
+    if (cut !== -1) this.takenNames.add(label.slice(cut + 3));
+  }
+
+  /**
+   * Ask the browser which workstream labels already exist and reserve them all.
+   *
+   * Failure is not fatal — an extension too old to know `__session_list` leaves
+   * us exactly where we were before, uniquely naming everything this process
+   * can see. Degraded, not broken.
+   */
+  async _seedTakenNames() {
+    try {
+      const res = await this._rawCall('__session_list', {}, { timeout: 5000 });
+      const names = res?.names;
+      if (Array.isArray(names)) {
+        for (const label of names) this._reserve(label);
+        if (names.length) this.log(`reserved ${names.length} session name(s) already in the browser`);
+      }
+    } catch {
+      /* older extension, or it went away mid-handshake */
+    }
+    this._seeded = true;
   }
 
   /** A readable name no other live session is using. */
@@ -146,10 +203,6 @@ export class Hub {
 
     if (role === 'peer') {
       this.peers.add(conn);
-      // The name is assigned here, not chosen by the peer, so it is unique
-      // among everything currently connected.
-      const name = this._claimName();
-      conn.sessionName = name;
 
       conn.on('close', () => {
         this.peers.delete(conn);
@@ -158,14 +211,19 @@ export class Hub {
         // it adopted — and handing the same name to the next session would drop
         // it straight into those leftover tabs. Names are cheap; collisions are
         // not.
-        this._endSession(conn.sessionLabel || name);
+        const name = conn.sessionLabel || conn.sessionName;
+        if (name) this._endSession(name);
       });
       conn.on('message', (raw) => this._onPeerMessage(conn, raw));
       conn.sendJSON({
         type: 'hello',
         role: 'hub',
-        extensionConnected: !!this.extension,
-        sessionName: name,
+        extensionConnected: this.connected,
+        // Withheld until the browser has said which names are in use. A peer
+        // that connects before then is told its name in the `extension_status`
+        // that follows the seed, which is also the message it is waiting on
+        // before it can make a call at all.
+        sessionName: this._seeded ? this._nameFor(conn) : undefined,
       });
       return;
     }
@@ -183,6 +241,9 @@ export class Hub {
       if (this.extension === conn) {
         this.extension = null;
         this.extensionInfo = null;
+        // Names already handed out stay taken; what has to be re-established is
+        // the browser's view, since a different browser may connect next.
+        this._seeded = false;
         this.pending.rejectAll('browser extension disconnected mid-call');
         this._broadcastPeers({ type: 'extension_status', connected: false });
         this.log('extension disconnected');
@@ -202,9 +263,13 @@ export class Hub {
     if (msg.type === 'hello') {
       this.extensionInfo = msg;
       this.log(`extension connected (${msg.browser || 'chrome'} v${msg.version || '?'})`);
-      this._broadcastPeers({ type: 'extension_status', connected: true, info: msg });
-      const waiters = this._waiters.splice(0);
-      for (const resolve of waiters) resolve();
+      // Nobody is told the browser is ready until the seed is in, so no name
+      // can be claimed against a stale picture of what is in use. The seed is
+      // one loopback round trip and always settles, so this cannot wedge.
+      this._seedTakenNames().then(() => {
+        this._announceReady(msg);
+        for (const resolve of this._waiters.splice(0)) resolve();
+      });
       return;
     }
 
@@ -233,6 +298,10 @@ export class Hub {
     // disconnect would look for a workstream that does not exist.
     if (msg.type === 'register') {
       peer.sessionLabel = msg.label;
+      // A peer whose hub owner died reconnects to a brand new one, which has
+      // never heard of it. Reserving on register is what stops that new hub
+      // handing this peer's name to the next session that asks.
+      this._reserve(msg.label);
       return;
     }
 
@@ -249,6 +318,28 @@ export class Hub {
 
   _broadcastPeers(obj) {
     for (const p of this.peers) if (!p.closed) p.sendJSON(obj);
+  }
+
+  /** This peer's session name, claimed on first use. */
+  _nameFor(peer) {
+    return (peer.sessionName ??= this._claimName());
+  }
+
+  /**
+   * Tell every peer the browser is ready, and — individually — what it is
+   * called. Not a broadcast: the name differs per peer, and that difference is
+   * the whole point.
+   */
+  _announceReady(info) {
+    for (const peer of this.peers) {
+      if (peer.closed) continue;
+      peer.sendJSON({
+        type: 'extension_status',
+        connected: true,
+        info,
+        sessionName: this._nameFor(peer),
+      });
+    }
   }
 
   /**
@@ -270,8 +361,12 @@ export class Hub {
     });
   }
 
+  /**
+   * Ready to take calls. Includes the seed, so the first caller through here
+   * cannot claim a name before the browser has said which ones are in use.
+   */
   get connected() {
-    return !!this.extension && !this.extension.closed;
+    return !!this.extension && !this.extension.closed && this._seeded;
   }
 
   /** Resolve once an extension is connected, or reject after `timeout`. */
@@ -293,6 +388,15 @@ export class Hub {
   /** Invoke a tool in the browser. @returns {Promise<any>} */
   async call(tool, args = {}, { timeout } = {}) {
     if (!this.connected) await this.waitForExtension();
+    return this._rawCall(tool, args, { timeout });
+  }
+
+  /**
+   * Send without waiting to be `connected`. Only the seed uses this — it runs
+   * *during* the handshake that makes us connected, so going through `call()`
+   * would deadlock on a wait it is itself responsible for ending.
+   */
+  _rawCall(tool, args = {}, { timeout } = {}) {
     const id = nextId();
     const promise = this.pending.create(id, { timeout });
     this.extension.sendJSON({ type: 'call', id, tool, args });
@@ -302,6 +406,7 @@ export class Hub {
   /** Record the label this session's tab group actually carries. */
   setSessionLabel(label) {
     this.sessionLabel = label;
+    this._reserve(label);
   }
 
   async stop() {
@@ -309,7 +414,9 @@ export class Hub {
     // A peer's cleanup is triggered by its socket closing; the hub owner has no
     // socket to close, so it has to say so on the way out. The short wait is
     // for the frame to reach the extension before the server is torn down.
-    this._endSession(this.sessionLabel || this.sessionName);
+    // `_sessionName`, not the getter: a hub owner that never drove a tab has no
+    // name, and shutdown is not the moment to claim one.
+    this._endSession(this.sessionLabel || this._sessionName);
     await new Promise((resolve) => setTimeout(resolve, 150));
     await this.server?.close();
   }
@@ -362,7 +469,12 @@ export class HubClient {
       if (msg.type === 'hello' || msg.type === 'extension_status') {
         // The hub owns name allocation; a joining server is told which one it
         // got, so two servers can never end up driving the same tab group.
-        if (msg.sessionName) this.sessionName = msg.sessionName;
+        //
+        // Once a label is committed it is final. Reconnecting to a *new* hub
+        // owner gets a fresh assignment, but this session's tab group already
+        // carries the old name — accepting the new one would strand those tabs
+        // under a label nothing cleans up.
+        if (msg.sessionName && !this.sessionLabel) this.sessionName = msg.sessionName;
         this.extensionConnected = !!(msg.connected ?? msg.extensionConnected);
         this._onHello?.();
         this._onHello = null;
@@ -384,6 +496,12 @@ export class HubClient {
     });
 
     await helloSeen;
+
+    // Re-announce on every connect, not just the first. The hub owner is an
+    // ordinary MCP server and can be killed; whoever binds the port next has
+    // never heard of this session, and would hand its name — and so its tab
+    // group — to the next client that joins.
+    if (this.sessionLabel) this.conn.sendJSON({ type: 'register', label: this.sessionLabel });
   }
 
   get connected() {

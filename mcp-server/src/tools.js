@@ -156,7 +156,16 @@ export const TOOLS = [
             'click', 'double_click', 'right_click', 'middle_click',
             'hover', 'focus', 'blur', 'scroll', 'scroll_to',
             'drag', 'select_option', 'check', 'uncheck', 'clear', 'submit',
+            'dialog',
           ],
+        },
+        accept: {
+          type: 'boolean',
+          description: 'For "dialog": true = OK/Leave, false = Cancel/Stay.',
+        },
+        promptText: {
+          type: 'string',
+          description: 'For "dialog": text to type for prompt().',
         },
         ref: REF,
         coordinate: COORD,

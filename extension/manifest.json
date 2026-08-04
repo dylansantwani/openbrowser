@@ -16,10 +16,8 @@
     "downloads",
     "webNavigation",
     "cookies",
-    "contextMenus",
     "alarms",
-    "clipboardWrite",
-    "clipboardRead"
+    "clipboardWrite"
   ],
 
   "host_permissions": ["<all_urls>"],

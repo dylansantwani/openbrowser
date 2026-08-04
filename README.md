@@ -137,7 +137,7 @@ single-purpose ones — models pick an enum value far more reliably.
 | `browser_navigate` | go to a URL, back, forward, reload |
 | `browser_snapshot` | read the page as an accessibility tree with `[ref=eN]` handles |
 | `browser_find` | find elements by description, ranked |
-| `browser_act` | click, hover, drag, select, check — trusted input events |
+| `browser_act` | click, hover, drag, select, check, answer native dialogs — trusted input events |
 | `browser_input` | type text, fill many fields at once, press keys |
 | `browser_screenshot` | viewport / full page / element / region, or record a GIF |
 | `browser_wait` | block on text, selector, URL, network idle, load |
@@ -231,6 +231,7 @@ The cases that usually break browser automation, and what handles them here:
 | Click opens a new tab or popup | Reported with the new tab's id, rather than looking like nothing happened |
 | Tab is in the background | Foregrounded before input; Chrome silently discards clicks aimed at hidden tabs |
 | Click seems to do nothing | Distinguishes "the app has not reacted yet" from "the click missed" |
+| Native JS dialog (alert/confirm/beforeunload) | Reported with the dialog's text; answered with `browser_act action:"dialog" accept:true/false` |
 
 Every row above is a bug that was found by driving the extension against a real
 site, not a hypothetical. The write-ups are in

@@ -804,18 +804,33 @@ var OB = globalThis.OB || (globalThis.OB = {});
       if (interactiveOnly && !node.ref) continue;
 
       const name = (node.name || '').toLowerCase();
-      const haystack = `${node.role} ${name} ${node.value || ''} ${node.href || ''}`.toLowerCase();
-      // Word-boundary matching. Raw substring search lets "to" hit "custom" and
-      // "form" hit "information", which on a page full of prose (an inbox, a
-      // feed, search results) buries the actual control under long labels that
-      // accumulate incidental hits.
-      const words = new Set(haystack.match(/[a-z0-9]+/g) || []);
+      // The href is in the haystack on purpose — "/login" and "/cart" are
+      // legitimate finds — but it must not score like a name. A citation link
+      // named "33163088" pointing at search.worldcat.org/oclc/33163088 matched
+      // "search" through the URL alone and ranked as high as the actual search
+      // box. Split the two: real signals (role/name/value) first, href as the
+      // weaker fallback.
+      const real = `${node.role} ${name} ${node.value || ''}`.toLowerCase();
+      const href = (node.href || '').toLowerCase();
+      const realWords = new Set(real.match(/[a-z0-9]+/g) || []);
+      const hrefWords = new Set(href.match(/[a-z0-9]+/g) || []);
 
       let score = 0;
+      let hrefOnly = true;
       for (const term of terms) {
-        if (words.has(term)) score += 2;
-        else if (haystack.includes(term)) score += 0.5;
-        else continue;
+        if (realWords.has(term)) {
+          score += 2;
+          hrefOnly = false;
+        } else if (real.includes(term)) {
+          score += 0.5;
+          hrefOnly = false;
+        } else if (hrefWords.has(term)) {
+          score += 1;
+        } else if (href.includes(term)) {
+          score += 0.25;
+        } else {
+          continue;
+        }
 
         if (name === term) score += 6;
         else if (name.startsWith(term)) score += 3;
@@ -832,6 +847,11 @@ var OB = globalThis.OB || (globalThis.OB = {});
       // thing being asked for.
       if (name.length > 120) score -= 4;
       else if (name.length > 60) score -= 2;
+
+      // An element whose only connection to the query is the URL, with no name
+      // of its own, is prose noise — citation links, trackers. Discount it so
+      // real controls outrank it, without making "/login" unfindable.
+      if (hrefOnly && !name) score *= 0.25;
 
       if (score > 0) scored.push({ node, score });
     }

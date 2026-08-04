@@ -9,7 +9,7 @@ Ordered by how much pain it removes per unit of work.
 **Status legend:** 🔴 not started · 🟡 built, not yet verified against the real
 extension · ✅ verified live.
 
-## 1. Native dialogs freeze everything
+## 1. Native dialogs freeze everything ✅ fixed, verified live
 
 **What happened.** Reported from real use: leaving a page with unsaved changes
 raises the browser's own *"Are you sure you want to leave?"* box. `alert()`,
@@ -18,56 +18,59 @@ page DOM. It is invisible to the accessibility tree, unclickable by CDP input,
 and it pauses the renderer, so the content script cannot answer and every
 subsequent call sits there until it times out. Nothing says why.
 
-**Fix.** CDP already has exactly the right hooks and neither is wired up:
+**Fix (done).** CDP's hooks are wired up:
 
-- `Page.javascriptDialogOpening` fires with the dialog's `type` and `message`.
-  Record it, and report it in the next result rather than letting the call die
-  silently: *"a confirm() dialog is open: 'Leave site?' — accept or dismiss it
-  before continuing"*.
-- `Page.handleJavaScriptDialog {accept, promptText}` answers it.
+- `Page.javascriptDialogOpening` is recorded per tab (`cdp.pendingDialog`),
+  cleared on `Page.javascriptDialogClosed`, detach, and tab removal.
+- **Every page-touching call fails fast** while a dialog is open, via a check in
+  `prepareTab` (and at the top of `browser_navigate`, so a beforeunload raised
+  by navigation itself is caught too). The error names the dialog and the way
+  out:
+  `a confirm() dialog is open: "Leave site?" — answer it with browser_act action:"dialog" accept:true (OK/Leave) or accept:false (Cancel/Stay)`
+- `browser_act action:"dialog"` answers it (`Page.handleJavaScriptDialog`),
+  with optional `promptText` for `prompt()`.
+- A click that opens a dialog reports it in its own result (the note replaces
+  the settling probe, which would otherwise hang on the paused renderer), and
+  `pageMeta` falls back to tab metadata instead of waiting on the content
+  script.
+- `Page` is enabled for every prepared tab (and before navigation), because the
+  opening event is the only record a dialog exists.
 
-Surface both: a `browser_act action:"dialog"` (or a `dialog` target on
-`browser_inspect` plus accept/dismiss) so an agent can see one and answer it.
-Auto-accepting by default would be wrong — "are you sure you want to delete
-this" is the same shape as "are you sure you want to leave" — but a dialog that
-blocks everything and explains nothing is worse than either choice.
-
-**Impact.** Any form-heavy flow can hit this on navigation, and when it does the
-session is stuck with no diagnosis. Highest-value item open.
-
-> Verifying anything under `extension/` requires a reload at
-> `chrome://extensions` — Chrome caches extension files. Changes under
-> `mcp-server/` take effect when the MCP client next starts the server, which is
-> why the server-side fixes below could be confirmed immediately and the
-> extension-side ones could not.
+Verified live in Chrome: schedule a `confirm()`, watch every subsequent call
+fail fast with the named dialog, dismiss it with `action:"dialog"`, and watch
+the page's `confirm()` return the dismissed result. Auto-accepting by default
+would still be wrong — "are you sure you want to delete this" is the same shape
+as "are you sure you want to leave" — but a dialog that blocks everything and
+explains nothing is worse than either choice.
 
 ---
 
 ## Open
 
-### 1. Enter in rich editors produces double line breaks 🔴
+> Nothing currently open. Every item below was found live, fixed, and verified;
+> they are kept here for the record. New candidates go above the line.
+
+### 1. Enter in rich editors produces double line breaks ✅ fixed
 
 **What happened.** Typing `\n\n` into Meta's composer yielded three newlines;
 typing `\n` yielded one. Exactly one blank line between paragraphs was not
 reachable.
 
-**Fix.** In a `contenteditable`, send `Shift+Enter` for a soft line break
-instead of `Enter`, or expose a `newline: "soft" | "paragraph"` option on
-`browser_input`. Worth doing because captions and comments are a common target
-and paragraph spacing is visible to the public.
+**Fix (done).** `browser_input` takes `newline: "soft"`, which sends
+`Shift+Enter` between lines — the soft break every rich editor honours — so
+`\n\n` gives exactly one blank line. `cdp.js` (`typeText`) implements it.
 
-### 2. `Control+a` selects the page when focus is lost 🔴
+### 2. `Control+a` selects the page when focus is lost ✅ fixed
 
 **What happened.** Several `browser_input {keys:["Control+a"]}` calls with no
 `ref` selected the entire document instead of a field, because focus was not
 where it was assumed to be.
 
-**Fix.** When `keys` are sent without `ref`, check `document.activeElement`
-first; if it is `body`, return an error naming the problem rather than
-dispatching a chord that will do something surprising. Alternatively let `keys`
-accept a `ref` and click it first, as `text` already does.
+**Fix (done).** When `keys` are sent without `ref`, the router checks
+`document.activeElement` first; if it is `body` (or missing), the call fails
+with the diagnosis instead of dispatching a chord that selects the whole page.
 
-### 3. `full_page` screenshots fail outright on tall pages 🔴
+### 3. `full_page` screenshots fail outright on tall pages ✅ fixed (fail-fast)
 
 **Found live, 2026-08-02.** A full-page capture of the Wikipedia "Berlin"
 article (~42,000 CSS px tall) spun for **14.7 seconds** and then returned the
@@ -80,14 +83,19 @@ Page.captureScreenshot failed: {"code":-32000,"message":"Unable to capture scree
 Chrome cannot allocate a texture that large. Nothing in the message says so, so
 the natural next move is to retry — which burns another 15 seconds.
 
-**Fix.** Read `Page.getLayoutMetrics` first (`captureScreenshot` already calls
-it for `fullPage`). When the content height exceeds a safe ceiling, either
-capture in horizontal bands and stitch, or fail immediately with a message that
-names the real problem and the way out:
-`"the page is 42,000px tall — too tall to capture in one image; use mode:"region" over the part you need, or scroll and take viewport shots"`.
-Failing in 50ms with a next step beats failing in 15s without one.
+**Fix (done).** `cdp.captureScreenshot` already reads `Page.getLayoutMetrics`
+for `fullPage`; it now checks the device-pixel height against the GPU's common
+max texture size (16,384px) and refuses up front:
 
-### 4. `find` ranks href-only matches as highly as real controls 🔴
+```
+the page is 42,000px tall — too tall to capture in one image; use mode:"region" over the part you need, or scroll and take viewport shots
+```
+
+Failing in ~50ms with a next step beats failing in 15s without one. Capturing
+in horizontal bands and stitching is still open as a future improvement, but
+the stall-plus-raw-error case is gone.
+
+### 4. `find` ranks href-only matches as highly as real controls ✅ fixed
 
 **Found live, 2026-08-02.** `browser_find query:"search box"` on a Wikipedia
 article returned the search box second and then filled the next four slots with
@@ -106,42 +114,42 @@ top two results are right, so this is noise rather than breakage — but it is
 noise the model pays for on every find, and on a page where the real control
 ranks lower it becomes breakage.
 
-**Fix.** In `findElements`, score `href` matches below `name` matches, and
-discount an element whose *only* hit is in the href and whose name is empty.
-The href is in the haystack to catch `/login` and `/cart`, not to match prose.
+**Fix (done).** `findElements` now scores role/name/value hits first and href
+hits as the weaker fallback (word match 1 instead of 2, substring 0.25 instead
+of 0.5), and an element whose only connection to the query is the URL, with no
+name of its own, is discounted to a quarter. The href stays in the haystack —
+`/login` and `/cart` are still findable — but prose matches no longer compete
+with real controls. Two regression tests cover it in `test/a11y-browser.html`.
 
-### 5. Session and workstream naming is opaque 🔴
+### 5. Session and workstream naming is opaque ✅ fixed
 
-Group labels currently read `opencode 5020`, `opencode a670` — a client name
-plus a hex slice of the pid. A human looking at the tab strip cannot tell which
-is which, and the hex conveys nothing about the work. Making the id
-collision-proof (see *Session isolation*, below) made it **worse**, not better:
-labels are now `opencode 5020a3f1`.
+Group labels used to read `opencode 5020`, `opencode a670` — a client name
+plus a hex slice of the pid. A human looking at the tab strip could not tell
+which was which, and the hex conveyed nothing about the work.
 
-**Fix — separate the identity from the label.** They are two different jobs
-being done by one string:
+**Fix (done).** The hub now hands out short, common, visually distinct words —
+`claude · harbor`, `opencode · meadow` — no two starting with the same letter
+so they stay separable in a narrow tab group. The identity and the label are
+separate jobs: the word is the display label, and uniqueness for tab ownership
+is guaranteed by reserving every label (whole and by its distinguishing half)
+against the browser's own record of names already in use (`__session_list`), so
+a restarted hub cannot drop a fresh session into a dead one's tabs. The agent's
+own `group` argument still wins for sub-workstreams (`opencode · reel
+uploads`). Exhausted the list? Numbered fallback (`session-2`) — ugly but
+unique, which is the property that actually matters.
 
-- **Session id**: opaque, unique, never shown. Used as the group-map key and
-  for tab ownership. Uniqueness is the only requirement.
-- **Display label**: short and human. `opencode 1`, `opencode 2` numbered per
-  client within a browser session; or a memorable word pair (`opencode
-  swift-otter`); or, best, the workstream the agent actually named
-  (`opencode · reel uploads`), falling back to a number when it has not named
-  one. Disambiguate with a numeric suffix only on an actual collision, rather
-  than pre-emptively for every session.
-
-The tab strip is the only place a human sees what the agents are doing, so the
-label should describe the work, not the process that started it.
-
-### 6. Surface a "page is settling" signal 🔴
+### 6. Surface a "page is settling" signal ✅ fixed
 
 **What happened.** Several clicks on Meta's "Create post" registered but did not
 navigate, needing a second attempt. There was no way to distinguish "the click
 missed" from "the app has not reacted yet".
 
-**Fix.** After a click that produces no delta, poll briefly for any DOM mutation
-and report `"no change detected — the page may still be reacting, or the click
-missed"`. Better than the current silence.
+**Fix (done).** After a click that produces no delta, the router runs a 500ms
+DOM-mutation probe in the page and reports which of the two it was:
+`"no diff yet, but the page is still changing — browser_wait or snapshot again
+in a moment"` vs `"no change detected — the click may have missed, or this
+control does nothing on its own"`. The probe is skipped when a native dialog
+explains the stillness — the dialog's paused renderer could never answer it.
 
 ---
 
@@ -330,16 +338,14 @@ request). Each prevents a failed call, which costs far more than it saves;
 
 ---
 
-## Loose end from the 2026-08-03 merge
+## Loose end from the 2026-08-03 merge — resolved
 
-- **`captureGeometry()` in `extension/background/format.js` is currently unreferenced.**
-  It maps a returned screenshot back to CSS pixels — the image goes through two
-  independent rescalings (device pixel ratio at capture, then the downscale to
-  `maxWidth`), so a coordinate read off a screenshot is in neither space, and
-  passing it to `browser_act` clicks the wrong place silently. The function
-  survived the merge but its caller did not: it was wired into a `router.js`
-  screenshot handler from a parallel branch that was superseded. Hook it into
-  the current `browser_screenshot` result, or drop it deliberately.
+- ~~**`captureGeometry()` in `extension/background/format.js` is currently unreferenced.**~~
+  **Done.** Wired into `browser_screenshot` in `router.js`, replacing the inline
+  coordinate-factor block. The result now reads `viewport screenshot, 929x869 —
+  1.00x of 929x869 CSS px`, and region captures include the conversion math
+  (`to convert: page x = 830 + imageX/1.50, …`). The now-dead
+  `cdp.layoutMetrics()` helper was removed with it.
 
 ---
 

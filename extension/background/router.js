@@ -293,22 +293,46 @@ async function sessionTabId(args) {
  * Get a tab ready to be driven: permission check, content scripts present,
  * capture running. Cheap and idempotent, so every tool calls it.
  */
-async function prepareTab(tabId, { needsScripts = true } = {}) {
+async function prepareTab(tabId, { needsScripts = true, skipDialogCheck = false } = {}) {
   const tab = await chrome.tabs.get(tabId);
   const settings = await getSettings();
+
+  // A native JS dialog (alert/confirm/beforeunload) pauses the renderer, so
+  // every page-side call would hang until timeout with no explanation. Name it
+  // up front, and tell the agent the one call that answers it.
+  if (!skipDialogCheck) {
+    const dlg = cdp.pendingDialog(tabId);
+    if (dlg) {
+      throw new Error(
+        `a ${dlg.type}() dialog is open: "${fmt.truncate(dlg.message, 120)}" — ` +
+          `answer it with browser_act action:"dialog" accept:true (OK/Leave) or accept:false (Cancel/Stay) before continuing`
+      );
+    }
+  }
 
   const url = tab.url || tab.pendingUrl || '';
   const check = checkUrlAllowed(url, settings);
   if (!check.allowed) throw new Error(check.reason);
 
   if (needsScripts) await frames.ensureInjected(tabId);
-  if (settings.useDebugger) recorder.ensureRecording(tabId).catch(() => {});
+  if (settings.useDebugger) {
+    recorder.ensureRecording(tabId).catch(() => {});
+    // Page must be enabled before a dialog can open, or the opening event —
+    // the only record one exists — never fires.
+    cdp.enableDomain(tabId, 'Page').catch(() => {});
+  }
 
   return { tab, settings };
 }
 
 /** Current page metadata from the main frame, for result headers. */
 async function pageMeta(tabId) {
+  // A native JS dialog pauses the renderer, so the content script cannot
+  // answer — return what the tabs API gives us instead of hanging.
+  if (cdp.pendingDialog(tabId)) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    return { url: tab?.url || '', title: tab?.title || '' };
+  }
   try {
     return await frames.sendToTab(tabId, 'pageInfo', {});
   } catch {
@@ -517,6 +541,36 @@ const HANDLERS = {
    */
   __session_end: (args) => endSession(args._session || args.group),
 
+  /**
+   * Internal, like `__session_end`: every workstream label the browser still
+   * knows about.
+   *
+   * The hub allocates session names, but its record of which are taken is
+   * process memory — so a hub owner that restarts starts counting from the top
+   * of the list again and hands the first name straight back out. If the
+   * previous holder's tab group is still on screen (it exited without a clean
+   * socket close, or auto-close is off) the new session lands in it, inheriting
+   * a stranger's tabs. The browser is the only durable record of what is in
+   * use, so the hub asks it on connect.
+   *
+   * Storage bookkeeping is included alongside live groups: a session whose
+   * group the user dissolved by hand still has tabs it opened, and its name is
+   * still spoken for.
+   */
+  async __session_list() {
+    const names = new Set((await groups.list()).map((g) => g.name));
+    for (const key of [CREATED_TABS_KEY, RECENT_TABS_KEY]) {
+      try {
+        for (const label of Object.keys((await chrome.storage.session.get(key))[key] || {})) {
+          names.add(label);
+        }
+      } catch {
+        /* bookkeeping only; live groups are the important half */
+      }
+    }
+    return { names: [...names] };
+  },
+
   // ---------------------------------------------------------------- tabs ----
   async browser_tabs(args) {
     const action = args.action || 'list';
@@ -628,6 +682,19 @@ const HANDLERS = {
   // ------------------------------------------------------------ navigate ----
   async browser_navigate(args) {
     const tabId = await resolveTab(args);
+
+    // A dialog already open on this tab would make the navigation hang; a
+    // beforeunload raised by the navigation would stall it with no record.
+    // Enable Page first so either one is seen, and refuse to navigate into one.
+    const preDlg = cdp.pendingDialog(tabId);
+    if (preDlg) {
+      throw new Error(
+        `a ${preDlg.type}() dialog is open: "${fmt.truncate(preDlg.message, 120)}" — ` +
+          `answer it with browser_act action:"dialog" accept:true (OK/Leave) or accept:false (Cancel/Stay) before navigating`
+      );
+    }
+    cdp.enableDomain(tabId, 'Page').catch(() => {});
+
     const target = String(args.url || '').trim();
     const timeout = args.timeout ?? 30_000;
 
@@ -786,8 +853,22 @@ const HANDLERS = {
   // ----------------------------------------------------------------- act ----
   async browser_act(args) {
     const tabId = await resolveTab(args);
-    const { settings } = await prepareTab(tabId);
     const action = args.action;
+
+    // Answer a native JS dialog. This must not trip the pending-dialog precheck
+    // in prepareTab, and it needs no coordinates, scripts, or foregrounding —
+    // the renderer is paused by the dialog anyway.
+    if (action === 'dialog') {
+      if (typeof args.accept !== 'boolean') {
+        throw new Error('action:"dialog" needs accept: true (OK/Leave) or accept: false (Cancel/Stay); pass promptText for prompt() dialogs.');
+      }
+      await prepareTab(tabId, { needsScripts: false, skipDialogCheck: true });
+      await cdp.handleDialog(tabId, { accept: args.accept, promptText: args.promptText });
+      const meta = await pageMeta(tabId).catch(() => ({}));
+      return fmt.actionResult(`dialog ${args.accept ? 'accepted' : 'dismissed'}`, { meta, tabId });
+    }
+
+    const { settings } = await prepareTab(tabId);
 
     // These are handled entirely in the page; no trusted event needed.
     const IN_PAGE = ['focus', 'blur', 'scroll_to', 'select_option', 'check', 'uncheck', 'clear', 'submit'];
@@ -873,12 +954,27 @@ const HANDLERS = {
     // opposite responses: wait, or try something else. "Nothing" includes a
     // delta that is only the focus ring moving, which is what a click on a dead
     // button produces. Hover is excluded — no change is its normal outcome.
+    //
+    // A native dialog is the third possibility, and it must be checked before
+    // the settling probe: the dialog pauses the renderer, so the probe's
+    // content-script call would hang forever instead of reporting anything.
+    const dlg = cdp.pendingDialog(tabId);
     const nothingHappened = !changed || fmt.isFocusOnly(changed);
-    const note = nothingHappened && action !== 'hover' ? await settlingNote(tabId) : null;
+    const note = nothingHappened && action !== 'hover' && !dlg ? await settlingNote(tabId) : null;
+
+    let label2 = label;
+    if (dlg) {
+      // The action itself opened a native dialog. The renderer is paused now;
+      // say what it is and how to answer it instead of leaving the next call
+      // to hang on it.
+      label2 += `\nNOTE: a ${dlg.type}() dialog is open: "${fmt.truncate(dlg.message, 120)}" — ` +
+        `answer it with browser_act action:"dialog" accept:true (OK/Leave) or accept:false (Cancel/Stay)`;
+    }
 
     // The focus churn is replaced rather than appended: it is noise, and the
-    // note carries the one fact worth having.
-    return fmt.actionResult(label, { changed: note || changed, meta: await pageMeta(tabId), tabId });
+    // note carries the one fact worth having. pageMeta is dialog-aware and
+    // falls back to tab metadata when the renderer is paused.
+    return fmt.actionResult(label2, { changed: note || changed, meta: await pageMeta(tabId), tabId });
   },
 
   // --------------------------------------------------------------- input ----
@@ -1035,27 +1131,17 @@ const HANDLERS = {
     const resized = await downscale(base64, format, quality, maxWidth);
     const meta = await pageMeta(tabId).catch(() => ({}));
 
-    // What was captured, measured in CSS pixels — the units `region` and every
-    // coordinate argument use. The image itself is device pixels and then
-    // downscaled, so without this the two silently disagree and any coordinate
-    // read off the returned image lands somewhere else entirely.
-    const css = clip
-      ? { width: Math.round(clip.width), height: Math.round(clip.height) }
-      : await cdp.layoutMetrics(tabId).then(
-          (m) => (args.mode === 'full_page' ? m.content : m.viewport),
-          () => null
-        );
-
-    let line = `${args.mode || 'viewport'} screenshot, ${resized.width}x${resized.height}`;
-    if (css?.width) {
-      const factor = resized.width / css.width;
-      // Only say it when it is actually misleading; at 1x the extra sentence is
-      // pure cost on a call that already ships an image.
-      if (Math.abs(factor - 1) > 0.01) {
-        const f = factor.toFixed(2);
-        line += ` = ${f}x of ${css.width}x${css.height} css px (divide image coords by ${f} before using them as region/coordinates)`;
-      }
-    }
+    // The image has been through two independent rescalings — the device pixel
+    // ratio at capture, then the downscale to maxWidth — so its dimensions say
+    // nothing about the CSS-pixel space that `region` and every coordinate
+    // argument use. captureGeometry derives the factor from the image against
+    // what it covered, and says so when the mapping is not 1:1.
+    const line = fmt.captureGeometry({
+      mode: args.mode || 'viewport',
+      clip,
+      meta,
+      image: { width: resized.width, height: resized.height },
+    });
 
     return {
       text: `${fmt.pageHeader(meta, tabId)}\n${line}`,

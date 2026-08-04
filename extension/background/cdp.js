@@ -21,6 +21,14 @@ const attaching = new Map();
 const PROTOCOL_VERSION = '1.3';
 
 /**
+ * Ceiling for a full-page capture in device pixels. The capture is one GPU
+ * texture, so this is the GPU's max texture size, not a number we chose.
+ * 16384 is the common limit (Intel and older NVIDIA); captures beyond it stall
+ * for ~15s and die with "Unable to capture screenshot" and no explanation.
+ */
+const MAX_FULL_PAGE_DEVICE_PX = 16384;
+
+/**
  * Attach the debugger to a tab, if it is not already attached.
  * @returns {Promise<boolean>} false when attaching is not possible
  */
@@ -432,6 +440,17 @@ export async function captureScreenshot(tabId, { format = 'jpeg', quality = 70, 
   } else if (fullPage) {
     const metrics = await send(tabId, 'Page.getLayoutMetrics');
     const content = metrics.cssContentSize || metrics.contentSize;
+    // Chrome allocates the capture as one GPU texture; past the max texture
+    // size (commonly 16384 device px) it stalls for ~15s and then fails with a
+    // bare protocol error that reads like a retryable glitch. Refuse up front
+    // with the way out instead.
+    const dpr = metrics.cssDeviceScaleFactor || 1;
+    if (Math.round(content.height * dpr) > MAX_FULL_PAGE_DEVICE_PX) {
+      throw new Error(
+        `the page is ${Math.round(content.height).toLocaleString()}px tall — too tall to capture in one image; ` +
+          `use mode:"region" over the part you need, or scroll and take viewport shots`
+      );
+    }
     params.clip = { x: 0, y: 0, width: content.width, height: content.height, scale: 1 };
     params.captureBeyondViewport = true;
   }
@@ -440,32 +459,38 @@ export async function captureScreenshot(tabId, { format = 'jpeg', quality = 70, 
   return data; // base64
 }
 
-/**
- * The tab's geometry in CSS pixels — the units `region` and click coordinates
- * are expressed in.
- *
- * Worth having separately from the capture because the returned image is in
- * device pixels and then downscaled, so its dimensions say nothing about the
- * coordinate space the caller has to use.
- */
-export async function layoutMetrics(tabId) {
-  await enableDomain(tabId, 'Page');
-  const m = await send(tabId, 'Page.getLayoutMetrics');
-  const view = m.cssVisualViewport || m.visualViewport || {};
-  const content = m.cssContentSize || m.contentSize || {};
-  return {
-    viewport: {
-      width: Math.round(view.clientWidth ?? view.width ?? 0),
-      height: Math.round(view.clientHeight ?? view.height ?? 0),
-    },
-    content: { width: Math.round(content.width || 0), height: Math.round(content.height || 0) },
-  };
-}
-
 /** Listeners waiting on a one-shot CDP event: `${tabId}:${method}` -> Set<fn>. */
 const eventWaiters = new Map();
 
+/**
+ * Native JS dialogs (alert/confirm/beforeunload/prompt) pause the renderer.
+ * They are invisible to the accessibility tree and unclickable by CDP input,
+ * so without this every page-side call after one opens hangs until timeout
+ * with no explanation. The `Page.javascriptDialogOpening` event is the only
+ * record that one exists; `Page.javascriptDialogClosed` clears it.
+ */
+const dialogs = new Map();
+
+/** The open native dialog on this tab, or null. */
+export function pendingDialog(tabId) {
+  return dialogs.get(tabId) || null;
+}
+
+/** Answer a native JS dialog. accept:true = OK/Leave, false = Cancel/Stay. */
+export async function handleDialog(tabId, { accept, promptText } = {}) {
+  await enableDomain(tabId, 'Page');
+  const params = { accept: !!accept };
+  if (promptText !== undefined) params.promptText = promptText;
+  await send(tabId, 'Page.handleJavaScriptDialog', params);
+  dialogs.delete(tabId);
+}
+
 chrome.debugger.onEvent.addListener((source, method, params) => {
+  if (method === 'Page.javascriptDialogOpening') {
+    dialogs.set(source.tabId, { type: params?.type || 'dialog', message: params?.message || '' });
+  } else if (method === 'Page.javascriptDialogClosed') {
+    dialogs.delete(source.tabId);
+  }
   const waiters = eventWaiters.get(`${source.tabId}:${method}`);
   if (!waiters) return;
   for (const fn of waiters) fn(params);
@@ -607,7 +632,13 @@ function sleep(ms) {
 // A tab we were driving has gone. Drop our bookkeeping so a later attach to a
 // recycled tabId starts clean.
 chrome.debugger.onDetach.addListener(({ tabId }) => {
-  if (tabId != null) sessions.delete(tabId);
+  if (tabId != null) {
+    sessions.delete(tabId);
+    dialogs.delete(tabId);
+  }
 });
 
-chrome.tabs.onRemoved.addListener((tabId) => sessions.delete(tabId));
+chrome.tabs.onRemoved.addListener((tabId) => {
+  sessions.delete(tabId);
+  dialogs.delete(tabId);
+});

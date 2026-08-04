@@ -361,6 +361,28 @@
         couponHits[0]?.name === 'Coupon code', couponHits[0]?.name);
       longLabel.remove();
 
+      // Ranking regression, found on Wikipedia: citation links whose only
+      // connection to the query is the URL ("search" inside
+      // search.worldcat.org/oclc/33163088) used to score as high as a real
+      // name match and fill the result slots, pushing real controls off the
+      // list. URL hits now score below role/name/value hits.
+      const cit = document.createElement('a');
+      cit.href = 'https://search.worldcat.org/oclc/33163088';
+      cit.textContent = '33163088';
+      document.querySelector('#fixture main').appendChild(cit);
+      OB.a11y.buildTree({ mode: 'interactive', selector: '#fixture' });
+      const citHit = OB.a11y.findElements('search').results.find((h) => h.name === '33163088');
+      check('an href-only match scores below a name match', !!citHit && citHit.score < 2, JSON.stringify(citHit));
+      const box = document.createElement('button');
+      box.textContent = 'Search';
+      document.querySelector('#fixture main').appendChild(box);
+      OB.a11y.buildTree({ mode: 'interactive', selector: '#fixture' });
+      const withBox = OB.a11y.findElements('search').results;
+      check('a real control outranks an href-only citation link',
+        withBox[0]?.name === 'Search', withBox.map((h) => h.name).join(','));
+      cit.remove();
+      box.remove();
+
       // --- Geometry ----------------------------------------------------------
       const submit = OB.a11y.resolveRef(refs.find((r) => OB.a11y.resolveRef(r)?.textContent === 'Create account'));
       // Mirror real usage: the router scrolls a target into view before asking

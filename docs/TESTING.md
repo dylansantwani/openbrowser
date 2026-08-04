@@ -136,6 +136,24 @@ The point of the debugger. Verify on a site that rejects synthetic events:
 - [ ] A blocklisted host — refused with a message pointing at options
 - [ ] Add a host to the allowlist — other hosts are refused
 - [ ] A stale ref after a full re-render — error says to re-snapshot
+
+### Native dialogs
+
+Trigger with a page that calls `confirm()`/`beforeunload` (an unsaved-changes
+form is the realistic case):
+
+- [ ] A click that opens a `confirm()` — the action's own result notes the
+      dialog and how to answer it
+- [ ] Any later call (snapshot, find, eval, wait) fails fast with the dialog's
+      text and the `action:"dialog"` instruction — no 60s hang
+- [ ] `action:"dialog" accept:false` dismisses; the page's `confirm()` returns
+      false
+- [ ] `action:"dialog" accept:true` on a beforeunload proceeds with the
+      navigation
+- [ ] Navigating away from a page with a `beforeunload` handler is caught by
+      the navigate precheck, not a silent stall
+- [ ] After answering, calls work normally again
+- [ ] `action:"dialog"` without `accept` errors with the usage message
 - [ ] `browser_upload` to a styled "Browse" button, not the raw input
 
 ### Side panel

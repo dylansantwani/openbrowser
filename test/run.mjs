@@ -171,10 +171,14 @@ async function main() {
   // browser_find (a dozen extra round trips), the no-regex-literals rule on
   // browser_eval (four failed calls), and forward slashes on upload paths. A
   // single retried call costs more than the ~90 tokens they add to every
-  // request. Raise this again only for guidance that demonstrably prevents a
-  // failure — never to make room for prose.
+  // request. Raised again to 13.7KB for `browser_act action:"dialog"` (accept/
+  // promptText): a native JS dialog pauses the renderer, so without the enum
+  // and its accept/dismiss guidance every page-side call hangs until timeout —
+  // the session-stuck failure the whole feature exists to prevent. Raise this
+  // again only for guidance that demonstrably prevents a failure — never to
+  // make room for prose.
   const schemaBytes = JSON.stringify(tools).length;
-  check('tool schemas stay under 13.5KB', schemaBytes < 13_500, `${schemaBytes} bytes`);
+  check('tool schemas stay under 13.7KB', schemaBytes < 13_700, `${schemaBytes} bytes`);
 
   // Exactly one blank line between paragraphs was unreachable in rich editors
   // until `newline` existed, so the option has to stay advertised — a model
@@ -184,6 +188,18 @@ async function main() {
     'browser_input offers a soft newline',
     input?.inputSchema?.properties?.newline?.enum?.includes('soft'),
     JSON.stringify(input?.inputSchema?.properties?.newline)
+  );
+
+  // A native JS dialog (alert/confirm/beforeunload) pauses the renderer and is
+  // invisible to the accessibility tree; the only way to unstick the session is
+  // to answer it, so the action and its accept flag must be advertised — a
+  // model cannot call an enum value it has never been shown.
+  const act = tools.find((t) => t.name === 'browser_act');
+  const actProps = act?.inputSchema?.properties || {};
+  check(
+    'browser_act can answer native dialogs',
+    actProps.action?.enum?.includes('dialog') && actProps.accept?.type === 'boolean',
+    JSON.stringify({ enum: actProps.action?.enum, accept: actProps.accept })
   );
 
   const ping = await server.request('ping');
@@ -351,6 +367,21 @@ async function main() {
     `${firstLabel} / ${secondLabel}`
   );
 
+  // `checkArgs` deliberately lets underscore-prefixed arguments through, so a
+  // model can put `_session` on any call it makes. The stamp therefore has to
+  // be applied *after* the argument spread. Applied before, a model could join
+  // another agent's tab group — and be handed its tabs — by naming it.
+  const spoofed = await server.request('tools/call', {
+    name: 'browser_snapshot',
+    arguments: { _session: 'somebody · else' },
+  });
+  check('a spoofed _session does not fail the call', spoofed.result?.isError === false);
+  check(
+    "a model cannot assert another session's identity",
+    ext.seen.filter((c) => c.tool === 'browser_snapshot').pop()?.args._session === firstLabel,
+    ext.seen.filter((c) => c.tool === 'browser_snapshot').pop()?.args._session
+  );
+
   // A disconnected client is the only reliable "task over" signal, so the hub
   // has to notice the socket close and tell the browser to tidy up.
   second.proc.kill();
@@ -362,6 +393,57 @@ async function main() {
     ended.some((c) => c.args._session === secondLabel) && !ended.some((c) => c.args._session === firstLabel),
     JSON.stringify(ended.map((c) => c.args._session))
   );
+
+  // ── Names vs. what is already in the browser ─────────────────────────────
+  section('Session names never collide with tab groups already on screen');
+
+  // A hub owner is an ordinary MCP server and can be killed. Whoever binds the
+  // port next starts its name list from the top, so without asking the browser
+  // it hands "harbor" straight back out — and the new session opens into the
+  // dead one's tab group, inheriting a stranger's tabs. The browser is the only
+  // durable record of what is in use, so it is asked on connect.
+  const PORT2 = PORT + 1;
+  const fresh = startServer(PORT2);
+  await fresh.request('initialize', {
+    protocolVersion: '2025-06-18',
+    capabilities: {},
+    clientInfo: { name: 'claude', version: '1' },
+  });
+  fresh.notify('notifications/initialized');
+
+  const ext2 = await fakeExtension(PORT2, {
+    onCall: (msg) =>
+      msg.tool === '__session_list'
+        ? { names: ['claude · harbor', 'opencode · meadow', 'research'] }
+        : undefined,
+  });
+
+  await fresh.request('tools/call', { name: 'browser_tabs', arguments: { action: 'list' } });
+  check('the hub asks the browser which names are in use', ext2.seen.some((c) => c.tool === '__session_list'));
+
+  const freshLabel = ext2.seen.find((c) => c.tool === 'browser_tabs')?.args._session;
+  check(
+    'a name whose tab group is still live is not reused',
+    !!freshLabel && !/ · (harbor|meadow)$/.test(freshLabel),
+    freshLabel
+  );
+  check('the session still gets a readable name', /^claude · [a-z-]+\d*$/.test(freshLabel || ''), freshLabel);
+
+  fresh.proc.kill();
+  ext2.conn.close();
+  await sleep(200);
+
+  // The wire path above proves the seed reaches the allocator. These cover the
+  // other two ways a name becomes taken without this process ever handing it
+  // out: a peer re-registering after its hub owner died, and the owner's own
+  // label. Both are pure bookkeeping, so they are asserted directly.
+  const { Hub } = await importFrom('mcp-server', 'src', 'hub.js');
+  const bookkeeping = new Hub({ port: 0 });
+  bookkeeping._reserve('claude · harbor');
+  check('reserving a label also reserves its distinguishing half', bookkeeping.takenNames.has('harbor'));
+  check('the first free name is handed out', bookkeeping._claimName() === 'meadow');
+  bookkeeping.setSessionLabel('opencode · falcon');
+  check("the owner's own label is reserved", bookkeeping._claimName() === 'copper');
 
   // ── Disconnection ────────────────────────────────────────────────────────
   section('Browser disconnected');
