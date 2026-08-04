@@ -52,6 +52,48 @@ const DEFAULTS = {
    */
   useDebugger: true,
 
+  /**
+   * Answer "Leave site? Changes you made may not be saved" automatically.
+   *
+   * `beforeunload` is not the same kind of question as `confirm()`. A
+   * `confirm("Delete this?")` is the page asking something it needs an answer
+   * to, and guessing is dangerous — those stay blocking, always. A beforeunload
+   * prompt only ever appears *because something is already trying to leave*, so
+   * when the agent navigates, the intent to leave is the instruction it was
+   * given; answering carries it out rather than deciding anything new.
+   *
+   * Only tabs the agent drives can reach this: the opening event arrives over
+   * the debugger, which is attached to those tabs and no others, so a prompt
+   * raised by the user's own browsing is untouched.
+   *
+   * Set false to have these block like every other dialog and wait for an
+   * explicit browser_act action:"dialog".
+   */
+  autoConfirmLeave: true,
+
+  /**
+   * Put the tab back after the agent borrows the foreground.
+   *
+   * Trusted input can only be dispatched at a foreground tab — a hidden one
+   * drops mouse and key events silently — so the agent has to activate its tab
+   * to click. Keeping it afterwards is no part of that requirement, and a
+   * background job stealing the tab you are reading is the tool interrupting
+   * you to do the thing you asked it to do quietly. A tab group does not help:
+   * groups share a window, so activating a tab in one pulls you out of another.
+   *
+   * Restoring is skipped if you switched tabs yourself in the meantime.
+   */
+  restoreFocusAfterInput: true,
+
+  /**
+   * Draw a persistent border and caption on pages an agent is driving.
+   *
+   * The tab-group colour is only visible in the tab strip; once you are looking
+   * at a page there is otherwise nothing to distinguish an agent's tab from one
+   * of your own.
+   */
+  showAgentBadge: true,
+
   /** Ring buffer sizes for passive capture. */
   consoleBufferSize: 300,
   networkBufferSize: 300,

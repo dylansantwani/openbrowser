@@ -466,9 +466,18 @@ var OB = globalThis.OB || (globalThis.OB = {});
    * click on a button planted to do nothing — the tool's own feedback drowning
    * out the signal it was trying to read.
    */
+  /**
+   * Everything this tool draws on the page itself. `.ob-agent-frame` is the
+   * persistent "an agent is driving this tab" border, re-applied on every call —
+   * so leaving it out here would report page activity on every single call and
+   * destroy the settling signal outright, which is worse than the highlight bug
+   * this function was written for.
+   */
+  const OWN_DECORATION = '.ob-highlight, .ob-agent-frame';
+
   function isDecoration(node) {
     const el = node?.nodeType === 1 ? node : node?.parentElement;
-    return !!el?.closest?.('.ob-highlight');
+    return !!el?.closest?.(OWN_DECORATION);
   }
 
   function isDecorationRecord(record) {
@@ -525,7 +534,16 @@ var OB = globalThis.OB || (globalThis.OB = {});
    * queue, which makes invalidation exact rather than merely eventual.
    */
   function drainPending() {
-    if (observer && observer.takeRecords().length) cache.dirty = true;
+    // `takeRecords` *removes* what it returns, so the observer callback will
+    // never see these. Classifying them here rather than only setting the flag
+    // is what keeps the counter honest: drop them and a change that raced a
+    // read vanishes from the settling signal, and a click that did work reports
+    // that nothing happened — the exact false negative the counter exists to
+    // prevent. `invalidate` applies the same decoration test the callback would.
+    if (observer) {
+      const pending = observer.takeRecords();
+      if (pending.length) invalidate(pending);
+    }
 
     // Focus cannot be watched with an event here. When the document does not
     // hold system focus, Chrome updates `document.activeElement` immediately
@@ -618,6 +636,8 @@ var OB = globalThis.OB || (globalThis.OB = {});
       }
       if (!(el instanceof Element)) return [];
       if (SKIP_TAGS.has(el.tagName)) return [];
+      // Never let the tool's own overlays into the tree it reports.
+      if (el.matches?.(OWN_DECORATION)) return [];
 
       if (!isVisible(el)) return [];
 

@@ -94,6 +94,48 @@
         </label>
 
         <label class="check">
+          <input type="checkbox" id="showAgentBadge" />
+          <span>
+            <strong>Mark pages an agent is driving</strong>
+            <small class="muted">
+              Draws an orange border and a caption naming the workstream, so a
+              page being driven is obvious from the page itself and not only
+              from the tab strip.
+            </small>
+          </span>
+        </label>
+
+        <label class="check">
+          <input type="checkbox" id="restoreFocusAfterInput" />
+          <span>
+            <strong>Give the tab back after clicking or typing</strong>
+            <small class="muted">
+              Clicks and keystrokes only land on a foreground tab, so the agent
+              has to switch to its own to act — which pulls you out of whatever
+              you were reading, tab groups included, since a group shares your
+              window. This switches back once it is done. If you changed tabs
+              yourself in the meantime, you are left where you are.
+            </small>
+          </span>
+        </label>
+
+        <label class="check">
+          <input type="checkbox" id="autoConfirmLeave" />
+          <span>
+            <strong>Answer "Leave site?" prompts automatically</strong>
+            <small class="muted">
+              These only appear because something is already trying to leave, so
+              the agent answers its own navigation rather than stalling behind a
+              box it cannot click. Unsaved changes on the old page are discarded,
+              and the navigation result says when it happened. Only affects tabs
+              the agent drives. <strong>alert(), confirm() and prompt() are
+              never answered for you</strong> — those are real questions and
+              still wait for you.
+            </small>
+          </span>
+        </label>
+
+        <label class="check">
           <input type="checkbox" id="captureBodies" />
           <span>
             <strong>Capture request and response bodies</strong>

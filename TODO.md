@@ -295,6 +295,166 @@ request). Each prevents a failed call, which costs far more than it saves;
 
 ---
 
+## Verification pass, 2026-08-04 (reloaded extension) ✅
+
+All three of the changes below were exercised against the real extension.
+
+| Check | Result |
+|---|---|
+| `test/a11y-browser.html` after the badge exclusion | 71 passed, 0 failed |
+| Border present, orange, `pointer-events: none`, captioned | ✅ `OpenBrowser · claude-code · 90d0` |
+| Snapshot identical with the border on and off | ✅ byte-identical |
+| Re-applying the border twice counts as page activity | ✅ **0** — the risk that would have broken the settling signal |
+| Border survives a navigation | ✅ re-applied by `prepareTab` |
+| Focus returned after the agent clicks a background tab | ✅ the human's tab was active again |
+| "Leave site?" answered without a human, note on the result | ✅ |
+| A real `confirm()` still blocks and names itself | ✅ |
+
+Two things learned while testing that are worth keeping:
+
+- **`confirm()` cannot be tested from the main world on this profile.** Another
+  installed automation extension (chromeflow) replaces `window.confirm` with a
+  stub returning `true` — no native dialog, no CDP event, nothing for
+  OpenBrowser to see. It looked exactly like a regression in the beforeunload
+  change until `Function.prototype.toString` showed the override. Test dialogs
+  from `world:"isolated"`, where the binding is pristine. The `autoDismissed`
+  counter is what ruled the change out: it is only incremented on an auto-accept,
+  and the following navigation reported nothing.
+- **The running MCP server can be older than `mcp-server/src/tools.js`.**
+  `browser_act action:"dialog" accept:false` was rejected with "unknown
+  parameter: accept" while the schema on disk declares it — the server process
+  predated the feature, and `checkArgs` derives its list from whatever schema
+  that process loaded. Reloading the extension does not restart the MCP server;
+  the client has to. Worth remembering before diagnosing a "missing" parameter,
+  and it leaves a blocking dialog with no way out until the restart.
+
+## The agent stole the tab you were working in ✅ fixed, verified live
+
+Reported from real use: with the agent's tabs in their own group and the user
+working in a different one, the view still jumped to the agent's tab whenever it
+did something.
+
+A tab group is not isolation. Groups share a window, and only one tab per window
+can be foreground, so `ensureForeground` — which exists because a hidden tab
+silently drops `Input.dispatchMouseEvent` and `Input.dispatchKeyEvent`, the worst
+failure this project can produce — pulled the user out of their group every time
+the agent clicked.
+
+The requirement is that the tab be foreground *while input is dispatched*.
+Keeping it afterwards was never part of that, and was the whole of the
+annoyance. `restoreFocusAfterInput` (default on) records what was active before
+the first steal in a burst and puts it back once the call is done:
+
+- Debounced (700ms), so twenty clicks do not flip the view twenty times.
+- Restores to the tab active before the *first* steal, not the previous one.
+- Skipped entirely if the agent's tab is no longer active — if the user switched
+  tabs by hand, that decision wins.
+- Released from `dispatch`'s `finally`, so it happens on the error paths too,
+  and never for `browser_tabs`/`browser_window`, where being asked to focus a
+  tab is the point of the call.
+
+**Rejected: give the agent its own window.** An unfocused window's active tab is
+normally still `visible`, so this looks like it removes the problem outright —
+but Chrome's native window-occlusion tracking marks fully covered windows hidden
+on Windows, which is exactly this user's platform, and that reintroduces
+silently dropped input. Not worth trading a visible annoyance for an invisible
+wrong-click. Revisit only with a live visibility check before each dispatch.
+
+## Agent-driven tabs are marked on the page ✅ fixed, verified live
+
+The tab-group colour only exists in the tab strip, so once you were looking at a
+page there was nothing to say whether an agent was driving it. There is now a
+persistent orange border and a caption naming the workstream
+(`OpenBrowser · <label>`), controlled by `showAgentBadge`.
+
+Three things about it are load-bearing:
+
+- **It is inert.** `pointer-events: none` throughout, so it can never swallow a
+  click meant for the page.
+- **It is excluded from the tree and from the mutation counter.** The decoration
+  test that used to name `.ob-highlight` now covers both overlays. Missing this
+  would have been worse than the bug it was written for: the border is
+  re-applied on every call, so counting it would report page activity on every
+  single call and destroy the settling signal permanently.
+- **It is re-applied, not tracked.** A navigation throws the document away along
+  with the border, and `prepareTab` runs on every page-touching call anyway.
+
+Cleared when a session ends, for adopted tabs as well as created ones — those
+are the user's own tabs and outlive the session, and a stale "an agent is
+driving this" border on a tab nothing is driving is worse than no border.
+
+**Still to verify live:** that the border appears and survives navigation, that
+it never appears on the user's own tabs, that snapshots are byte-identical with
+it on and off, and that focus is actually returned after a click.
+
+## "Leave site?" had to be clicked by hand ✅ fixed, verified live
+
+Reported from real use: the beforeunload prompt kept appearing mid-run and a
+human had to click it, which is the one thing this tool exists to avoid.
+
+The 2026-08-03 dialog work (§1) treated all four native dialog types the same —
+block everything, name the dialog, wait for an explicit `browser_act
+action:"dialog"`. That reasoning holds for `alert`, `confirm` and `prompt`, and
+they are unchanged. It does not hold for `beforeunload`, which is a different
+kind of event: it only ever appears **because something is already trying to
+leave**. When the agent navigates, the intent to leave is the instruction it was
+given, so answering carries that out rather than deciding anything new. The old
+behaviour asked the caller to confirm a thing it had just asked for, from behind
+a native box nothing on the page side can reach.
+
+`autoConfirmLeave` (default on, in the options page) accepts beforeunload
+prompts only. The gate is structural rather than a heuristic: the opening event
+arrives over the debugger, which is attached only to tabs the agent drives, so a
+prompt raised by the user's own browsing never reaches this code at all.
+
+Not silent — accepting discards whatever the old page held unsaved, so
+`browser_navigate` reports how many it answered and how to turn it off. If
+`handleJavaScriptDialog` fails the dialog stays recorded as pending, so the next
+call fails fast and names it rather than hanging on a paused renderer.
+
+**Still to verify live** (Chrome was closed when this was written): that a
+beforeunload prompt is answered without a human touching it, that the note
+appears on the navigation result, that `autoConfirmLeave:false` restores the
+blocking behaviour, and that a real `confirm()` still blocks.
+
+## A read erased the evidence that the page had changed ✅ fixed 2026-08-03
+
+`drainPending()` called `observer.takeRecords()` for its `.length` and dropped
+the records. `takeRecords` *removes* what it returns, so those records never
+reached the MutationObserver callback and never reached `invalidate` — the
+`mutations` counter simply never saw them. Only `cache.dirty` was set, so
+caching stayed correct and nothing looked wrong.
+
+The counter is the settling signal: it is what tells "the app has not reacted
+yet" apart from "the click went nowhere". `buildTree` runs on every
+`browser_snapshot` and every `browser_find`, so a page change that landed just
+before a read was counted **zero** times, while the identical change with no
+read in between counted once. Snapshots are the common path, so the usual
+sequence — act, then look — is exactly the one that erased the proof the action
+had worked. A click that did fire could report that nothing happened.
+
+Measured in a real browser, appending a `<p>` to the fixture:
+
+| | counted |
+|---|---|
+| change, then a `buildTree` read in the same tick | **0** ❌ |
+| same change, no read in between (control) | 1 |
+
+Now `drainPending` routes the drained records through `invalidate`, which
+applies the same decoration test the callback would, so both cases count 1.
+Mutation-tested: reverting the two lines fails the new regression test
+"a change that raced a read is still counted" (`6 -> 6`).
+
+**The highlight-box test was also flaky for an unrelated reason.** It asserted
+that our own `.ob-highlight` box adds nothing to the counter, but measured
+without waiting for the page to go quiet. Other installed extensions inject
+their own UI into every page — this profile has `#SASContainer` and
+`#ibotta-extension-root`, jQuery-UI drag handles and all — and that churn is
+real page activity to the counter, so the assertion failed `0 -> 4` on one run
+and `0 -> 1` on the next. The decoration filter itself was always correct. The
+test now waits for quiescence before measuring. Worth knowing generally: the
+browser suite is not isolated from whatever else is installed in the profile.
+
 ## Smaller notes
 
 - **OAuth and form-heavy checkout are now exercised** (2026-08-03). A real
@@ -309,12 +469,13 @@ request). Each prevents a failed call, which costs far more than it saves;
   principle, but nobody should be typing real card numbers to find out. If this
   matters, test against a payment provider's own sandbox with test card numbers.
 
-- **`browser_find` with a `selector` that matches a single element returns
-  nothing.** `buildTree` sets the match as its root and then walks the root's
-  *children*, so the element itself is never emitted. Scoping to a dialog works
-  because you want its contents; scoping to one control silently reports "no
-  matches", which reads as "it is not there". Either emit the root or say that
-  scoping is subtree-only. Hit while trying to scope to a planted `#ob-probe`.
+- ~~**`browser_find` with a `selector` that matches a single element returns
+  nothing.**~~ ✅ **fixed** — `walkTree` falls back to walking the match itself
+  when walking its children yielded nothing, so scoping to one control returns
+  that control while scoping to a container still splices in its contents.
+  Covered by "scoping to a single control returns that control" in
+  `test/a11y-browser.html`; verified passing live 2026-08-03. This note was
+  stale, not open.
 - **`browser_eval`'s `ref` does not bind anything usable.** Passing `ref` and
   writing `element.target = '_blank'` throws `ReferenceError: element is not
   defined`. Either bind the resolved node to a documented name, or drop `ref`

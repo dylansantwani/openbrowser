@@ -395,6 +395,38 @@ var OB = globalThis.OB || (globalThis.OB = {});
     setTimeout(() => box.remove(), 900);
   }
 
+  /**
+   * Show or hide the persistent "an agent is driving this tab" frame.
+   *
+   * Top frame only: an iframe drawing its own border would put a second box
+   * inside the page, and the point is one unmistakable marker per tab.
+   *
+   * Re-applied by the background on every call rather than tracked, because a
+   * navigation replaces the document and takes the frame with it — cheap enough
+   * that "just set it again" beats keeping state in sync with the page.
+   */
+  function agentFrame(on, label = 'OpenBrowser agent') {
+    if (window.top !== window) return false;
+    const root = document.body || document.documentElement;
+    if (!root) return false;
+
+    let box = document.querySelector('.ob-agent-frame');
+    if (!on) {
+      box?.remove();
+      return false;
+    }
+    if (!box) {
+      box = document.createElement('div');
+      box.className = 'ob-agent-frame';
+      // The overlay must survive a page that reparents or clears body children.
+      root.appendChild(box);
+    } else if (box.parentElement !== root) {
+      root.appendChild(box);
+    }
+    if (box.dataset.obAgent !== label) box.dataset.obAgent = label;
+    return true;
+  }
+
   OB.actions = {
     clickPoint,
     isPointOn,
@@ -406,6 +438,7 @@ var OB = globalThis.OB || (globalThis.OB = {});
     waitFor,
     textPresent,
     highlight,
+    agentFrame,
     setFrameOffset,
     frameOffset,
     describe,

@@ -34,6 +34,48 @@
   white-space: nowrap;
 }
 
+/*
+ * Persistent "an agent is driving this tab" frame.
+ *
+ * A tab group colour is only visible in the tab strip, and says nothing once
+ * you are looking at the page — so a tab being driven was indistinguishable
+ * from one you opened yourself. This is deliberately loud and deliberately
+ * inert: `pointer-events: none` everywhere, so it can never take a click the
+ * page should have had.
+ */
+.ob-agent-frame {
+  position: fixed !important;
+  inset: 0 !important;
+  z-index: 2147483646 !important;
+  pointer-events: none !important;
+  box-sizing: border-box !important;
+  border: 3px solid #f97316 !important;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.55) !important;
+  background: none !important;
+  margin: 0 !important;
+  padding: 0 !important;
+}
+
+.ob-agent-frame::after {
+  content: attr(data-ob-agent);
+  position: absolute !important;
+  top: 0 !important;
+  right: 12px !important;
+  background: #f97316 !important;
+  color: #fff !important;
+  font: 600 11px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif !important;
+  letter-spacing: 0.02em !important;
+  padding: 3px 8px !important;
+  border-radius: 0 0 4px 4px !important;
+  white-space: nowrap !important;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.28) !important;
+}
+
+/* Printing a page should not print the chrome around it. */
+@media print {
+  .ob-agent-frame { display: none !important; }
+}
+
 @keyframes ob-highlight-fade {
   0%   { opacity: 0; transform: scale(1.04); }
   15%  { opacity: 1; transform: scale(1); }

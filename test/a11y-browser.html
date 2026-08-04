@@ -235,6 +235,29 @@
       // report that the page was still changing — the tool drowning out its own
       // signal.
       OB.a11y.buildTree({ mode: 'interactive', selector: '#fixture' }); // start the observer
+
+      // Other installed extensions inject their own UI into every page — a real
+      // profile showed `#SASContainer` and `#ibotta-extension-root` both doing
+      // it, jQuery-UI handles and all — and that churn is page activity as far
+      // as the counter is concerned. It arrives in a burst shortly after load,
+      // so measuring without waiting for quiet made this assertion depend on
+      // which extensions the machine happened to have (seen failing 0 -> 4 and
+      // 0 -> 1 on the same box). Wait for the page to stop moving, so the only
+      // thing changing during the measurement is the thing under test.
+      async function quiesce(quietFor = 250, timeout = 4000) {
+        const startedAt = performance.now();
+        let last = OB.a11y.mutationCount();
+        let stableSince = performance.now();
+        while (performance.now() - startedAt < timeout) {
+          await new Promise((r) => setTimeout(r, 50));
+          const now = OB.a11y.mutationCount();
+          if (now !== last) { last = now; stableSince = performance.now(); }
+          else if (performance.now() - stableSince >= quietFor) return true;
+        }
+        return false;
+      }
+      await quiesce();
+
       const mutationsBefore = OB.a11y.mutationCount();
 
       OB.actions.highlight(document.getElementById('email'), 'click');
@@ -251,6 +274,23 @@
         OB.a11y.mutationCount() > mutationsBefore,
         `${mutationsBefore} -> ${OB.a11y.mutationCount()}`);
       realChange.remove();
+
+      // A read drains the observer's queue with `takeRecords`, which *removes*
+      // the records — so a change that lands just before a snapshot used to be
+      // counted zero times while the identical change with no read in between
+      // counted once. Snapshots are the common path, so this quietly erased the
+      // evidence that a click had worked.
+      await quiesce();
+      const beforeDrain = OB.a11y.mutationCount();
+      const raced = document.createElement('p');
+      raced.textContent = 'changed just before a read';
+      document.querySelector('#fixture main').appendChild(raced);
+      OB.a11y.buildTree({ mode: 'interactive', selector: '#fixture' }); // drains the queue
+      await new Promise((r) => setTimeout(r, 60));
+      check('a change that raced a read is still counted',
+        OB.a11y.mutationCount() > beforeDrain,
+        `${beforeDrain} -> ${OB.a11y.mutationCount()}`);
+      raced.remove();
 
       // --- Scoping to a single element ---------------------------------------
       // Scoping used to walk only the root's children, so pointing a selector

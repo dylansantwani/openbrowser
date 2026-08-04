@@ -12,6 +12,8 @@
  * tab goes away, to keep that banner off tabs the agent is merely reading.
  */
 
+import { getSettings } from './settings.js';
+
 /** tabId -> {attached: boolean, domains: Set<string>} */
 const sessions = new Map();
 
@@ -485,9 +487,41 @@ export async function handleDialog(tabId, { accept, promptText } = {}) {
   dialogs.delete(tabId);
 }
 
+/**
+ * "Leave site?" prompts answered for a tab since the last read, so a navigation
+ * can say it happened. Auto-answering is defensible; doing it silently is not —
+ * a page that refused to be left is worth one line in the result.
+ */
+const autoDismissed = new Map();
+
+/** Consume the record of auto-answered leave prompts for a tab. */
+export function takeAutoDismissed(tabId) {
+  const n = autoDismissed.get(tabId) || 0;
+  autoDismissed.delete(tabId);
+  return n;
+}
+
 chrome.debugger.onEvent.addListener((source, method, params) => {
   if (method === 'Page.javascriptDialogOpening') {
-    dialogs.set(source.tabId, { type: params?.type || 'dialog', message: params?.message || '' });
+    const type = params?.type || 'dialog';
+    dialogs.set(source.tabId, { type, message: params?.message || '' });
+
+    // A beforeunload prompt is not a question the page needs answered — it is
+    // the page objecting to a departure that has already been asked for. The
+    // caller said "go there"; stopping to ask whether it meant it strands the
+    // run behind a native box nothing on the page side can reach. `confirm()`
+    // and friends are genuine questions and stay blocking below.
+    if (type === 'beforeunload') {
+      getSettings()
+        .then((settings) => {
+          if (settings.autoConfirmLeave === false) return;
+          autoDismissed.set(source.tabId, (autoDismissed.get(source.tabId) || 0) + 1);
+          return handleDialog(source.tabId, { accept: true });
+        })
+        // Leaving it recorded as pending is the right failure: the next call
+        // fails fast and names it rather than hanging on a paused renderer.
+        .catch(() => {});
+    }
   } else if (method === 'Page.javascriptDialogClosed') {
     dialogs.delete(source.tabId);
   }
@@ -635,10 +669,12 @@ chrome.debugger.onDetach.addListener(({ tabId }) => {
   if (tabId != null) {
     sessions.delete(tabId);
     dialogs.delete(tabId);
+    autoDismissed.delete(tabId);
   }
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   sessions.delete(tabId);
   dialogs.delete(tabId);
+  autoDismissed.delete(tabId);
 });

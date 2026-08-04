@@ -10,7 +10,15 @@ const $ = (sel) => document.querySelector(sel);
 
 /** Fields that map straight to a settings key, by input type. */
 const NUMBER_FIELDS = ['port', 'maxSnapshotChars'];
-const BOOLEAN_FIELDS = ['autoConnect', 'useDebugger', 'highlightActions', 'captureBodies'];
+const BOOLEAN_FIELDS = [
+  'autoConnect',
+  'useDebugger',
+  'highlightActions',
+  'showAgentBadge',
+  'restoreFocusAfterInput',
+  'autoConfirmLeave',
+  'captureBodies',
+];
 const LIST_FIELDS = ['allowlist', 'blocklist'];
 
 function call(type, payload = {}) {

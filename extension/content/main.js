@@ -87,6 +87,11 @@ var OB = globalThis.OB || (globalThis.OB = {});
       return { ok: true, url: location.href, top: window.top === window };
     },
 
+    /** Show/hide the persistent "an agent is driving this tab" border. */
+    agent_frame({ on = true, label }) {
+      return { shown: actions.agentFrame(on, label) };
+    },
+
     snapshot({ mode = 'interactive', selector, viewportOnly, maxChars = 20000 }) {
       if (mode === 'text') {
         return { text: a11y.pageText(maxChars), ...pageMeta() };

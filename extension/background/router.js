@@ -54,6 +54,15 @@ export async function dispatch(tool, args = {}) {
   } catch (err) {
     logActivity({ tool, args, ok: false, error: err.message, ms: Date.now() - started });
     throw err;
+  } finally {
+    // One place rather than every input path: this runs whichever way the call
+    // left, including the error paths, and a call that never borrowed focus
+    // costs nothing here. `browser_tabs`/`browser_window` are excluded because
+    // being asked to focus a tab is the whole point of those two — handing it
+    // straight back would undo what was requested.
+    if (tool !== 'browser_tabs' && tool !== 'browser_window' && borrowedFocus.size) {
+      for (const windowId of [...borrowedFocus.keys()]) releaseForeground(windowId);
+    }
   }
 }
 
@@ -121,8 +130,29 @@ async function resolveTab(args) {
   // merely worked on are remembered, which is enough to keep it on the same tab
   // between calls, without claiming them from anyone.
   await rememberSessionTab(args.group || args._session, tabId);
+  noteAgentLabel(tabId, args.group || args._session);
   return tabId;
 }
+
+/**
+ * Which workstream is driving each tab, for the on-page border's caption.
+ *
+ * Deliberately in-memory and best-effort: if an MV3 restart loses it the border
+ * still appears, just without a name. Worth nothing to persist, and a wrong name
+ * would be worse than none.
+ */
+const agentLabels = new Map();
+
+function noteAgentLabel(tabId, label) {
+  if (label) agentLabels.set(tabId, String(label));
+}
+
+function agentFrameLabel(tabId) {
+  const label = agentLabels.get(tabId);
+  return label ? `OpenBrowser · ${label}` : 'OpenBrowser agent';
+}
+
+chrome.tabs.onRemoved.addListener((tabId) => agentLabels.delete(tabId));
 
 /**
  * Tabs each workstream opened for itself.
@@ -186,7 +216,17 @@ async function endSession(label) {
   };
 
   const ids = await forget(CREATED_TABS_KEY);
-  await forget(RECENT_TABS_KEY);
+  const recent = await forget(RECENT_TABS_KEY);
+
+  // Take the border off every tab this session touched. Tabs it merely adopted
+  // are the ones that matter — those are the user's own, they outlive the
+  // session, and a stale "an agent is driving this" border on a tab nothing is
+  // driving is worse than no border at all. Tabs about to be closed below cost
+  // nothing to clear first.
+  for (const tabId of new Set([...ids, ...recent])) {
+    agentLabels.delete(tabId);
+    frames.sendToTab(tabId, 'agent_frame', { on: false }).catch(() => {});
+  }
 
   const settings = await getSettings();
   if (settings.closeTabsOnSessionEnd === false) {
@@ -315,6 +355,16 @@ async function prepareTab(tabId, { needsScripts = true, skipDialogCheck = false 
   if (!check.allowed) throw new Error(check.reason);
 
   if (needsScripts) await frames.ensureInjected(tabId);
+  // Mark the page itself as agent-driven. A tab group's colour only shows in
+  // the tab strip, so once you are looking at a page there was nothing to tell
+  // an agent's tab from your own. Re-applied here rather than tracked: a
+  // navigation throws the old document away along with the border, and this
+  // runs on every page-touching call anyway.
+  if (needsScripts && settings.showAgentBadge !== false) {
+    frames
+      .sendToTab(tabId, 'agent_frame', { on: true, label: agentFrameLabel(tabId) })
+      .catch(() => {});
+  }
   if (settings.useDebugger) {
     recorder.ensureRecording(tabId).catch(() => {});
     // Page must be enabled before a dialog can open, or the opening event —
@@ -421,6 +471,17 @@ async function ensureForeground(tabId) {
   try {
     const tab = await chrome.tabs.get(tabId);
     if (tab.active) return;
+
+    // Remember what the human was looking at, so it can be put back. Only the
+    // first steal in a burst is recorded: a run of twenty clicks should return
+    // to the tab you were on before the first one, not to tab nineteen.
+    if (!borrowedFocus.has(tab.windowId)) {
+      const [wasActive] = await chrome.tabs.query({ active: true, windowId: tab.windowId });
+      if (wasActive && wasActive.id !== tabId) {
+        borrowedFocus.set(tab.windowId, { previousTabId: wasActive.id, agentTabId: tabId });
+      }
+    }
+
     await chrome.tabs.update(tabId, { active: true });
     // The compositor needs a moment before it will accept input.
     await settle(120);
@@ -429,6 +490,53 @@ async function ensureForeground(tabId) {
     // here would turn a maybe into a definite no.
   }
 }
+
+/** windowId -> {previousTabId, agentTabId} while the agent has focus on loan. */
+const borrowedFocus = new Map();
+const focusTimers = new Map();
+
+/**
+ * Give the tab back.
+ *
+ * Input has to be dispatched at a foreground tab — a hidden one drops mouse and
+ * key events on the floor, which is why `ensureForeground` exists at all. But
+ * *keeping* the foreground afterwards is not part of that requirement, and a
+ * background job stealing the tab you are reading, in the window you are
+ * working in, is the tool interrupting you to do something you asked it to do
+ * quietly.
+ *
+ * Debounced, because a burst of clicks would otherwise flip the view back and
+ * forth on every one. Restored only if the agent's tab is still the active one:
+ * if you switched tabs yourself in the meantime, that is your decision and this
+ * must not overrule it.
+ */
+function releaseForeground(windowId, delay = 700) {
+  clearTimeout(focusTimers.get(windowId));
+  focusTimers.set(
+    windowId,
+    setTimeout(async () => {
+      focusTimers.delete(windowId);
+      const borrowed = borrowedFocus.get(windowId);
+      if (!borrowed) return;
+      const settings = await getSettings();
+      if (settings.restoreFocusAfterInput === false) {
+        borrowedFocus.delete(windowId);
+        return;
+      }
+      borrowedFocus.delete(windowId);
+      try {
+        const [nowActive] = await chrome.tabs.query({ active: true, windowId });
+        // Moved on already, or the human took over — either way, leave it.
+        if (!nowActive || nowActive.id !== borrowed.agentTabId) return;
+        await chrome.tabs.get(borrowed.previousTabId);
+        await chrome.tabs.update(borrowed.previousTabId, { active: true });
+      } catch {
+        /* the tab or window went away; nothing to put back */
+      }
+    }, delay)
+  );
+}
+
 
 /**
  * Tell "the app has not reacted yet" from "the click went nowhere".
@@ -728,6 +836,16 @@ const HANDLERS = {
     const notes = [];
     if (meta.hasCaptcha) {
       notes.push('NOTE: a CAPTCHA is present on this page. It must be solved by a human — this tool cannot and will not bypass it.');
+    }
+    // The page tried to keep us. Answering that is the point of the setting,
+    // but it discarded whatever the old page held unsaved, so say so.
+    const left = cdp.takeAutoDismissed(tabId);
+    if (left) {
+      notes.push(
+        `NOTE: answered ${left === 1 ? 'a' : `${left}`} "Leave site?" prompt${left === 1 ? '' : 's'} to get here — ` +
+          'the previous page had unsaved changes and they were discarded. ' +
+          'Set autoConfirmLeave:false in the extension options to be asked instead.'
+      );
     }
 
     return [fmt.pageHeader(meta, tabId), ...notes].join('\n');
