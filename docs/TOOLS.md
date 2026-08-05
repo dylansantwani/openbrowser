@@ -314,6 +314,10 @@ pointing at the visible control is fine — the actual input is located from it.
 
 | Param | Type | Notes |
 |---|---|---|
+| `action` | `list` \| `use` \| `pick` \| `browsers` \| `connect` \| `disconnect` \| `remotes` | omit for the emulation params below |
+| `windowId` | number | for `use` |
+| `browser` | string | for `use`; a name from `browsers` |
+| `hub` | string | for `connect`/`disconnect`; `host` or `host:port` |
 | `preset` | `mobile` \| `tablet` \| `desktop` \| `wide` | |
 | `width` / `height` | number | override the preset |
 | `colorScheme` | `light` \| `dark` \| `no-preference` | |
@@ -324,6 +328,28 @@ pointing at the visible control is fine — the actual input is located from it.
 
 Presets carry the right device scale factor and mobile flag, so `mobile` gets
 touch layout rather than just a narrow window.
+
+### Machines elsewhere
+
+`connect` attaches a hub on another machine; its browsers then appear alongside
+local ones as `remote/browser` and are driven identically.
+
+```json
+{ "action": "connect", "hub": "10.0.0.5" }
+{ "action": "remotes" }
+{ "action": "disconnect", "hub": "10.0.0.5" }
+```
+
+The far end must be started with `--host 0.0.0.0`; it binds `127.0.0.1` by
+default. These three actions work with no browser attached — `connect` is how a
+browser becomes reachable in the first place.
+
+Names are namespaced because instance ids are only unique within one hub, the
+same way tab ids are only unique within one browser. Two machines each running
+an unnamed Chrome would otherwise be indistinguishable in the chooser.
+
+> The hub has no authentication. Anything that reaches it can run JavaScript in
+> a logged-in browser — keep federated hubs on a private network.
 
 ---
 
