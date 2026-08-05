@@ -213,8 +213,23 @@ async function main() {
   // not: tab ids are only unique within a browser, so a guessed binding sends
   // every later call to a real, different tab of the same id, silently. The
   // additions were trimmed to 28 bytes over the old ceiling before raising it.
+  //
+  // Raised to 14.4KB for `action:"connect"/"disconnect"/"remotes"` and `hub`.
+  // Not guidance this time but reachability: a hub on another machine is
+  // invisible until something attaches it, and the only thing that can attach
+  // it is a model making this call. Without the enum values and `hub` there is
+  // no syntax for that, so every browser outside the local machine is
+  // unreachable no matter what the agent tries — a capability that exists and
+  // cannot be invoked is worse than one that does not exist, because the
+  // browsers show up in `remotes` output and prose while staying undrivable.
+  // The `"remote/browser"` clause is load-bearing for the same reason the
+  // browser raise above was: names collide across machines, and an agent that
+  // has not been told the namespacing will pass a bare name that matches two
+  // browsers on different boxes. Trimmed twice before raising — 14461 to 14401
+  // by shortening prose, then to 14326 by deleting the `name` parameter and
+  // routing `disconnect` through `hub` instead.
   const schemaBytes = JSON.stringify(tools).length;
-  check('tool schemas stay under 14.2KB', schemaBytes < 14_200, `${schemaBytes} bytes`);
+  check('tool schemas stay under 14.4KB', schemaBytes < 14_400, `${schemaBytes} bytes`);
 
   // Exactly one blank line between paragraphs was unreachable in rich editors
   // until `newline` existed, so the option has to stay advertised — a model
@@ -520,6 +535,10 @@ async function main() {
   section('Tab groups with several agents');
   await testGroupConcurrency();
 
+  // ── Hub-to-hub federation ────────────────────────────────────────────────
+  section('Federation between hubs');
+  await testFederation();
+
   // ── Summary ──────────────────────────────────────────────────────────────
   process.stdout.write(`\n${passed} passed, ${failed} failed\n`);
   if (failures.length) {
@@ -660,6 +679,129 @@ async function testTwoBrowsers() {
   personal.conn.close();
   await sleep(100);
   await hub.stop();
+}
+
+/**
+ * One hub driving a browser attached to another hub.
+ *
+ * The whole point of the design is that a remote browser is indistinguishable
+ * from a local one to everything downstream of `liveBrowsers()`, so most of
+ * these assertions are really checking that *nothing special happens* — the
+ * chooser, the binding, and the `_browser` stamp behave as they always did.
+ *
+ * The two that are about federation specifically are the namespacing (names
+ * collide across machines, and a bare "chrome" on two boxes is exactly the
+ * ambiguity the chooser exists to remove) and the one-level-deep rule, which is
+ * what makes A→B→A structurally impossible instead of a cycle to detect.
+ */
+async function testFederation() {
+  const { Hub } = await importFrom('mcp-server', 'src', 'hub.js');
+  const { toHubUrl, aliasFor } = await importFrom('mcp-server', 'src', 'federation.js');
+  const LOCAL = PORT + 10;
+  const REMOTE = PORT + 11;
+
+  // Address parsing first — an agent will write "10.0.0.5", not a ws:// URL,
+  // and a parse error there is a wasted turn.
+  check('a bare host gets the default port and /hub', toHubUrl('10.0.0.5') === 'ws://10.0.0.5:8848/hub');
+  check('host:port is respected', toHubUrl('10.0.0.5:9000') === 'ws://10.0.0.5:9000/hub');
+  check('a ws:// URL is normalised to /hub', toHubUrl('ws://10.0.0.5:9000/mcp') === 'ws://10.0.0.5:9000/hub');
+  check('bracketed IPv6 keeps its address', toHubUrl('[::1]:9000') === 'ws://[::1]:9000/hub');
+  check('a duplicate alias is disambiguated', aliasFor('10.0.0.5', new Set(['10.0.0.5'])) === '10.0.0.5-2');
+
+  const remote = await new Hub({ port: REMOTE }).start();
+  const cloud = await fakeExtension(REMOTE, {
+    instance: 'inst-cloud',
+    browser: 'chrome',
+    name: 'sandbox',
+    onCall: (msg) =>
+      msg.tool === '__window_list' ? { windows: [{ windowId: 77, tabs: 1, titles: ['remote'] }] } : { ok: 'from-remote' },
+  });
+  await sleep(200);
+
+  const local = await new Hub({ port: LOCAL }).start();
+  check('a hub with no browsers has none live', local.liveBrowsers().length === 0);
+
+  // `connect` must work with nothing attached — it is how something becomes
+  // attached. Going through `call` proves the waitForExtension bypass too.
+  const connected = await local.call('browser_window', {
+    action: 'connect',
+    hub: `127.0.0.1:${REMOTE}`,
+    _session: 'claude · harbor',
+  });
+  await sleep(250);
+
+  check('connect reports success', /Connected to the hub/.test(connected.text || ''), connected.text);
+  check('the remote browser is now live locally', local.liveBrowsers().length === 1);
+
+  const [rb] = local.liveBrowsers();
+  check('its id is namespaced by the remote', rb.instance === `127.0.0.1/inst-cloud`, rb.instance);
+  check('its name is namespaced too', /^127\.0\.0\.1\/sandbox$/.test(rb.info?.name || ''), rb.info?.name);
+
+  // One level deep: what we expose to a federated hub is only ever our own
+  // browsers. This is the cycle guard, and it is structural rather than a check.
+  check('a remote browser is not re-shared', local._sharedBrowsers().length === 0);
+  check('it is absent from localBrowsers', local.localBrowsers().length === 0);
+
+  // A single browser is never a question, remote or not.
+  const res = await local.call('browser_tabs', { action: 'list', _session: 'claude · harbor' });
+  check('a call reaches the remote browser', cloud.seen.some((c) => c.tool === 'browser_tabs'));
+  check('its result comes back', res?.ok === 'from-remote', JSON.stringify(res));
+  check('the session bound to the remote browser',
+    local.sessionBrowsers.get('claude · harbor') === '127.0.0.1/inst-cloud');
+
+  // The far side must see its *own* instance id, never the namespaced one, or
+  // the extension's `_browser` guard would reject every federated call.
+  const relayed = cloud.seen.find((c) => c.tool === 'browser_tabs');
+  check('the far side receives its own browser id', relayed?.args?._browser === 'inst-cloud', relayed?.args?._browser);
+
+  // `remotes` is how an agent checks what it is attached to.
+  const listed = await local.call('browser_window', { action: 'remotes', _session: 'claude · harbor' });
+  check('remotes lists the hub', /127\.0\.0\.1/.test(listed.text || ''), listed.text);
+  check('remotes names its browsers', /sandbox/.test(listed.text || ''), listed.text);
+
+  // A local browser alongside a remote one raises the chooser, with both named.
+  const here = await fakeExtension(LOCAL, {
+    instance: 'inst-here',
+    browser: 'chrome',
+    name: 'laptop',
+    onCall: (msg) => (msg.tool === '__window_list' ? { windows: [{ windowId: 5, tabs: 2, titles: ['x'] }] } : {}),
+  });
+  await sleep(250);
+  check('both browsers are live', local.liveBrowsers().length === 2);
+
+  let threw = null;
+  await local.call('browser_tabs', { action: 'list', _session: 'claude · meadow' }).catch((e) => (threw = e.message));
+  check('a new session is asked which browser', !!threw && /2 browsers are connected/.test(threw), threw);
+  check('the chooser offers the local one', !!threw && /browser:"laptop"/.test(threw), threw);
+  check('the chooser offers the remote one by namespaced name',
+    !!threw && /browser:"127\.0\.0\.1\/sandbox"/.test(threw), threw);
+  check('the remote window is listed', !!threw && /windowId:77/.test(threw), threw);
+
+  // Now that a local browser exists, it — and only it — is shared onward.
+  check('only the local browser is shared onward', local._sharedBrowsers().length === 1);
+  check('and it is the local one', local._sharedBrowsers()[0]?.instance === 'inst-here');
+
+  // Disconnecting drops the browsers and any binding into them, so a session
+  // is not left pointing at something unreachable with no way to clear it.
+  await local.call('browser_window', { action: 'disconnect', hub: '127.0.0.1', _session: 'claude · harbor' });
+  await sleep(150);
+  check('the remote browser is gone', local.liveBrowsers().length === 1);
+  check('the binding into it was cleared', !local.sessionBrowsers.has('claude · harbor'));
+  check('the local browser is untouched', local.liveBrowsers()[0]?.instance === 'inst-here');
+
+  // A bad address fails with something actionable rather than a stack trace.
+  let connErr = null;
+  await local
+    .call('browser_window', { action: 'connect', hub: '127.0.0.1:1', _session: 'claude · harbor' })
+    .catch((e) => (connErr = e.message));
+  check('an unreachable hub explains itself', !!connErr && /could not reach a hub/.test(connErr), connErr);
+  check('and mentions the --host gate', !!connErr && /--host/.test(connErr), connErr);
+
+  here.conn.close();
+  cloud.conn.close();
+  await sleep(100);
+  await local.stop();
+  await remote.stop();
 }
 
 /**

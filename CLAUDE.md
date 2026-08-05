@@ -237,6 +237,47 @@ another's work. The chooser lists windows across all browsers in one question:
 nobody thinks "the work browser, then its second window", they think "that
 window over there", so picking a window names its browser implicitly.
 
+**A hub on another machine is that same problem a third time, and the fix is to
+make it not a new problem at all.** `browser_window action:"connect"
+hub:"10.0.0.5"` attaches a remote hub, and its browsers join `liveBrowsers()` as
+`RemoteBrowser` proxies wearing the shape an extension connection has —
+`instance`, `info`, `closed`, `sendJSON`. Everything downstream is untouched:
+`_routeFor`, the chooser, session binding, the `_browser` stamp. That is the
+whole design, and it is why federation cost `router.js` nothing.
+
+What it replaced, built by hand against a real VM first: an SSH tunnel per
+machine plus an `mcp-server` config entry per machine, because `mcp-server` only
+ever dials `127.0.0.1` and the sole knob is `--port`. It works, and it does not
+scale — a spare local port, a config block, and a process to babysit for every
+box you add.
+
+Two rules keep federation comprehensible:
+
+- **One level deep.** `_sharedBrowsers` offers only `localBrowsers()`, never one
+  reached through someone else, so A→B→A cannot form. A cycle here is not a hang
+  but a call ping-ponging until it times out, and structural impossibility beats
+  detection. Covered in `test/run.mjs`, and verified to fail when the guard is
+  removed.
+- **Names are namespaced at the boundary** — `remote/browser`. Instance ids are
+  unique only within a hub, exactly as tab ids are unique only within a browser,
+  and two machines each running an unnamed Chrome would otherwise put the same
+  label in one chooser. The far side is always sent *its own* id, never the
+  namespaced one, or the extension's `_browser` guard would reject every call.
+
+**Receiving federation is always on; the gate is the bind address.** There is no
+toggle for it, because a toggle in the extension would put a security control in
+a different process from the thing it protects — and the hub can be running with
+no extension attached at all, which is exactly when you would least want it
+quietly accepting peers. `--host` defaults to `127.0.0.1`, so `/hub` is
+unreachable off-machine until someone says otherwise.
+
+**The hub has no authentication, so that default is load-bearing.** Anything
+that reaches it gets `browser_eval` in a logged-in browser plus CDP trusted
+input — remote code execution and session hijacking in one. `--host 0.0.0.0`
+logs a warning saying so. Do not put this on a public address without auth in
+front of it; a mesh (Tailscale/WireGuard) is the cheapest correct answer,
+because it deletes the problem rather than solving it.
+
 **A workstream group is not a window, and treating it as one is how agents get
 lost.** `tabGroups.query({})` spans every window, so a workstream with a group in
 two windows — from a rebind, or a tab dragged out — returned tabs from both, and
@@ -317,10 +358,11 @@ mcp-server/src/
   ws.js               hand-rolled RFC 6455
   mcp.js              hand-rolled MCP over stdio
   hub.js              routes calls; lets several MCP clients share one browser
+  federation.js       hub-to-hub links; remote browsers as local-looking proxies
   tools.js            the 14 tool schemas — token-critical
 
 test/
-  run.mjs             99 tests, no browser needed
+  run.mjs             199 tests, no browser needed
   a11y-browser.html   73 tests, needs a browser (npm run preview)
   overlay-preview.html the on-page overlays, self-checking (same server)
 ```
@@ -377,7 +419,7 @@ presence — a `.value` can be empty while the control visibly shows a value
 ## Testing
 
 ```bash
-npm test          # 99 tests — run before and after every change
+npm test          # 199 tests — run before and after every change
 npm run preview   # then open /test/a11y-browser.html for 68 DOM tests
 ```
 
