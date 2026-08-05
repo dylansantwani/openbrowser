@@ -58,13 +58,23 @@ function section(title) {
  * Connects to the hub exactly as the extension does and answers tool calls with
  * canned results. Lets us exercise the whole path without a browser.
  */
-async function fakeExtension(port, { onCall } = {}) {
+async function fakeExtension(port, { onCall, instance = 'fake-instance', browser = 'fake', name } = {}) {
   const { connectWebSocket } = await importFrom('mcp-server', 'src', 'ws.js');
   const conn = await connectWebSocket(`ws://127.0.0.1:${port}/ext`);
   const seen = [];
+  /** Hub hellos, which is where the primary/standby verdict arrives. */
+  const hellos = [];
+  let closed = false;
+  conn.on('close', () => {
+    closed = true;
+  });
 
   conn.on('message', async (raw) => {
     const msg = JSON.parse(raw);
+    if (msg.type === 'hello') {
+      hellos.push(msg);
+      return;
+    }
     if (msg.type !== 'call') return;
     seen.push(msg);
 
@@ -76,8 +86,15 @@ async function fakeExtension(port, { onCall } = {}) {
     }
   });
 
-  conn.sendJSON({ type: 'hello', role: 'extension', version: '1.0.0', browser: 'fake' });
-  return { conn, seen };
+  conn.sendJSON({ type: 'hello', role: 'extension', version: '1.0.0', browser, instance, name });
+  return {
+    conn,
+    seen,
+    hellos,
+    get closed() {
+      return closed || conn.closed;
+    },
+  };
 }
 
 // -----------------------------------------------------------------------------
@@ -186,8 +203,18 @@ async function main() {
   // bearing too: the failure it prevents is an agent picking a window id out of
   // the error text and dropping its tabs into whichever window the human was
   // reading in, which is the entire problem the feature exists to solve.
+  //
+  // Raised to 14.2KB for `action:"browsers"` and the `browser` argument. Same
+  // failure as the window raise above, one level out and worse: with two
+  // browsers connected a session cannot start until it binds one, and a model
+  // that has never been shown these sees "2 browsers are connected" with no
+  // call available to answer it. Worse, because a wrong window is visible —
+  // both windows are in one browser's tab list — while a wrong *browser* is
+  // not: tab ids are only unique within a browser, so a guessed binding sends
+  // every later call to a real, different tab of the same id, silently. The
+  // additions were trimmed to 28 bytes over the old ceiling before raising it.
   const schemaBytes = JSON.stringify(tools).length;
-  check('tool schemas stay under 14.1KB', schemaBytes < 14_100, `${schemaBytes} bytes`);
+  check('tool schemas stay under 14.2KB', schemaBytes < 14_200, `${schemaBytes} bytes`);
 
   // Exactly one blank line between paragraphs was unreachable in rich editors
   // until `newline` existed, so the option has to stay advertised — a model
@@ -454,6 +481,14 @@ async function main() {
   bookkeeping.setSessionLabel('opencode · falcon');
   check("the owner's own label is reserved", bookkeeping._claimName() === 'copper');
 
+  // ── Two browsers, one hub ────────────────────────────────────────────────
+  section('Two browsers with the extension installed');
+  await testTwoBrowsers();
+
+  // ── The hub owner exits ──────────────────────────────────────────────────
+  section('The owning server exits while another is running');
+  await testHubTakeover();
+
   // ── Disconnection ────────────────────────────────────────────────────────
   section('Browser disconnected');
   ext.conn.close();
@@ -518,6 +553,164 @@ function stubChrome() {
   };
 }
 
+/**
+ * Two browsers, each running the extension, both live on one hub.
+ *
+ * This started as one socket, which made two browsers evict each other in a
+ * permanent one-second flap; then as primary-plus-standby, which stopped the
+ * flap by making the second browser useless. Both were the same mistake —
+ * treating "the browser" as a singleton. Now every browser is live and a
+ * *session* is bound to one.
+ *
+ * The hazard these guard is that tab ids are only unique within a browser. A
+ * call sent to the wrong one does not fail; it succeeds on a different page.
+ */
+async function testTwoBrowsers() {
+  const { Hub } = await importFrom('mcp-server', 'src', 'hub.js');
+  const PORT3 = PORT + 2;
+  const windowsFor = (n) => (msg) =>
+    msg.tool === '__window_list' ? { windows: [{ windowId: n, tabs: 3, titles: ['a', 'b'] }] } : undefined;
+
+  const hub = await new Hub({ port: PORT3 }).start();
+
+  const work = await fakeExtension(PORT3, { instance: 'inst-work', browser: 'chrome', name: 'work', onCall: windowsFor(11) });
+  await sleep(150);
+  check('one browser needs no question', hub.liveBrowsers().length === 1);
+
+  // A lone browser is never a question — same rule as one window.
+  await hub.call('browser_tabs', { action: 'list', _session: 'claude · harbor' }).catch(() => {});
+  check('a single browser binds silently', work.seen.some((c) => c.tool === 'browser_tabs'));
+  check('the binding was recorded', hub.sessionBrowsers.get('claude · harbor') === 'inst-work');
+
+  const personal = await fakeExtension(PORT3, { instance: 'inst-home', browser: 'chrome', name: 'personal', onCall: windowsFor(22) });
+  await sleep(200);
+
+  // Nobody is evicted, so nobody reconnects, so there is no loop.
+  check('both browsers stay connected', !work.closed && !personal.closed);
+  check('the hub holds both', hub.liveBrowsers().length === 2);
+
+  // An already-bound session is unaffected by a new browser showing up.
+  await hub.call('browser_tabs', { action: 'list', _session: 'claude · harbor' }).catch(() => {});
+  check('a bound session is not re-asked',
+    work.seen.filter((c) => c.tool === 'browser_tabs').length === 2 &&
+    !personal.seen.some((c) => c.tool === 'browser_tabs'));
+
+  // A *new* session with two browsers up must not be guessed for.
+  let threw = null;
+  await hub.call('browser_tabs', { action: 'list', _session: 'claude · meadow' }).catch((e) => (threw = e.message));
+  check('a new session raises the chooser', !!threw && /2 browsers are connected/.test(threw), threw);
+  check('the chooser names both browsers', !!threw && /browser:"work"/.test(threw) && /browser:"personal"/.test(threw), threw);
+  check('the chooser lists windows from both', !!threw && /windowId:11/.test(threw) && /windowId:22/.test(threw), threw);
+  check('nothing was sent to either browser', !personal.seen.some((c) => c.tool === 'browser_tabs'));
+
+  // Answering it binds the browser and routes there.
+  await hub.call('browser_window', { action: 'use', browser: 'personal', windowId: 22, _session: 'claude · meadow' }).catch(() => {});
+  check('answering binds the named browser', hub.sessionBrowsers.get('claude · meadow') === 'inst-home');
+  check('the answer went to that browser', personal.seen.some((c) => c.tool === 'browser_window'));
+
+  // The two sessions now work in different browsers, simultaneously.
+  await Promise.all([
+    hub.call('browser_navigate', { url: 'https://a.test', _session: 'claude · harbor' }).catch(() => {}),
+    hub.call('browser_navigate', { url: 'https://b.test', _session: 'claude · meadow' }).catch(() => {}),
+  ]);
+  check('each session drives its own browser',
+    work.seen.some((c) => c.tool === 'browser_navigate' && c.args.url === 'https://a.test') &&
+    personal.seen.some((c) => c.tool === 'browser_navigate' && c.args.url === 'https://b.test'));
+  check('neither session leaked into the other browser',
+    !work.seen.some((c) => c.args.url === 'https://b.test') &&
+    !personal.seen.some((c) => c.args.url === 'https://a.test'));
+
+  // Every call is addressed, which is what makes a misroute loud rather than a
+  // silent success on a same-numbered tab in the wrong browser.
+  const addressed = work.seen.find((c) => c.tool === 'browser_navigate');
+  check('calls carry the browser they are addressed to', addressed?.args?._browser === 'inst-work', JSON.stringify(addressed?.args));
+
+  // An unknown name must not fall back to a connected browser.
+  threw = null;
+  await hub.call('browser_tabs', { action: 'list', browser: 'nope', _session: 'claude · falcon' }).catch((e) => (threw = e.message));
+  check('an unknown browser name is refused, not guessed', !!threw && /no connected browser is called "nope"/.test(threw), threw);
+  check('the refusal lists the real names', !!threw && /"work"/.test(threw) && /"personal"/.test(threw));
+
+  // Reload: the same browser reconnecting replaces its own socket only.
+  const workAgain = await fakeExtension(PORT3, { instance: 'inst-work', browser: 'chrome', name: 'work', onCall: windowsFor(11) });
+  await sleep(250);
+  check('a reload supersedes only that browser', work.closed && !personal.closed);
+  check('the hub still holds two browsers', hub.liveBrowsers().length === 2);
+  check('the binding survives the reload', hub.sessionBrowsers.get('claude · harbor') === 'inst-work');
+  await hub.call('browser_tabs', { action: 'list', _session: 'claude · harbor' }).catch(() => {});
+  check('the session resumes on the reloaded browser', workAgain.seen.some((c) => c.tool === 'browser_tabs'));
+
+  // A browser going away must not reassign its sessions to whatever is left —
+  // that is the silent wrong-target failure the whole design exists to stop.
+  workAgain.conn.close();
+  await sleep(250);
+  threw = null;
+  await hub.call('browser_tabs', { action: 'list', _session: 'claude · harbor' }).catch((e) => (threw = e.message));
+  check('a session whose browser left is not silently rehomed',
+    !!threw && /is not connected right now/.test(threw), threw);
+  check('its binding is kept for when the browser returns',
+    hub.sessionBrowsers.get('claude · harbor') === 'inst-work');
+  check("the other browser's session is unharmed", hub.sessionBrowsers.get('claude · meadow') === 'inst-home');
+
+  // The hub answers "which browsers?" itself — no single browser can see the others.
+  const listed = await hub.call('browser_window', { action: 'browsers', _session: 'claude · meadow' });
+  check('the hub lists browsers locally', /"personal"/.test(listed.text), listed.text);
+  check('it marks the caller\'s own browser', /your browser/.test(listed.text), listed.text);
+
+  personal.conn.close();
+  await sleep(100);
+  await hub.stop();
+}
+
+/**
+ * The owning mcp-server exits while another is still running.
+ *
+ * `HubClient`'s reconnect claimed in a comment that it could "take over or
+ * rejoin" and could only rejoin — it called `connectWebSocket` and nothing
+ * else. So every survivor retried a port nobody was listening on, once a
+ * second, forever: live mcp-server processes, no hub, every browser stuck
+ * retrying, and not one error message anywhere. Seen exactly like that — two
+ * `index.js` processes up, nothing bound to 8848, one extension flapping and
+ * one showing disconnected.
+ */
+async function testHubTakeover() {
+  const { Hub, HubClient } = await importFrom('mcp-server', 'src', 'hub.js');
+  const PORT4 = PORT + 3;
+
+  const owner = await new Hub({ port: PORT4 }).start();
+  const secondary = await new HubClient({ port: PORT4 }).start();
+  check('a second server joins rather than binding', secondary.owner === null);
+
+  // The owner goes away, as an editor restarting takes its mcp-server with it.
+  await owner.stop();
+  await sleep(1400); // the reconnect timer is 1s
+
+  check('the survivor takes over the port', !!secondary.owner, 'port left orphaned');
+  check('the survivor now answers as the hub', secondary.connected === false && !!secondary.owner);
+
+  // The real proof: a browser can reach the port again.
+  const ext = await fakeExtension(PORT4, { instance: 'after-takeover' });
+  await sleep(200);
+  check('a browser can connect to the new owner', !ext.closed && !ext.standby);
+
+  await secondary.call('browser_tabs', { action: 'list' }).catch(() => {});
+  check('calls flow through the promoted server', ext.seen.some((c) => c.tool === 'browser_tabs'));
+
+  // The name a session already holds must survive election, or its tab group is
+  // stranded under a label nothing will clean up.
+  const named = new HubClient({ port: PORT4 });
+  named.sessionName = 'harbor';
+  named.opts = { port: PORT4 + 50, host: '127.0.0.1', log: () => {} };
+  named.url = `ws://127.0.0.1:${PORT4 + 50}/mcp`;
+  await named._tryTakeOver();
+  check('an elected server keeps the name it already had', named.sessionName === 'harbor');
+  await named.stop();
+
+  ext.conn.close();
+  await sleep(100);
+  await secondary.stop();
+}
+
 async function testFormatting() {
   stubChrome();
   const fmt = await importFrom('extension', 'background', 'format.js');
@@ -546,6 +739,35 @@ async function testFormatting() {
   check('a login form renders under 250 chars', rendered.text.length < 250, `${rendered.text.length} chars`);
 
   check('respects the character budget', fmt.renderTree(nodes, { maxChars: 40 }).truncated === true);
+
+  // ── The tab list has to say which window each tab is in ──────────────────
+  //
+  // It was a flat list of every tab in the browser, with the window nowhere in
+  // it. An agent with three windows open therefore had no way to tell where it
+  // was working, and the only window-ish signal available — the workstream tag
+  // — describes a *group*, which can be left behind in a window the session no
+  // longer works in. That is precisely how agents ended up certain they were in
+  // one window while acting in another.
+  const tabList = fmt.renderTabs(
+    [
+      { id: 11, windowId: 501, url: 'https://mail.google.com/', title: 'Inbox' },
+      { id: 12, windowId: 501, url: 'https://example.com/a', title: 'A' },
+      { id: 21, windowId: 502, url: 'https://example.com/b', title: 'B' },
+    ],
+    11,
+    [
+      { name: 'claude · harbor', tabIds: [11, 12], windowId: 501 },
+      { name: 'claude · meadow', tabIds: [21], windowId: 502 },
+    ],
+    { boundWindowId: 501, label: 'claude · harbor' }
+  );
+  check('tabs are grouped under a window header', /window 501 \(2 tabs\)/.test(tabList), tabList);
+  check('both windows appear', /window 502 \(1 tab\)/.test(tabList));
+  check('the calling session sees which window is its own', /window 501 [^\n]*\[your window\]/.test(tabList), tabList);
+  check('the session reads as "(you)" in its own window', /claude · harbor \(you\)/.test(tabList));
+  check('another session in another window is named', /window 502[^\n]*claude · meadow/.test(tabList));
+  check('every tab is still listed exactly once',
+    tabList.split('\n').filter((l) => /^ {2}\d+ {2}/.test(l)).length === 3, tabList);
 
   // Diffing.
   fmt.storeSnapshot(1, 'a\nb\nc');
@@ -951,6 +1173,11 @@ async function testGroupConcurrency() {
       async ungroup(ids) {
         for (const t of [].concat(ids)) tabs.get(t).groupId = -1;
       },
+      async move(id, { windowId }) {
+        await nap();
+        tabs.get(id).windowId = windowId;
+        return tabs.get(id);
+      },
       async query({ groupId }) {
         await nap();
         return [...tabs.values()].filter((t) => t.groupId === groupId);
@@ -1012,6 +1239,33 @@ async function testGroupConcurrency() {
   tabs.set(9, { id: 9, windowId: 20, groupId: stray.id });
   check('a duplicate group is not allowed to hide tabs',
     (await groups.tabsFor('dev · harbor')).length === 4);
+
+  // ── The same duplicate, from the point of view of resolving a tab ────────
+  //
+  // Cleanup wants every tab under this name, wherever it is — that is the
+  // assertion above. *Resolution* wants the opposite: a session bound to one
+  // window must never be handed a tab in another, or every call after that
+  // lands somewhere the session has been told it is not. Tabs 1-3 are in
+  // window 10, the stray is in window 20.
+  check('resolution scoped to a window sees only that window',
+    (await groups.tabsFor('dev · harbor', 10)).length === 3,
+    JSON.stringify(await groups.tabsFor('dev · harbor', 10)));
+  check('the other window holds only the stray',
+    (await groups.tabsFor('dev · harbor', 20)).join() === '9');
+  check('an unscoped lookup still spans windows, for cleanup',
+    (await groups.tabsFor('dev · harbor')).length === 4);
+
+  // Rebinding a session used to move only the bookkeeping: new tabs went to the
+  // new window while the group and everything in it stayed put, so a listing
+  // and reality told two different stories. Moving is what "works here now"
+  // has to mean.
+  const moved = await groups.moveTo('dev · harbor', 10);
+  check('rebinding brings the workstream along', moved === 1, `moved ${moved}`);
+  check('every tab is in the bound window afterwards',
+    (await groups.tabsFor('dev · harbor', 10)).length === 4);
+  check('nothing is left behind in the old window',
+    (await groups.tabsFor('dev · harbor', 20)).length === 0);
+
   check('release covers every duplicate', (await groups.release('dev · harbor')) === true);
   check('nothing is left grouped after release',
     (await groups.tabsFor('dev · harbor')).length === 0);

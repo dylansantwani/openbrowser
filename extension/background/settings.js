@@ -11,6 +11,17 @@ const DEFAULTS = {
   /** Hub port. Must match the MCP server's --port. */
   port: 8848,
 
+  /**
+   * What an agent calls this browser: "work", "personal".
+   *
+   * Several browsers can share one hub, and a session binds to one of them — so
+   * something has to name them, and only a human knows which is which. Empty
+   * falls back to a generated `chrome·a3f1`, which is unambiguous but tells you
+   * nothing; naming it is what makes `browser:"work"` readable in a prompt and
+   * in the chooser.
+   */
+  browserName: '',
+
   /** Connect to the hub automatically when the browser starts. */
   autoConnect: true,
 

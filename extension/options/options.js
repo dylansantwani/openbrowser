@@ -21,6 +21,8 @@ const BOOLEAN_FIELDS = [
   'captureBodies',
 ];
 const LIST_FIELDS = ['allowlist', 'blocklist'];
+/** Plain text fields. Empty is meaningful — it means "generate a name for me". */
+const TEXT_FIELDS = ['browserName'];
 
 function call(type, payload = {}) {
   return new Promise((resolve, reject) => {
@@ -34,6 +36,7 @@ function call(type, payload = {}) {
 
 function populate(settings) {
   for (const key of NUMBER_FIELDS) $(`#${key}`).value = settings[key] ?? '';
+  for (const key of TEXT_FIELDS) $(`#${key}`).value = settings[key] ?? '';
   for (const key of BOOLEAN_FIELDS) $(`#${key}`).checked = !!settings[key];
   for (const key of LIST_FIELDS) $(`#${key}`).value = (settings[key] || []).join('\n');
 }
@@ -45,6 +48,9 @@ function collect() {
     const value = Number($(`#${key}`).value);
     if (Number.isFinite(value) && value > 0) patch[key] = value;
   }
+  // Trimmed, because " work" and "work" would be two different browsers to
+  // anyone reading a chooser and the same one to the person who typed it.
+  for (const key of TEXT_FIELDS) patch[key] = $(`#${key}`).value.trim();
   for (const key of BOOLEAN_FIELDS) patch[key] = $(`#${key}`).checked;
 
   for (const key of LIST_FIELDS) {

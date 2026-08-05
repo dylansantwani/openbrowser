@@ -46,10 +46,10 @@ export function isSupported() {
  * matching is a glob — a workstream called "checkout *" would collect its
  * neighbours.
  */
-async function findGroups(name) {
+async function findGroups(name, windowId) {
   const wanted = PREFIX + name;
   const all = await chrome.tabGroups.query({});
-  return all.filter((g) => g.title === wanted);
+  return all.filter((g) => g.title === wanted && (windowId == null || g.windowId === windowId));
 }
 
 /**
@@ -225,6 +225,10 @@ export async function list() {
         title: group.title,
         color: group.color,
         groupId: group.id,
+        // Reported because a workstream can have a group in two windows, and a
+        // listing that omits which is which is how a session concludes it is
+        // working somewhere it is not.
+        windowId: group.windowId,
         tabIds: tabs.map((t) => t.id),
       });
     }
@@ -241,12 +245,22 @@ export async function list() {
  * that map is service-worker memory and does not survive an MV3 restart — while
  * the tab group itself does. The group title is the durable record of which
  * tabs belong to whom, so it is the thing to ask.
+ *
+ * @param {number} [windowId] restrict to this window. A workstream can end up
+ *   with a group in each of two windows — the user drags a tab out, or the
+ *   session was rebound with `browser_window use` after it had already opened
+ *   tabs — and without this the *resolution* path can hand back a tab from the
+ *   window the session is no longer working in. That is the wrong-window bug in
+ *   its purest form: the session is told it is in the window it chose, and
+ *   every subsequent call lands in the other one. Cleanup deliberately does not
+ *   pass this, because releasing half a workstream is worse than releasing it
+ *   all.
  */
-export async function tabsFor(name) {
+export async function tabsFor(name, windowId) {
   if (!isSupported() || !name) return [];
   try {
     const all = [];
-    for (const group of await findGroups(name)) {
+    for (const group of await findGroups(name, windowId)) {
       all.push(...(await chrome.tabs.query({ groupId: group.id })));
     }
     return all
@@ -255,6 +269,48 @@ export async function tabsFor(name) {
   } catch {
     return [];
   }
+}
+
+/**
+ * Move a workstream's tabs into `windowId`, so its group follows the session.
+ *
+ * Rebinding a session to another window used to change only the bookkeeping:
+ * new tabs went to the new window while the group — and every tab already in it
+ * — stayed put, so a listing said "this workstream is in window A" about tabs
+ * physically sitting in window B. Both halves were internally consistent and
+ * they disagreed with each other, which is exactly the state an agent cannot
+ * reason its way out of.
+ *
+ * Tabs are moved first and regrouped after, because `chrome.tabs.group` cannot
+ * pull a tab across a window boundary into an existing group.
+ *
+ * @returns {number} how many tabs moved
+ */
+export async function moveTo(name, windowId) {
+  if (!isSupported() || !name) return 0;
+  let moved = 0;
+  try {
+    for (const group of await findGroups(name)) {
+      if (group.windowId === windowId) continue;
+      const tabs = await chrome.tabs.query({ groupId: group.id });
+      for (const tab of tabs) {
+        try {
+          // Ungrouped first: moving a tab that is still in a group takes the
+          // whole group with it in some Chrome builds, which would drag another
+          // session's tabs along if it shares the window.
+          await chrome.tabs.ungroup([tab.id]);
+          await chrome.tabs.move(tab.id, { windowId, index: -1 });
+          await assign(tab.id, name);
+          moved++;
+        } catch {
+          /* a pinned or otherwise immovable tab is not worth failing the bind */
+        }
+      }
+    }
+  } catch {
+    /* presentation; never fail the call that asked */
+  }
+  return moved;
 }
 
 /**

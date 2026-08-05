@@ -105,6 +105,14 @@ export class Bridge {
     this.status = 'connecting';
     this._emit();
 
+    // Resolved before the socket exists so the `open` handler stays
+    // synchronous: the hello has to be the first frame on the wire, and an
+    // await inside `open` would let the heartbeat race it.
+    const instance = await instanceId();
+    // Held on the bridge so incoming calls can be checked against it without
+    // touching storage on every message.
+    this.instance = instance;
+
     const url = `ws://127.0.0.1:${this.port}/ext`;
     let socket;
     try {
@@ -128,6 +136,14 @@ export class Bridge {
           role: 'extension',
           version: chrome.runtime.getManifest().version,
           browser: navigatorBrand(),
+          // What lets the hub tell "this browser reconnecting" from "a second
+          // browser arriving". Without it the two are indistinguishable, and
+          // the hub's only safe move was to evict whoever was there — which,
+          // with two browsers running, is a permanent disconnect loop. It is
+          // also the address every call is stamped with. See `_admit` in hub.js.
+          instance,
+          // What a human calls this browser, so `browser:"work"` means something.
+          name: settings.browserName || '',
         })
       );
 
@@ -171,6 +187,30 @@ export class Bridge {
 
     if (msg.type === 'hello') return; // hub acknowledging us
     if (msg.type !== 'call') return;
+
+    // Every call is addressed to a specific browser, and this is where the
+    // address is checked.
+    //
+    // Tab ids are only unique *within* a browser: two Chromes each allocate
+    // from their own counter, so id 511957184 names a real but different tab in
+    // both. A misrouted call therefore does not fail — it succeeds, on the
+    // wrong page, silently. That is the worst failure mode this system has, and
+    // one comparison removes the whole class.
+    const addressed = msg.args?._browser;
+    if (addressed != null && this.instance != null && addressed !== this.instance) {
+      this._send({
+        type: 'result',
+        id: msg.id,
+        ok: false,
+        error: {
+          message:
+            'this call was addressed to a different browser and was not run. ' +
+            'The session is bound to another browser — re-bind it with ' +
+            'browser_window action:"use" browser:<name> windowId:<id>.',
+        },
+      });
+      return;
+    }
 
     this.stats.calls++;
     try {
@@ -241,6 +281,31 @@ export class Bridge {
     this.disconnect();
     this.backoff = BACKOFF_MIN_MS;
     await this.connect();
+  }
+}
+
+/**
+ * A stable id for this browser install, so the hub can tell two browsers apart.
+ *
+ * `chrome.storage.local`, not `session`: it has to survive a browser restart,
+ * or every restart looks to the hub like a brand new browser arriving alongside
+ * the one it just lost. Cached in a module variable too, since this is read on
+ * every connect and the worker is respawned constantly.
+ */
+let cachedInstance = null;
+
+async function instanceId() {
+  if (cachedInstance) return cachedInstance;
+  try {
+    const stored = (await chrome.storage.local.get('obInstanceId')).obInstanceId;
+    if (stored) return (cachedInstance = stored);
+    const fresh = crypto.randomUUID();
+    await chrome.storage.local.set({ obInstanceId: fresh });
+    return (cachedInstance = fresh);
+  } catch {
+    // Storage unavailable. A per-worker id is still better than none: it is
+    // wrong only across worker restarts, where the cost is one supersede.
+    return (cachedInstance = crypto.randomUUID());
   }
 }
 

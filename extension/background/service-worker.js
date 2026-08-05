@@ -135,8 +135,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     async update_settings() {
       const settings = await updateSettings(msg.patch || {});
-      // A port change only takes effect on a fresh connection.
-      if ('port' in (msg.patch || {})) await bridge.reconnect();
+      // Both of these are only ever sent in the hello, so they take effect on a
+      // fresh connection and nowhere else. Renaming a browser and having the
+      // chooser keep showing the old name would be its own small betrayal.
+      const patch = msg.patch || {};
+      if ('port' in patch || 'browserName' in patch) await bridge.reconnect();
       return settings;
     },
 

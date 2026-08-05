@@ -54,13 +54,14 @@ const runTool = (tool, args = {}) => call('run_tool', { tool, args });
 // -----------------------------------------------------------------------------
 
 function renderStatus() {
-  const { status, port, stats } = state.bridge;
+  const { status, port, stats, lastError } = state.bridge;
   const button = $('#connection');
 
   button.className = `status status--${status}`;
   $('#status-text').textContent =
     status === 'connected' ? `Connected · ${port}` :
     status === 'connecting' ? 'Connecting…' : 'Disconnected';
+  button.title = lastError || '';
 
   // Troubleshooting steps belong to a link that is actually down, not one that
   // is mid-reconnect. Reconnects are routine — MV3 recycles the worker every

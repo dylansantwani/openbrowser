@@ -63,7 +63,7 @@ export const TOOLS = [
           type: 'boolean',
           description: 'For "new": open unfocused. Default true, so parallel work keeps focus.',
         },
-        windowId: { type: 'number', description: 'For "new": target window.' },
+        windowId: { type: 'number', description: 'For "new": target window. For "list": only that window.' },
       },
     },
   },
@@ -412,11 +412,12 @@ export const TOOLS = [
       properties: {
         action: {
           type: 'string',
-          enum: ['list', 'use', 'pick'],
+          enum: ['list', 'use', 'pick', 'browsers'],
           description:
-            'Window choice. "list" shows open windows; "use" takes windowId; "pick" asks the user in the browser and waits. Only needed when a call reports several windows are open — relay the list and let the user choose, never guess.',
+            'Where this session works. "list" windows; "browsers" lists them; "use" takes browser and/or windowId; "pick" asks the user. Only when a call reports several — relay the list, never guess.',
         },
         windowId: { type: 'number', description: 'For "use".' },
+        browser: { type: 'string', description: 'For "use": browser name.' },
         tabId: TAB,
         preset: { type: 'string', enum: ['mobile', 'tablet', 'desktop', 'wide'] },
         width: { type: 'number' },

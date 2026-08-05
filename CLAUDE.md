@@ -16,6 +16,10 @@ logins.
   MCP client ──stdio──> mcp-server ──ws://127.0.0.1:8848──> extension ──> tabs
 ```
 
+Several MCP clients share one hub, and one hub drives *several browsers*. A
+session is bound to one browser and to one window inside it; the hub routes by
+that binding. See "The browser was never a singleton" below.
+
 Two halves, two languages of failure:
 
 - **`mcp-server/`** is Node. Bugs here look like "the tool never appears in my
@@ -73,6 +77,15 @@ human answers either through the agent (`browser_window action:"use"`) or by
 clicking the prompt `action:"pick"` paints in every window. Bindings are keyed
 by session label in `chrome.storage.session` and released when the session ends,
 so a name reused later never inherits a window nobody chose for it.
+
+The binding has to constrain *reads*, not just writes. Binding used to decide
+only where the next `tabs.create` went, which left three ways for a session to
+end up acting outside its own window — a rebind that moved the bookkeeping and
+not the tabs, a user dragging a tab out, an explicit `tabId` from elsewhere — and
+in every one of them `browser_window list` still cheerfully reported the chosen
+window. So `sessionTabId` filters candidates by the bound window, `use`/`pick`
+move the workstream to the new window (`groups.moveTo`), and an adopted tab
+either sets the binding, if the session has none, or is moved to it.
 
 The pick prompt is the one thing on a page an agent must not be able to see:
 it is in `OWN_DECORATION` in `a11y.js`, so it never enters a snapshot, so no
@@ -189,6 +202,64 @@ value never moves. Nothing about it looks broken. Any property a keyframe drives
 must therefore be declared *without* `!important`, which is the one place this
 file breaks its own rule. `test/overlay-preview.html` samples the computed value
 across the cycle rather than trusting that the animation exists.
+
+**"The browser" was never a singleton, and every bug in that area was the same
+bug.** The hub held one extension socket and evicted whoever was there when a
+new one arrived — right for the case it was written for (an extension reload or
+an MV3 worker respawn reconnecting), ruinous for a second browser. Both connect,
+each eviction triggers the other's one-second reconnect, and the pair flaps
+forever; every eviction runs `pending.rejectAll`, so agents mid-call get
+"browser extension disconnected mid-call" at random. The first fix made the
+second browser a standby, which stopped the flap by making that browser useless
+— the same singleton assumption with better manners.
+
+Now every connected browser is live and a *session* is bound to one, exactly as
+a session is bound to a window one level in. `_routeFor` is `ensureWindow`'s
+shape: bound sessions pass through, one browser is never a question, anything
+ambiguous raises a chooser rather than guessing. Identity comes from a stable
+`instance` id the extension keeps in `chrome.storage.local`, so a reconnection
+is distinguishable from an arrival and supersedes only its own socket.
+
+Guessing a browser is worse than guessing a window, and this is the reason the
+design is strict: **tab ids are only unique within a browser.** Two Chromes each
+allocate from their own counter, so id `511957184` names a real but different
+tab in both — a misrouted call does not fail, it succeeds on the wrong page.
+Hence `_browser` on every call, stamped by the hub after the caller's args for
+the same reason `_session` is, and checked in `bridge.js` against the browser's
+own instance. That one comparison is what makes a misroute loud.
+
+Two consequences worth keeping: a browser that disconnects keeps its sessions'
+bindings rather than releasing them (an extension reload is routine and the tabs
+are still there — rebinding to whatever else is connected is the silent
+wrong-target failure again), and `_onExtensionClose` fails only the calls that
+were in flight *to that browser*, because one browser closing must not fail
+another's work. The chooser lists windows across all browsers in one question:
+nobody thinks "the work browser, then its second window", they think "that
+window over there", so picking a window names its browser implicitly.
+
+**A workstream group is not a window, and treating it as one is how agents get
+lost.** `tabGroups.query({})` spans every window, so a workstream with a group in
+two windows — from a rebind, or a tab dragged out — returned tabs from both, and
+`sessionTabId` took the most recently accessed. The agent is then working in a
+window while every status call it can make insists it is in the other one, with
+both answers internally consistent. Two credible stories that disagree is worse
+than one incomplete one. `tabsFor(name, windowId)` scopes resolution; cleanup
+(`release`, `closeWorkstream`) deliberately stays unscoped, because releasing
+half a workstream is worse than releasing all of it.
+
+Related, and the reason it stayed invisible for so long: `browser_tabs list`
+was a flat list of every tab in the browser with the window nowhere in it, and
+it accepted `windowId` and silently ignored it — so two different windows
+returned byte-identical output. An agent trying to work out where it was
+literally could not. It is grouped by window now, with the session's own window
+marked.
+
+**`chrome.tabs.create({windowId})` is a request, not a promise of placement.** A
+`windowId` Chrome will not honour does not reliably throw; the tab appears in the
+last-focused window instead — the exact window the binding exists to keep agents
+out of. `createTabIn` reads `windowId` back off the created tab and moves it if
+it landed wrong. `tabs.move` after the fact is reliable in a way `create` is not,
+because the tab exists by then.
 
 **MutationObserver does not cross a shadow boundary, but the tree walk does.**
 `subtree: true` stops at the shadow root; `childrenOf` walks straight through

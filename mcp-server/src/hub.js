@@ -84,9 +84,31 @@ export class Hub {
     this.host = host;
     this.log = log;
 
-    /** @type {import('./ws.js').WebSocketConnection | null} */
-    this.extension = null;
-    this.extensionInfo = null;
+    /**
+     * Every connected browser. All of them are live.
+     *
+     * This began as a single socket, which made two browsers fight for it; then
+     * as a primary plus standbys, which stopped the fight by making the second
+     * browser useless. Both were the same mistake — treating "the browser" as a
+     * singleton when a work profile and a personal one, or Chrome beside a
+     * Chromium build, is an ordinary setup. A session is bound to one browser;
+     * the hub is bound to none.
+     */
+    this.extensions = new Set();
+
+    /**
+     * sessionLabel -> browser instance id.
+     *
+     * The hub is the only process that sees every session *and* every browser,
+     * so it is the only place this can live — the same argument that puts
+     * session-name allocation here. Re-seeded from the browsers on connect,
+     * because a hub owner is an ordinary mcp-server and can be killed.
+     */
+    this.sessionBrowsers = new Map();
+
+    /** call id -> the connection it was sent to, so results route back. */
+    this._callConn = new Map();
+
     this.pending = new PendingCalls();
     /** Secondary MCP servers connected over /mcp. */
     this.peers = new Set();
@@ -146,16 +168,32 @@ export class Hub {
    * can see. Degraded, not broken.
    */
   async _seedTakenNames() {
-    try {
-      const res = await this._rawCall('__session_list', {}, { timeout: 5000 });
-      const names = res?.names;
-      if (Array.isArray(names)) {
-        for (const label of names) this._reserve(label);
-        if (names.length) this.log(`reserved ${names.length} session name(s) already in the browser`);
-      }
-    } catch {
-      /* older extension, or it went away mid-handshake */
-    }
+    // Every browser, not just the newest: a session's tab group lives in
+    // whichever browser it was working in, so asking only one leaves the other's
+    // names free to be handed out again — dropping a fresh session straight into
+    // a live session's tabs, which is the exact failure the seed exists to stop.
+    await Promise.all(
+      this.liveBrowsers().map(async (conn) => {
+        try {
+          const res = await this._rawCallTo(conn, '__session_list', {}, { timeout: 5000 });
+          const names = res?.names;
+          if (Array.isArray(names)) {
+            for (const label of names) this._reserve(label);
+            // Re-learn which browser each session belongs to. Without this a
+            // hub that took over the port has no bindings, and every session
+            // would be re-asked the chooser mid-task.
+            for (const label of names) {
+              if (!this.sessionBrowsers.has(label)) this.sessionBrowsers.set(label, conn.instance);
+            }
+            if (names.length) {
+              this.log(`reserved ${names.length} session name(s) in ${describeBrowser(conn.info)}`);
+            }
+          }
+        } catch {
+          /* older extension, or it went away mid-handshake */
+        }
+      })
+    );
     this._seeded = true;
   }
 
@@ -185,8 +223,14 @@ export class Hub {
       healthPayload: () => ({
         ok: true,
         role: 'hub',
-        extensionConnected: !!this.extension,
-        browser: this.extensionInfo?.browser ?? null,
+        extensionConnected: this.liveBrowsers().length > 0,
+        browsers: this.liveBrowsers().map((c) => ({
+          name: browserLabel(c),
+          browser: c.info?.browser ?? null,
+          sessions: [...this.sessionBrowsers]
+            .filter(([, inst]) => inst === c.instance)
+            .map(([label]) => label),
+        })),
         peers: this.peers.size,
       }),
     });
@@ -228,31 +272,97 @@ export class Hub {
       return;
     }
 
-    // Only one extension at a time. A reconnect (extension reloaded, service
-    // worker respawned) supersedes the old connection.
-    if (this.extension && !this.extension.closed) {
-      this.log('extension reconnected; dropping previous connection');
-      this.extension.close(1000, 'superseded');
-    }
-
-    this.extension = conn;
-    conn.on('message', (raw) => this._onExtensionMessage(raw));
-    conn.on('close', () => {
-      if (this.extension === conn) {
-        this.extension = null;
-        this.extensionInfo = null;
-        // Names already handed out stay taken; what has to be re-established is
-        // the browser's view, since a different browser may connect next.
-        this._seeded = false;
-        this.pending.rejectAll('browser extension disconnected mid-call');
-        this._broadcastPeers({ type: 'extension_status', connected: false });
-        this.log('extension disconnected');
-      }
-    });
-    conn.sendJSON({ type: 'hello', role: 'hub' });
+    // Which browser this is only becomes knowable at its `hello`, so admission
+    // is deferred until then — see `_admit`. Nothing is sent back before that
+    // point, because the one thing worth saying is the answer.
+    this.extensions.add(conn);
+    conn.on('message', (raw) => this._onExtensionMessage(conn, raw));
+    conn.on('close', () => this._onExtensionClose(conn));
   }
 
-  _onExtensionMessage(raw) {
+  /**
+   * A browser has introduced itself: register it, or replace its own earlier
+   * socket.
+   *
+   * The rule used to be "the newest connection wins", which is right for the
+   * case it was written for — an extension reload or an MV3 worker respawn
+   * reconnecting — and ruinous for the case it did not anticipate. Two browsers
+   * both connect, each evicts the other on arrival, and both reconnect a second
+   * later: a permanent flap. Every eviction ran `rejectAll`, so agents mid-call
+   * got "browser extension disconnected mid-call" at random.
+   *
+   * The missing fact was *identity*. A browser carries a stable instance id
+   * (see `bridge.js`), so a reconnection from the same browser is recognisable
+   * as one and still supersedes, while a different browser is recognisable as
+   * different and simply joins. Nobody is evicted for existing.
+   */
+  _admit(conn) {
+    // The same browser's earlier socket, if any. An extension reload leaves the
+    // old one briefly open, and two live sockets for one browser would make
+    // routing ambiguous — a call could go to the dead half.
+    for (const other of this.extensions) {
+      if (other === conn || other.closed) continue;
+      if (other.instance != null && other.instance === conn.instance) {
+        this.log(`${describeBrowser(conn.info)} reconnected; dropping its previous connection`);
+        other.superseded = true;
+        other.close(1000, 'superseded');
+      }
+    }
+
+    conn.sendJSON({ type: 'hello', role: 'hub', browser: conn.instance });
+    this.log(`browser connected: ${describeBrowser(conn.info)} (${this.liveBrowsers().length} now connected)`);
+
+    // Nobody is told a browser is ready until the seed is in, so no name can be
+    // claimed against a stale picture of what is in use. The seed asks every
+    // browser, since a session's tab group may live in any of them.
+    this._seedTakenNames().then(() => {
+      this._announceReady(conn.info);
+      for (const resolve of this._waiters.splice(0)) resolve();
+    });
+  }
+
+  /** Connected browsers, in connection order. */
+  liveBrowsers() {
+    return [...this.extensions].filter((c) => !c.closed && c.info);
+  }
+
+  /** A browser by its configured name, case-insensitively. */
+  _browserByName(name) {
+    const wanted = String(name).trim().toLowerCase();
+    return this.liveBrowsers().find((c) => browserLabel(c).toLowerCase() === wanted) || null;
+  }
+
+  _onExtensionClose(conn) {
+    this.extensions.delete(conn);
+    // A reload's old socket: its replacement is already registered, so nothing
+    // here is news. Announcing a disconnect would flap the peers' status.
+    if (conn.superseded) return;
+
+    // Only calls that were in flight *to this browser*. Rejecting everything
+    // was survivable when there was one browser and is plainly wrong now — one
+    // browser closing must not fail another browser's work.
+    for (const [id, target] of this._callConn) {
+      if (target !== conn) continue;
+      this._callConn.delete(id);
+      this.pending.settle(id, false, {
+        message:
+          `the browser "${browserLabel(conn)}" disconnected mid-call. Its session binding is kept, so retry once it ` +
+          'reconnects, or bind another with browser_window action:"use" browser:<name> windowId:<id>.',
+      });
+    }
+
+    // Bindings are deliberately kept. An extension reload is routine, the
+    // session's tabs are still sitting in that browser, and re-binding it to
+    // whatever else happens to be connected is precisely the silent wrong-target
+    // failure this whole design exists to prevent.
+    this.log(`browser disconnected: ${describeBrowser(conn.info)} (${this.liveBrowsers().length} left)`);
+    if (!this.liveBrowsers().length) {
+      this._seeded = false;
+      this._broadcastPeers({ type: 'extension_status', connected: false });
+    }
+  }
+
+  _onExtensionMessage(conn, raw) {
     let msg;
     try {
       msg = JSON.parse(raw);
@@ -261,19 +371,18 @@ export class Hub {
     }
 
     if (msg.type === 'hello') {
-      this.extensionInfo = msg;
-      this.log(`extension connected (${msg.browser || 'chrome'} v${msg.version || '?'})`);
-      // Nobody is told the browser is ready until the seed is in, so no name
-      // can be claimed against a stale picture of what is in use. The seed is
-      // one loopback round trip and always settles, so this cannot wedge.
-      this._seedTakenNames().then(() => {
-        this._announceReady(msg);
-        for (const resolve of this._waiters.splice(0)) resolve();
-      });
+      conn.info = msg;
+      conn.instance = msg.instance ?? null;
+      this._admit(conn);
       return;
     }
 
     if (msg.type === 'result') {
+      // Results are matched by call id, which is unique across every browser —
+      // so a browser cannot settle a call that was never sent to it.
+      if (this._callConn.get(msg.id) !== conn) return;
+      this._callConn.delete(msg.id);
+
       // Results for a peer's call are relayed back to that peer verbatim.
       const owner = this._callOwners?.get(msg.id);
       if (owner) {
@@ -307,13 +416,30 @@ export class Hub {
 
     if (msg.type !== 'call') return;
 
-    if (!this.extension || this.extension.closed) {
-      peer.sendJSON({ type: 'result', id: msg.id, ok: false, error: { message: NO_EXTENSION } });
+    // Hub-only questions are answered here too, or a peer's session could never
+    // see the browser list.
+    const local = this._localAnswer(msg.tool, msg.args || {});
+    if (local) {
+      peer.sendJSON({ type: 'result', id: msg.id, ok: true, result: local });
       return;
     }
-    this._callOwners ??= new Map();
-    this._callOwners.set(msg.id, peer);
-    this.extension.sendJSON(msg);
+
+    // A peer's call is routed exactly like a local one — the peer's session is
+    // in `args._session`, so the same binding applies. Routing failures come
+    // back as ordinary errors, which is how the chooser reaches an agent
+    // running in another mcp-server process.
+    this._routeFor(msg.args || {})
+      .then((conn) => {
+        this._callOwners ??= new Map();
+        this._callOwners.set(msg.id, peer);
+        this._callConn.set(msg.id, conn);
+        conn.sendJSON({ ...msg, args: { ...(msg.args || {}), _browser: conn.instance } });
+      })
+      .catch((err) => {
+        if (!peer.closed) {
+          peer.sendJSON({ type: 'result', id: msg.id, ok: false, error: { message: err.message } });
+        }
+      });
   }
 
   _broadcastPeers(obj) {
@@ -352,21 +478,31 @@ export class Hub {
    * allowed to hold a shutdown open.
    */
   _endSession(name) {
-    if (!name || !this.extension || this.extension.closed) return;
-    this.extension.sendJSON({
-      type: 'call',
-      id: `session-end-${name}-${this.peers.size}`,
-      tool: '__session_end',
-      args: { _session: name },
-    });
+    if (!name) return;
+    // Sent to the browser this session was bound to, if it is still there;
+    // otherwise to all of them, since a session's tabs can only be tidied by
+    // the browser holding them and a lost binding must not strand a tab group.
+    const bound = this.sessionBrowsers.get(name);
+    const targets = bound
+      ? this.liveBrowsers().filter((c) => c.instance === bound)
+      : this.liveBrowsers();
+    this.sessionBrowsers.delete(name);
+    for (const conn of targets) {
+      conn.sendJSON({
+        type: 'call',
+        id: `session-end-${name}-${this.peers.size}`,
+        tool: '__session_end',
+        args: { _session: name, _browser: conn.instance },
+      });
+    }
   }
 
   /**
    * Ready to take calls. Includes the seed, so the first caller through here
-   * cannot claim a name before the browser has said which ones are in use.
+   * cannot claim a name before the browsers have said which names are in use.
    */
   get connected() {
-    return !!this.extension && !this.extension.closed && this._seeded;
+    return this.liveBrowsers().length > 0 && this._seeded;
   }
 
   /** Resolve once an extension is connected, or reject after `timeout`. */
@@ -385,21 +521,166 @@ export class Hub {
     });
   }
 
-  /** Invoke a tool in the browser. @returns {Promise<any>} */
-  async call(tool, args = {}, { timeout } = {}) {
-    if (!this.connected) await this.waitForExtension();
-    return this._rawCall(tool, args, { timeout });
+  /**
+   * The browser a session works in, asking if there is any doubt.
+   *
+   * Deliberately the same shape as `ensureWindow` one level out: bound sessions
+   * go straight through, a single browser is never a question, and anything
+   * ambiguous raises a chooser rather than picking. Guessing here is worse than
+   * guessing a window — tab ids are only unique *within* a browser, so a call
+   * sent to the wrong one does not fail, it succeeds on a different page.
+   *
+   * @throws {Error} the chooser, when a human has to decide
+   */
+  async _routeFor(args) {
+    const label = args._session;
+    const live = this.liveBrowsers();
+    if (!live.length) throw new Error(NO_EXTENSION);
+
+    // An explicit name always wins, and re-binds. This is how the human's answer
+    // to the chooser gets back in.
+    if (args.browser != null) {
+      const named = this._browserByName(args.browser);
+      if (!named) {
+        throw new Error(
+          `no connected browser is called "${args.browser}". Connected: ` +
+            live.map((c) => `"${browserLabel(c)}"`).join(', ') +
+            '. Names are set in the extension options of each browser.'
+        );
+      }
+      if (label) this.sessionBrowsers.set(label, named.instance);
+      return named;
+    }
+
+    const bound = label && this.sessionBrowsers.get(label);
+    if (bound) {
+      const conn = live.find((c) => c.instance === bound);
+      if (conn) return conn;
+      // Kept, not reassigned — see `_onExtensionClose`.
+      throw new Error(
+        `the browser "${label}" works in is not connected right now. Reopen it, or move this session with ` +
+          'browser_window action:"use" browser:<name> windowId:<id>. Connected: ' +
+          live.map((c) => `"${browserLabel(c)}"`).join(', ') +
+          '.'
+      );
+    }
+
+    if (live.length === 1) {
+      if (label) this.sessionBrowsers.set(label, live[0].instance);
+      return live[0];
+    }
+
+    throw await this._chooser(label, live);
   }
 
   /**
-   * Send without waiting to be `connected`. Only the seed uses this — it runs
-   * *during* the handshake that makes us connected, so going through `call()`
-   * would deadlock on a wait it is itself responsible for ending.
+   * One question covering every window in every browser.
+   *
+   * Two questions — which browser, then which window — is the obvious shape and
+   * the wrong one: nobody thinks "the work browser, then the second window",
+   * they think "that window over there". Picking a window names its browser
+   * implicitly, so one answer binds both.
    */
-  _rawCall(tool, args = {}, { timeout } = {}) {
+  async _chooser(label, live) {
+    const perBrowser = await Promise.all(
+      live.map(async (conn) => {
+        try {
+          const res = await this._rawCallTo(conn, '__window_list', {}, { timeout: 5000 });
+          return { conn, windows: res?.windows || [] };
+        } catch {
+          // A browser that cannot answer still has to appear, or the human is
+          // offered a choice that silently omits where they are looking.
+          return { conn, windows: null };
+        }
+      })
+    );
+
+    const lines = [];
+    let n = 0;
+    for (const { conn, windows } of perBrowser) {
+      const name = browserLabel(conn);
+      if (windows == null) {
+        lines.push(`  · ${name} — could not list its windows`);
+        continue;
+      }
+      for (const w of windows) {
+        lines.push(
+          `  ${++n} · browser:"${name}" windowId:${w.windowId}  (${w.tabs} tab${w.tabs === 1 ? '' : 's'})` +
+            (w.titles?.length ? `  ${w.titles.join(', ')}` : '')
+        );
+      }
+    }
+
+    return new Error(
+      `${live.length} browsers are connected — ask the user which one "${label || 'this session'}" should work in. ` +
+        'Nothing has been opened yet.\n' +
+        lines.join('\n') +
+        '\nThen call browser_window action:"use" browser:<name> windowId:<id> with their answer. ' +
+        'That binds the browser and the window together.'
+    );
+  }
+
+  /**
+   * Questions only the hub can answer, because no single browser can see the
+   * others. Returns a result, or null to route the call normally.
+   */
+  _localAnswer(tool, args) {
+    if (tool !== 'browser_window' || args.action !== 'browsers') return null;
+
+    const live = this.liveBrowsers();
+    if (!live.length) return { text: NO_EXTENSION };
+
+    const label = args._session;
+    const bound = label && this.sessionBrowsers.get(label);
+    const lines = live.map((conn) => {
+      const sessions = [...this.sessionBrowsers]
+        .filter(([, inst]) => inst === conn.instance)
+        .map(([s]) => (s === label ? `${s} (you)` : s));
+      const named = conn.info?.name?.trim() ? '' : '  (unnamed — set one in this browser\'s extension options)';
+      return (
+        `  "${browserLabel(conn)}" — ${conn.info?.browser || 'chrome'}` +
+        (conn.instance === bound ? '  ← your browser' : '') +
+        (sessions.length ? `  ← ${sessions.join(', ')}` : '') +
+        named
+      );
+    });
+
+    return {
+      text:
+        `${live.length} browser(s) connected:\n${lines.join('\n')}\n` +
+        (bound
+          ? `"${label}" works in "${browserLabel(live.find((c) => c.instance === bound)) || bound}".`
+          : `"${label || 'this session'}" is not bound to a browser yet — ` +
+            'browser_window action:"use" browser:<name> windowId:<id>.'),
+    };
+  }
+
+  /** Invoke a tool in the session's browser. @returns {Promise<any>} */
+  async call(tool, args = {}, { timeout } = {}) {
+    if (!this.connected) await this.waitForExtension();
+    const local = this._localAnswer(tool, args);
+    if (local) return local;
+    const conn = await this._routeFor(args);
+    return this._rawCallTo(conn, tool, args, { timeout });
+  }
+
+  /**
+   * Send to a named connection without waiting to be `connected`. The seed uses
+   * it because it runs *during* the handshake that makes us connected, so going
+   * through `call()` would deadlock on a wait it is itself responsible for
+   * ending; routing uses it because it has already chosen the browser.
+   */
+  _rawCallTo(conn, tool, args = {}, { timeout } = {}) {
     const id = nextId();
     const promise = this.pending.create(id, { timeout });
-    this.extension.sendJSON({ type: 'call', id, tool, args });
+    this._callConn.set(id, conn);
+    // `_browser` is stamped here, after the caller's args, for the same reason
+    // `_session` is stamped in index.js after the spread: it is an assertion of
+    // identity and a model must not be able to forge it. The extension refuses
+    // any call whose `_browser` is not its own instance, which turns a misroute
+    // — otherwise a silent success on the wrong browser's tab of the same id —
+    // into a loud error.
+    conn.sendJSON({ type: 'call', id, tool, args: { ...args, _browser: conn.instance } });
     return promise;
   }
 
@@ -430,11 +711,14 @@ export class Hub {
 export class HubClient {
   constructor({ port = DEFAULT_PORT, host = '127.0.0.1', log = () => {} } = {}) {
     this.url = `ws://${host}:${port}/mcp`;
+    this.opts = { port, host, log };
     this.log = log;
     this.pending = new PendingCalls();
     this.conn = null;
     this.extensionConnected = false;
     this._waiters = [];
+    /** Set once this process has been elected owner — see `_tryTakeOver`. */
+    this.owner = null;
   }
 
   async start() {
@@ -442,7 +726,54 @@ export class HubClient {
     return this;
   }
 
+  /**
+   * Become the hub if nobody is holding the port.
+   *
+   * The reconnect path used to say it could "take over or rejoin" and could
+   * only ever rejoin: it called `connectWebSocket` and nothing else. So when
+   * the owning mcp-server exited — an editor restarting, a client being killed
+   * — every surviving secondary spun at one attempt per second against a port
+   * that nobody was listening on, forever. Nothing crashed and nothing logged
+   * an error; there were simply live mcp-server processes, no hub, and every
+   * browser stuck retrying. Observed exactly that way: two `index.js` processes
+   * running, nothing bound to 8848, one extension flapping and one reporting
+   * disconnected.
+   *
+   * Election is the bind itself, which is atomic — whoever gets the port is the
+   * owner and everyone else gets EADDRINUSE and joins them, which is the same
+   * rule `createTransport` uses at startup.
+   */
+  async _tryTakeOver() {
+    if (this.owner) return true;
+    const hub = new Hub(this.opts);
+    try {
+      await hub.start();
+    } catch (err) {
+      if (err.code === 'EADDRINUSE') return false; // someone else won; join them
+      throw err;
+    }
+
+    // Keep the name this session already has. Its tab group carries that label,
+    // and letting the new hub allocate a fresh one would strand those tabs
+    // under a name nothing will ever clean up.
+    if (this.sessionName) {
+      hub._sessionName = this.sessionName;
+      hub._reserve(this.sessionName);
+    } else {
+      this.sessionName = hub.sessionName;
+    }
+    if (this.sessionLabel) hub.setSessionLabel(this.sessionLabel);
+
+    this.owner = hub;
+    this.log('previous hub owner exited; took over the port');
+    return true;
+  }
+
   async _connect() {
+    // Try to become the owner first. Skipping this is what left a dead port
+    // with live servers around it.
+    if (await this._tryTakeOver()) return;
+
     this.conn = await connectWebSocket(this.url);
     this.log(`joined existing hub at ${this.url}`);
 
@@ -491,7 +822,8 @@ export class HubClient {
     this.conn.on('close', () => {
       this.extensionConnected = false;
       this.pending.rejectAll('hub connection lost');
-      // The hub owner may have exited; retry so we can take over or rejoin.
+      // The owner may have exited. `_connect` now tries to bind the port before
+      // joining, so this genuinely does take over rather than only claiming to.
       setTimeout(() => this._connect().catch(() => {}), 1000).unref?.();
     });
 
@@ -504,11 +836,16 @@ export class HubClient {
     if (this.sessionLabel) this.conn.sendJSON({ type: 'register', label: this.sessionLabel });
   }
 
+  // Once elected, every question is the owning hub's to answer. Forwarding
+  // rather than re-implementing keeps one behaviour for callers, which is the
+  // property that let `index.js` stay ignorant of which role it got.
+
   get connected() {
-    return this.extensionConnected;
+    return this.owner ? this.owner.connected : this.extensionConnected;
   }
 
   waitForExtension(timeout = 20_000) {
+    if (this.owner) return this.owner.waitForExtension(timeout);
     if (this.extensionConnected) return Promise.resolve();
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(NO_EXTENSION)), timeout);
@@ -521,7 +858,12 @@ export class HubClient {
   }
 
   async call(tool, args = {}, { timeout } = {}) {
-    if (!this.conn || this.conn.closed) await this._connect();
+    if (this.owner) return this.owner.call(tool, args, { timeout });
+    if (!this.conn || this.conn.closed) {
+      await this._connect();
+      // `_connect` may have won the port on the way through.
+      if (this.owner) return this.owner.call(tool, args, { timeout });
+    }
     const id = nextId();
     const promise = this.pending.create(id, { timeout });
     this.conn.sendJSON({ type: 'call', id, tool, args });
@@ -530,13 +872,39 @@ export class HubClient {
 
   setSessionLabel(label) {
     this.sessionLabel = label;
+    if (this.owner) return void this.owner.setSessionLabel(label);
     if (this.conn && !this.conn.closed) this.conn.sendJSON({ type: 'register', label });
   }
 
   async stop() {
     this.pending.rejectAll('shutting down');
     this.conn?.close();
+    // Releases the port, so the next survivor can win it.
+    await this.owner?.stop();
   }
+}
+
+/**
+ * The name a human uses for a browser, and an agent passes as `browser:`.
+ *
+ * Set in each browser's extension options, because only a human knows that one
+ * of them is "work". Unnamed browsers still need something stable and
+ * distinguishable — "chrome" twice would be unusable in a chooser — so the
+ * instance id's tail stands in until someone names it.
+ */
+function browserLabel(conn) {
+  const configured = conn?.info?.name;
+  if (typeof configured === 'string' && configured.trim()) return configured.trim();
+  const brand = (conn?.info?.browser || 'chrome').split(' ')[0].toLowerCase();
+  const tail = String(conn?.instance || '').replace(/-/g, '').slice(-4);
+  return tail ? `${brand}·${tail}` : brand;
+}
+
+/** A browser, as a human would name it in a sentence about which one is which. */
+function describeBrowser(info) {
+  if (!info) return 'an unidentified browser';
+  const name = info.name?.trim() || info.browser || 'chrome';
+  return info.version ? `${name} v${info.version}` : name;
 }
 
 export const NO_EXTENSION =

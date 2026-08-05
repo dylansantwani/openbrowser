@@ -182,6 +182,28 @@ async function claimTab(tabId, label) {
     );
   }
 
+  // A session works in one window. An explicit `tabId` is the one way a tab
+  // from somewhere else enters the picture, and leaving it there quietly breaks
+  // that invariant: resolution is window-scoped, so the very next call with no
+  // `tabId` would silently move to a different tab, in a different window, than
+  // the one just worked on. Both ways of restoring the invariant are honest;
+  // which applies depends on whether the session has committed to a window yet.
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (tab) {
+    const bound = await windows.boundWindowId(label);
+    if (bound == null) {
+      // Nothing committed yet, so the tab decides. This is also the nicest path
+      // for "drive my Gmail tab" as a session's first call: it binds a window
+      // without anyone having to answer the chooser.
+      await windows.bind(label, tab.windowId);
+    } else if (tab.windowId !== bound) {
+      // Already committed. Bring the tab to the session rather than the session
+      // to the tab — the binding may be the user's own answer to the chooser,
+      // and quietly reassigning it would undo a decision they made.
+      await chrome.tabs.move(tabId, { windowId: bound, index: -1 }).catch(() => {});
+    }
+  }
+
   const settings = await getSettings();
   if (settings.groupTabs === false) return;
   await groups.assign(tabId, label).catch(() => {});
@@ -209,10 +231,57 @@ async function openSessionTab(args) {
   const settings = await getSettings();
   const windowId = await windows.ensureWindow(label, settings);
 
-  const tab = await chrome.tabs.create({ url: 'about:blank', active: false, windowId });
+  const tab = await createTabIn({ url: 'about:blank', active: false }, windowId);
   await claimTab(tab.id, label);
   await rememberCreatedTab(args._session || label, tab.id);
   return tab.id;
+}
+
+/**
+ * Bring a session's existing tabs to the window it has just been bound to.
+ *
+ * Binding used to change only where the *next* tab would open. Everything the
+ * session already had stayed where it was, still carrying its workstream label,
+ * so `browser_window list` reported the session in its new window while its
+ * group — and the tab a call with no `tabId` would resolve to — sat in the old
+ * one. This is the drift that reads, from inside an agent, as "I was told I am
+ * in window A and I am demonstrably acting in window B".
+ *
+ * The alternative was to refuse to rebind while a session has tabs, which
+ * solves the inconsistency by forbidding the thing people actually want. Moving
+ * is what "this session works here now" means.
+ */
+async function rehomeSession(label, windowId) {
+  if (!label || windowId == null) return 0;
+  const settings = await getSettings();
+  if (settings.groupTabs === false) return 0;
+  return groups.moveTo(label, windowId).catch(() => 0);
+}
+
+/**
+ * Create a tab, and make sure it really is where it was asked to be.
+ *
+ * `chrome.tabs.create({windowId})` is not a promise of placement. A window that
+ * is closing, minimising, or mid-drag can end up with the tab somewhere else,
+ * and — worse — a `windowId` Chrome rejects surfaces as a tab created in the
+ * *last focused* window, which is precisely the window this whole module exists
+ * to keep agents out of. Nothing errors, so the only way to know is to read
+ * `windowId` back off the created tab and correct it.
+ *
+ * The correction is a `tabs.move`, which is reliable in a way `create` is not
+ * because the tab already exists by then.
+ */
+async function createTabIn(props, windowId) {
+  const tab = await chrome.tabs.create({ ...props, ...(windowId ? { windowId } : {}) });
+  if (windowId == null || tab.windowId === windowId) return tab;
+  try {
+    const moved = await chrome.tabs.move(tab.id, { windowId, index: -1 });
+    return { ...tab, windowId: (Array.isArray(moved) ? moved[0] : moved)?.windowId ?? windowId };
+  } catch {
+    // Report the truth rather than the intent: a caller that groups this tab
+    // needs its real window, or it creates a duplicate group in the wrong one.
+    return tab;
+  }
 }
 
 /**
@@ -397,10 +466,27 @@ async function sessionTabId(args) {
   const label = args.group || args._session;
   if (!label) return null; // the side panel drives the active tab, as a human expects
 
-  const candidates = [...(await groups.tabsFor(label)), ...(await recallTabs(RECENT_TABS_KEY, label))];
+  // The window the session was told to work in. Everything below is filtered
+  // against it, because a candidate in another window is the wrong-window bug:
+  // the session believes it is in the window it chose — that is what
+  // `browser_window list` says — while every call lands somewhere else. Both a
+  // stale group left behind by a rebind and a tab the user dragged out produce
+  // exactly that, and neither is rare.
+  //
+  // Read rather than ensured: this must never ask "which window?" as a side
+  // effect of resolving a tab. A session with no binding yet has no constraint
+  // to apply, and `openSessionTab` is where the question belongs.
+  const boundWindow = await windows.boundWindowId(label);
+
+  const candidates = [
+    ...(await groups.tabsFor(label, boundWindow ?? undefined)),
+    ...(await recallTabs(RECENT_TABS_KEY, label)),
+  ];
+
   for (const tabId of candidates) {
     try {
-      await chrome.tabs.get(tabId);
+      const tab = await chrome.tabs.get(tabId);
+      if (boundWindow != null && tab.windowId !== boundWindow) continue;
       return tabId;
     } catch {
       /* closed since; try the next */
@@ -730,6 +816,31 @@ const HANDLERS = {
   __session_end: (args) => endSession(args._session || args.group),
 
   /**
+   * Internal: this browser's windows, for the hub's cross-browser chooser.
+   *
+   * Choosing a browser and then choosing a window is two questions for one
+   * decision — nobody thinks "the work browser, then its second window", they
+   * think "that window over there". So the hub asks every browser for this and
+   * offers one combined list, where picking a window names its browser
+   * implicitly. Deliberately small: enough for a human to recognise a window,
+   * and nothing more, since this is paid for once per browser per chooser.
+   */
+  async __window_list() {
+    const wins = await windows.listWindows();
+    return {
+      windows: wins.map((w) => ({
+        windowId: w.windowId,
+        focused: w.focused,
+        tabs: w.tabs.length,
+        titles: w.tabs
+          .slice(0, 3)
+          .map((t) => (t.title || t.url || '').replace(/\s+/g, ' ').slice(0, 28))
+          .filter(Boolean),
+      })),
+    };
+  },
+
+  /**
    * Internal, like `__session_end`: every workstream label the browser still
    * knows about.
    *
@@ -765,16 +876,37 @@ const HANDLERS = {
 
     switch (action) {
       case 'list': {
-        const tabs = await chrome.tabs.query({});
+        // `windowId` used to be accepted here and silently dropped, so two
+        // different windows returned byte-identical listings — an agent
+        // checking where it was got the same answer whatever it asked.
+        const label = args.group || args._session;
+        const tabs = await chrome.tabs.query(args.windowId != null ? { windowId: args.windowId } : {});
         const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
         const workstreams = await groups.list();
+        const bound = label ? await windows.boundWindowId(label) : null;
 
-        const lines = [`${tabs.length} tab(s):`, fmt.renderTabs(tabs, active?.id, workstreams)];
+        const scope = args.windowId != null ? ` in window ${args.windowId}` : '';
+        const lines = [
+          `${tabs.length} tab(s)${scope}:`,
+          fmt.renderTabs(tabs, active?.id, workstreams, { boundWindowId: bound, label }),
+        ];
         if (workstreams.length) {
           lines.push(
             '',
             'workstreams:',
-            ...workstreams.map((w) => `  ${w.name} (${w.color}) — ${w.tabIds.length} tab(s): ${w.tabIds.join(', ')}`)
+            ...workstreams.map(
+              (w) => `  ${w.name} (${w.color}) — window ${w.windowId}, ${w.tabIds.length} tab(s): ${w.tabIds.join(', ')}`
+            )
+          );
+        }
+        // Said once, plainly, rather than left to be inferred from the tags: a
+        // workstream group can sit in a window the session no longer works in.
+        if (label) {
+          lines.push(
+            '',
+            bound == null
+              ? `"${label}" has no window bound yet — the next tab it opens will settle it, or bind one now with browser_window action:"use" windowId:<id>.`
+              : `"${label}" works in window ${bound}; tabs it opens go there.`
           );
         }
         return lines.join('\n');
@@ -795,11 +927,8 @@ const HANDLERS = {
         const windowId = args.windowId ?? (await windows.ensureWindow(sessionLabel, settings)) ?? undefined;
 
         // Background by default: opening ten tabs should not yank focus ten times.
-        const tab = await chrome.tabs.create({
-          url,
-          active: args.background === false,
-          ...(windowId ? { windowId } : {}),
-        });
+        // Placement is verified rather than assumed — see `createTabIn`.
+        const tab = await createTabIn({ url, active: args.background === false }, windowId);
         // Group before waiting for load, so the tab is visibly labelled the
         // moment it appears rather than after the page settles. An explicit
         // `group` wins over the session label, letting an agent split its own
@@ -1659,16 +1788,31 @@ const HANDLERS = {
         }
 
         case 'use': {
-          if (args.windowId == null) throw new Error('pass `windowId` — which window this session should work in.');
+          // `browser` alone is a complete answer: the hub bound it before this
+          // call was routed here, and which window to use inside it is a
+          // separate question this browser can still ask for itself.
+          if (args.windowId == null) {
+            if (args.browser != null) {
+              return `"${label}" works in browser "${args.browser}" now. Pass windowId too to pin a window.`;
+            }
+            throw new Error('pass `windowId` — which window this session should work in.');
+          }
           const id = await windows.use(label, args.windowId);
-          return `"${label}" will work in window ${id}. Its tabs open there, in their own group.`;
+          const moved = await rehomeSession(label, id);
+          return (
+            `"${label}" will work in window ${id}. Its tabs open there, in their own group.` +
+            (moved ? ` Moved ${moved} tab(s) it already had into window ${id}.` : '')
+          );
         }
 
         case 'pick': {
           const res = await windows.pick(label);
-          if (!res.asked) return `only one window is open; "${label}" will work in window ${res.windowId}.`;
+          const moved = await rehomeSession(label, res.windowId);
+          const followed = moved ? ` Moved ${moved} tab(s) it already had into window ${res.windowId}.` : '';
+          if (!res.asked) return `only one window is open; "${label}" will work in window ${res.windowId}.${followed}`;
           return (
             `the user chose window ${res.windowId} (${res.tabCount} tab(s)); "${label}" works there now.` +
+            followed +
             (res.skipped ? ` ${res.skipped} window(s) could not show the prompt.` : '')
           );
         }

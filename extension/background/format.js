@@ -218,7 +218,26 @@ export function renderFindResults(results, query) {
   return lines.join('\n');
 }
 
-export function renderTabs(tabs, activeTabId, workstreams = []) {
+/**
+ * The tab list, grouped by window.
+ *
+ * It used to be one flat list of every tab in the browser, with no indication
+ * of which window any of them was in — and `windowId` was accepted and then
+ * ignored, so asking about one window returned the same bytes as asking about
+ * another. An agent trying to work out where it was could not: the only
+ * window-shaped information anywhere in the output was the workstream tag, and
+ * that describes a *group*, which can outlive a rebind in the window the
+ * session has left. Two internally-consistent stories that disagree is worse
+ * than one incomplete one, and this is the call that has to settle it.
+ *
+ * Headers cost a line per window. That is the cheapest correct answer to "which
+ * window am I in" available, and far cheaper than the retries a wrong one buys.
+ *
+ * @param {object} [opts]
+ * @param {number|null} [opts.boundWindowId] the calling session's window
+ * @param {string|null} [opts.label] the calling session, so it reads as "(you)"
+ */
+export function renderTabs(tabs, activeTabId, workstreams = [], opts = {}) {
   if (!tabs.length) return 'No tabs open.';
 
   // tabId -> workstream label, so each row says which job owns it.
@@ -227,18 +246,42 @@ export function renderTabs(tabs, activeTabId, workstreams = []) {
     for (const id of w.tabIds) owner.set(id, w.name);
   }
 
-  return tabs
-    .map((t) => {
-      const marks = [];
-      if (t.id === activeTabId) marks.push('active');
-      if (t.audible) marks.push('audio');
-      if (t.discarded) marks.push('discarded');
-      if (t.status === 'loading') marks.push('loading');
-      const suffix = marks.length ? ` (${marks.join(', ')})` : '';
-      const stream = owner.has(t.id) ? `  [${owner.get(t.id)}]` : '';
-      return `${t.id}  ${shortUrl(t.url || t.pendingUrl || 'about:blank')}  "${truncate(t.title || '', 60)}"${suffix}${stream}`;
-    })
-    .join('\n');
+  const row = (t) => {
+    const marks = [];
+    if (t.id === activeTabId) marks.push('active');
+    if (t.audible) marks.push('audio');
+    if (t.discarded) marks.push('discarded');
+    if (t.status === 'loading') marks.push('loading');
+    const suffix = marks.length ? ` (${marks.join(', ')})` : '';
+    const stream = owner.has(t.id) ? `  [${owner.get(t.id)}]` : '';
+    return `  ${t.id}  ${shortUrl(t.url || t.pendingUrl || 'about:blank')}  "${truncate(t.title || '', 60)}"${suffix}${stream}`;
+  };
+
+  // Insertion order is Chrome's own window order, which is stable across calls
+  // — worth keeping, since an agent comparing two listings reads position.
+  const byWindow = new Map();
+  for (const t of tabs) {
+    const id = t.windowId ?? 0;
+    if (!byWindow.has(id)) byWindow.set(id, []);
+    byWindow.get(id).push(t);
+  }
+
+  const out = [];
+  for (const [windowId, group] of byWindow) {
+    // Which sessions have tabs here. The header is where an agent looks to see
+    // it is about to act in a window another agent is mid-task in.
+    const here = [...new Set(group.map((t) => owner.get(t.id)).filter(Boolean))];
+    const who = here.length
+      ? `  ← ${here.map((n) => (n === opts.label ? `${n} (you)` : n)).join(', ')}`
+      : '';
+    // Bracketed rather than a second arrow: the two say different things, and a
+    // session *can* have tabs in a window it is not bound to — that mismatch is
+    // the drift worth seeing, not something to paper over.
+    const mine = opts.boundWindowId != null && windowId === opts.boundWindowId ? ' [your window]' : '';
+    out.push(`window ${windowId} (${group.length} tab${group.length === 1 ? '' : 's'})${mine}${who}`);
+    out.push(...group.map(row));
+  }
+  return out.join('\n');
 }
 
 export function renderConsole(entries) {
