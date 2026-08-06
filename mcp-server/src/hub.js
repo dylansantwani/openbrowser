@@ -789,9 +789,25 @@ export class Hub {
     try {
       await link.start();
     } catch (err) {
+      // A hub published through TLS (Cloudflare tunnel, reverse proxy) answers
+      // only on 443, and a plaintext handshake there returns "400 Bad Request"
+      // rather than timing out — so the two failures need different advice.
+      const bare = String(address)
+        .replace(/^wss?:\/\//i, '')
+        .replace(/\/.*$/, '')
+        .replace(/:\d+$/, '');
+      // Only worth suggesting for a DNS name. A bare LAN IP is far more likely
+      // to be a hub still bound to loopback than one sitting behind TLS, and the
+      // extra sentence just buries the advice that actually applies.
+      const looksRoutable = /[a-z]/i.test(bare) && bare.includes('.') && !bare.startsWith('[');
+      const tlsHint =
+        /^wss:\/\//i.test(String(address)) || !looksRoutable
+          ? ''
+          : ` If it is published over HTTPS, address it as wss://${bare} instead.`;
       throw new Error(
         `could not reach a hub at ${address}: ${err.message}. The far end must be running with ` +
-          '--host 0.0.0.0 (it binds loopback by default) and its port must be reachable.'
+          '--host 0.0.0.0 (it binds loopback by default) and its port must be reachable.' +
+          tlsHint
       );
     }
 

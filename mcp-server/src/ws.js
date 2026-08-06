@@ -15,6 +15,7 @@ import { createServer } from 'node:http';
 import { createHash, randomBytes } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import net from 'node:net';
+import tls from 'node:tls';
 
 const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
@@ -311,8 +312,15 @@ export class WebSocketServer extends EventEmitter {
 export function connectWebSocket(url) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
-    const port = Number(u.port) || 80;
-    const socket = net.connect(port, u.hostname);
+    // wss:// is the only way to reach a hub that lives behind TLS — a Cloudflare
+    // tunnel, a reverse proxy — where 443 is the one port that answers. Sending
+    // a plaintext handshake there does not time out, it comes back as
+    // "400 Bad Request", which reads like a protocol bug rather than a scheme one.
+    const secure = u.protocol === 'wss:';
+    const port = Number(u.port) || (secure ? 443 : 80);
+    const socket = secure
+      ? tls.connect({ host: u.hostname, port, servername: u.hostname })
+      : net.connect(port, u.hostname);
     const key = randomBytes(16).toString('base64');
     let settled = false;
 
@@ -325,10 +333,16 @@ export function connectWebSocket(url) {
 
     socket.setTimeout(5000, () => fail(new Error('websocket handshake timed out')));
     socket.on('error', fail);
-    socket.on('connect', () => {
+    // A TLSSocket is not writable until the handshake finishes, and 'connect'
+    // fires before that — writing then would send the GET in the clear.
+    socket.on(secure ? 'secureConnect' : 'connect', () => {
+      // Drop the port from Host when it is the scheme default. Cloudflare routes
+      // on an exact Host match, and "host:443" is not the name it knows.
+      const hostHeader =
+        port === (secure ? 443 : 80) ? u.hostname : `${u.hostname}:${port}`;
       socket.write(
         `GET ${u.pathname || '/'}${u.search} HTTP/1.1\r\n` +
-          `Host: ${u.hostname}:${port}\r\n` +
+          `Host: ${hostHeader}\r\n` +
           'Upgrade: websocket\r\n' +
           'Connection: Upgrade\r\n' +
           `Sec-WebSocket-Key: ${key}\r\n` +

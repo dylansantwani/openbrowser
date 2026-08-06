@@ -223,7 +223,9 @@ export function toHubUrl(address, defaultPort = 8848) {
 
   if (/^wss?:\/\//i.test(raw)) {
     const u = new URL(raw);
-    if (!u.port) u.port = String(defaultPort);
+    // Whatever terminates TLS for a wss:// hub is listening on 443, not 8848 —
+    // defaulting to the plaintext port here just buys a handshake timeout.
+    if (!u.port) u.port = String(u.protocol === 'wss:' ? 443 : defaultPort);
     u.pathname = '/hub';
     return u.toString();
   }
