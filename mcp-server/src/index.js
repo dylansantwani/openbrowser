@@ -18,10 +18,21 @@ import { TOOLS, TOOL_NAMES, SERVER_INSTRUCTIONS } from './tools.js';
 const VERSION = '1.0.0';
 
 function parseArgs(argv) {
-  const opts = { port: Number(process.env.OPENBROWSER_PORT) || DEFAULT_PORT, mode: 'mcp', verbose: false };
+  const opts = {
+    port: Number(process.env.OPENBROWSER_PORT) || DEFAULT_PORT,
+    // Loopback by default, and that default is load-bearing: the hub has no
+    // authentication, so anything that can reach it can run JavaScript in a
+    // logged-in browser. Binding elsewhere is always an explicit act.
+    host: process.env.OPENBROWSER_HOST || '127.0.0.1',
+    connect: (process.env.OPENBROWSER_CONNECT || '').split(',').map((s) => s.trim()).filter(Boolean),
+    mode: 'mcp',
+    verbose: false,
+  };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--port' || a === '-p') opts.port = Number(argv[++i]);
+    else if (a === '--host') opts.host = String(argv[++i]);
+    else if (a === '--connect') opts.connect.push(...String(argv[++i] || '').split(',').map((s) => s.trim()).filter(Boolean));
     else if (a === '--health' || a === '--doctor') opts.mode = 'health';
     else if (a === '--hub') opts.mode = 'hub';
     else if (a === '--verbose' || a === '-v') opts.verbose = true;
@@ -51,6 +62,9 @@ if (opts.mode === 'help') {
       `  node src/index.js --health     check whether Chrome is connected\n` +
       `  node src/index.js --hub        run the hub only\n` +
       `  node src/index.js --port N     hub port (default ${DEFAULT_PORT})\n` +
+      `  node src/index.js --host H     bind address (default 127.0.0.1;\n` +
+      `                                 use 0.0.0.0 to accept remote hubs)\n` +
+      `  node src/index.js --connect A  attach to remote hub(s), comma separated\n` +
       `  node src/index.js --verbose    log to stderr\n`
   );
   process.exit(0);
@@ -61,7 +75,27 @@ if (opts.mode === 'health') {
   process.exit(0);
 }
 
-const transport = await createTransport({ port: opts.port, log });
+const transport = await createTransport({ port: opts.port, host: opts.host, log });
+
+if (opts.host !== '127.0.0.1' && opts.host !== 'localhost') {
+  log(
+    `listening on ${opts.host} — this hub has no authentication, so anyone who can reach ` +
+      `${opts.host}:${opts.port} can drive its browsers. Keep it on a private network.`
+  );
+}
+
+// Attach remote hubs named at startup, so a cloud box can be wired up from a
+// systemd unit rather than an agent having to issue `connect` every session.
+// Routed through `call` rather than the Hub method directly, so it behaves the
+// same whether this process won the port or joined someone else's hub.
+for (const address of opts.connect) {
+  try {
+    const res = await transport.call('browser_window', { action: 'connect', hub: address });
+    log(res?.text || `connected to remote hub at ${address}`);
+  } catch (err) {
+    log(`could not connect to remote hub at ${address}: ${err.message}`);
+  }
+}
 
 if (opts.mode === 'hub') {
   log('hub-only mode; press Ctrl+C to stop');
@@ -119,7 +153,13 @@ const server = new McpServer({
     if (name === 'browser_batch') for (const step of args.steps || []) checkArgs(step.tool, step.args);
     if (name === 'browser_upload') checkPaths(args.paths);
 
-    if (!transport.connected) {
+    // Hub-level questions must work with nothing attached — `connect` is how a
+    // browser becomes reachable in the first place, so waiting for one here
+    // would make a hub whose browsers are all remote impossible to bootstrap.
+    const hubOnly =
+      name === 'browser_window' && ['connect', 'disconnect', 'remotes'].includes(args.action);
+
+    if (!hubOnly && !transport.connected) {
       // Give a just-launched Chrome a moment to connect before failing — MCP
       // clients often start the server before the browser is up.
       try {

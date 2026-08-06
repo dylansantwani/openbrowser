@@ -15,6 +15,7 @@
  */
 
 import { WebSocketServer, connectWebSocket } from './ws.js';
+import { RemoteLink, aliasFor, toHubUrl } from './federation.js';
 
 export const DEFAULT_PORT = 8848;
 
@@ -133,6 +134,20 @@ export class Hub {
      * exactly how a restarted hub drops a fresh session into a dead one's tabs.
      */
     this._seeded = false;
+
+    /** alias -> RemoteLink. Remote hubs whose browsers we can drive. */
+    this.remotes = new Map();
+
+    /**
+     * Hubs that have connected to *us* over `/hub`, so we can push browser-list
+     * changes to them. Receiving is always on — see `_onConnection` — but it is
+     * only reachable if the hub was told to bind a non-loopback address, which
+     * is the deliberate gate.
+     */
+    this.federates = new Set();
+
+    /** Calls relayed on behalf of a federated hub: localId -> {conn, remoteId}. */
+    this._federatedCalls = new Map();
   }
 
   /**
@@ -242,7 +257,19 @@ export class Hub {
   }
 
   _onConnection(conn) {
-    // `/ext` is the extension; `/mcp` is another mcp-server process joining.
+    // `/ext` is the extension; `/mcp` is another mcp-server process joining;
+    // `/hub` is another *hub* federating to us.
+    //
+    // Receiving federation is deliberately always on — there is no toggle,
+    // because a toggle in a second process is a security control living
+    // somewhere other than the thing it protects. The real gate is the bind
+    // address: this hub listens on 127.0.0.1 unless started with --host, so
+    // nothing off-machine can reach this endpoint by default.
+    if (conn.path === '/hub') {
+      this._onFederateConnection(conn);
+      return;
+    }
+
     const role = conn.path === '/mcp' ? 'peer' : 'extension';
 
     if (role === 'peer') {
@@ -278,6 +305,86 @@ export class Hub {
     this.extensions.add(conn);
     conn.on('message', (raw) => this._onExtensionMessage(conn, raw));
     conn.on('close', () => this._onExtensionClose(conn));
+  }
+
+  /** Another hub has federated to us. Serve it our local browsers. */
+  _onFederateConnection(conn) {
+    this.federates.add(conn);
+    this.log(`a remote hub connected (${this.federates.size} federated)`);
+
+    conn.on('message', (raw) => this._onFederateMessage(conn, raw));
+    conn.on('close', () => {
+      this.federates.delete(conn);
+      // Its in-flight calls can never be answered now; drop the mappings so the
+      // maps do not grow for the lifetime of the process.
+      for (const [localId, entry] of this._federatedCalls) {
+        if (entry.conn === conn) this._federatedCalls.delete(localId);
+      }
+      this.log(`a remote hub disconnected (${this.federates.size} federated)`);
+    });
+
+    conn.sendJSON({ type: 'hello', role: 'hub', browsers: this._sharedBrowsers() });
+  }
+
+  /** Our local browsers, described for a federated hub. */
+  _sharedBrowsers() {
+    return this.localBrowsers().map((c) => ({
+      instance: c.instance,
+      label: browserLabel(c),
+      info: c.info ? { browser: c.info.browser, version: c.info.version, name: c.info.name } : null,
+    }));
+  }
+
+  /** Tell every federated hub our browser set changed, so their choosers stay true. */
+  _announceFederates() {
+    if (!this.federates.size) return;
+    const browsers = this._sharedBrowsers();
+    for (const conn of this.federates) {
+      if (!conn.closed) conn.sendJSON({ type: 'browsers', browsers });
+    }
+  }
+
+  _onFederateMessage(conn, raw) {
+    let msg;
+    try {
+      msg = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    if (msg.type !== 'call') return;
+
+    const target = this.localBrowsers().find((c) => c.instance === msg.browser);
+    if (!target) {
+      conn.sendJSON({
+        type: 'result',
+        id: msg.id,
+        ok: false,
+        error: {
+          message:
+            `no browser with id "${msg.browser}" is connected to this hub. Connected: ` +
+            (this._sharedBrowsers().map((b) => `"${b.label}"`).join(', ') || 'none') +
+            '. The remote browser list may be stale — it refreshes on reconnect.',
+        },
+      });
+      return;
+    }
+
+    // A fresh local id, because the calling hub's counter is a different
+    // process's and could collide with our own. The far side's id is carried in
+    // the map and restored on the way back.
+    const localId = nextId();
+    this._federatedCalls.set(localId, { conn, remoteId: msg.id });
+    this._callConn.set(localId, target);
+    target.sendJSON({
+      type: 'call',
+      id: localId,
+      tool: msg.tool,
+      // `_browser` is re-stamped with *our* instance id. The extension refuses
+      // any call whose `_browser` is not its own, and the calling hub sent the
+      // id it knows, which is the same one — but restamping here keeps the
+      // guarantee local rather than trusting the peer to have got it right.
+      args: { ...(msg.args || {}), _browser: target.instance },
+    });
   }
 
   /**
@@ -319,11 +426,26 @@ export class Hub {
       this._announceReady(conn.info);
       for (const resolve of this._waiters.splice(0)) resolve();
     });
+    this._announceFederates();
   }
 
-  /** Connected browsers, in connection order. */
-  liveBrowsers() {
+  /**
+   * Browsers attached directly to this hub.
+   *
+   * Only these are ever offered to a federated hub. Re-sharing browsers we
+   * ourselves reached through someone else is what would let A→B→A form, and a
+   * loop here is not a hang but a call that ping-pongs until it times out. One
+   * level deep makes the cycle impossible instead of detectable.
+   */
+  localBrowsers() {
     return [...this.extensions].filter((c) => !c.closed && c.info);
+  }
+
+  /** Every browser this hub can drive: its own, plus every remote hub's. */
+  liveBrowsers() {
+    const out = this.localBrowsers();
+    for (const link of this.remotes.values()) out.push(...link.liveBrowsers());
+    return out;
   }
 
   /** A browser by its configured name, case-insensitively. */
@@ -356,6 +478,7 @@ export class Hub {
     // whatever else happens to be connected is precisely the silent wrong-target
     // failure this whole design exists to prevent.
     this.log(`browser disconnected: ${describeBrowser(conn.info)} (${this.liveBrowsers().length} left)`);
+    this._announceFederates();
     if (!this.liveBrowsers().length) {
       this._seeded = false;
       this._broadcastPeers({ type: 'extension_status', connected: false });
@@ -382,6 +505,14 @@ export class Hub {
       // so a browser cannot settle a call that was never sent to it.
       if (this._callConn.get(msg.id) !== conn) return;
       this._callConn.delete(msg.id);
+
+      // Results for a federated hub's call go back with *its* id restored.
+      const fed = this._federatedCalls.get(msg.id);
+      if (fed) {
+        this._federatedCalls.delete(msg.id);
+        if (!fed.conn.closed) fed.conn.sendJSON({ ...msg, id: fed.remoteId });
+        return;
+      }
 
       // Results for a peer's call are relayed back to that peer verbatim.
       const owner = this._callOwners?.get(msg.id);
@@ -417,23 +548,24 @@ export class Hub {
     if (msg.type !== 'call') return;
 
     // Hub-only questions are answered here too, or a peer's session could never
-    // see the browser list.
-    const local = this._localAnswer(msg.tool, msg.args || {});
-    if (local) {
-      peer.sendJSON({ type: 'result', id: msg.id, ok: true, result: local });
-      return;
-    }
+    // see the browser list — or attach a remote hub.
+    this._localAnswer(msg.tool, msg.args || {})
+      .then((local) => {
+        if (local) {
+          peer.sendJSON({ type: 'result', id: msg.id, ok: true, result: local });
+          return;
+        }
 
-    // A peer's call is routed exactly like a local one — the peer's session is
-    // in `args._session`, so the same binding applies. Routing failures come
-    // back as ordinary errors, which is how the chooser reaches an agent
-    // running in another mcp-server process.
-    this._routeFor(msg.args || {})
-      .then((conn) => {
-        this._callOwners ??= new Map();
-        this._callOwners.set(msg.id, peer);
-        this._callConn.set(msg.id, conn);
-        conn.sendJSON({ ...msg, args: { ...(msg.args || {}), _browser: conn.instance } });
+        // A peer's call is routed exactly like a local one — the peer's session
+        // is in `args._session`, so the same binding applies. Routing failures
+        // come back as ordinary errors, which is how the chooser reaches an
+        // agent running in another mcp-server process.
+        return this._routeFor(msg.args || {}).then((conn) => {
+          this._callOwners ??= new Map();
+          this._callOwners.set(msg.id, peer);
+          this._callConn.set(msg.id, conn);
+          conn.sendJSON({ ...msg, args: { ...(msg.args || {}), _browser: conn.instance } });
+        });
       })
       .catch((err) => {
         if (!peer.closed) {
@@ -621,11 +753,159 @@ export class Hub {
   }
 
   /**
+   * Attach to another hub. Its browsers join `liveBrowsers()` under `alias/…`.
+   */
+  async connectRemote(address, alias) {
+    // Idempotent by *destination*, not by name.
+    //
+    // Deduping on the alias alone was wrong in the one way that matters: a
+    // second `connect` to an address already attached found the name taken,
+    // auto-aliased to `10.0.0.5-2`, and opened a second link to the same
+    // machine. One physical browser then appeared twice under two names, and
+    // every session that had not bound explicitly was pushed into a chooser
+    // offering two identical-looking options — manufacturing precisely the
+    // ambiguity the chooser exists to resolve. Reconnecting is a normal thing
+    // for an agent to do when it is unsure of its state, so this has to be a
+    // no-op rather than an error.
+    const url = toHubUrl(address);
+    for (const link of this.remotes.values()) {
+      if (link.url === url) return { name: link.name, link, reused: true };
+    }
+
+    const name = String(alias || aliasFor(address, new Set(this.remotes.keys()))).trim();
+    if (!name) throw new Error('a name for the remote hub is required');
+    if (this.remotes.has(name)) {
+      throw new Error(`a different remote hub is already called "${name}" — disconnect it first.`);
+    }
+
+    const link = new RemoteLink({
+      name,
+      address,
+      log: this.log,
+      onResult: (id, ok, payload) => this._settleFromRemote(id, ok, payload),
+      onChange: () => this._onRemoteChange(),
+    });
+
+    try {
+      await link.start();
+    } catch (err) {
+      throw new Error(
+        `could not reach a hub at ${address}: ${err.message}. The far end must be running with ` +
+          '--host 0.0.0.0 (it binds loopback by default) and its port must be reachable.'
+      );
+    }
+
+    this.remotes.set(name, link);
+    this._onRemoteChange();
+    return { name, link };
+  }
+
+  /** Detach a remote hub and drop any session bindings that pointed into it. */
+  disconnectRemote(name) {
+    const link = this.remotes.get(name);
+    if (!link) {
+      throw new Error(
+        `no remote hub called "${name}". Connected: ` +
+          ([...this.remotes.keys()].map((n) => `"${n}"`).join(', ') || 'none') +
+          '.'
+      );
+    }
+    // A binding into a hub that is gone would fail every later call with "not
+    // connected right now" and no way to clear it.
+    for (const [label, inst] of [...this.sessionBrowsers]) {
+      if (String(inst).startsWith(`${name}/`)) this.sessionBrowsers.delete(label);
+    }
+    link.stop();
+    this.remotes.delete(name);
+    return link;
+  }
+
+  /**
+   * Settle a call that was answered by a remote hub.
+   *
+   * Mirrors the local result path: a call made on behalf of a peer goes back to
+   * that peer, anything else resolves this process's own promise.
+   */
+  _settleFromRemote(id, ok, payload) {
+    this._callConn.delete(id);
+    const owner = this._callOwners?.get(id);
+    if (owner) {
+      this._callOwners.delete(id);
+      if (!owner.closed) {
+        owner.sendJSON({ type: 'result', id, ok, ...(ok ? { result: payload } : { error: payload }) });
+      }
+      return;
+    }
+    this.pending.settle(id, ok, payload);
+  }
+
+  /**
+   * A remote hub's browser set changed.
+   *
+   * The seed normally runs when a local extension says hello. With only remote
+   * browsers attached that never happens, and `connected` — which requires
+   * `_seeded` — would stay false forever, blocking every call behind
+   * `waitForExtension`. So a remote arriving seeds too.
+   */
+  _onRemoteChange() {
+    if (this._seeded || this._seeding || !this.liveBrowsers().length) return;
+    this._seeding = true;
+    this._seedTakenNames()
+      .then(() => {
+        this._announceReady(this.liveBrowsers()[0]?.info);
+        for (const resolve of this._waiters.splice(0)) resolve();
+      })
+      .finally(() => {
+        this._seeding = false;
+      });
+  }
+
+  /**
    * Questions only the hub can answer, because no single browser can see the
    * others. Returns a result, or null to route the call normally.
    */
-  _localAnswer(tool, args) {
-    if (tool !== 'browser_window' || args.action !== 'browsers') return null;
+  async _localAnswer(tool, args) {
+    if (tool !== 'browser_window') return null;
+
+    if (args.action === 'connect') {
+      const { name, reused } = await this.connectRemote(args.hub, args.name);
+      const link = this.remotes.get(name);
+      const found = link.liveBrowsers();
+      return {
+        text:
+          (reused
+            ? `Already connected to the hub at ${args.hub} as "${name}" — nothing changed. `
+            : `Connected to the hub at ${args.hub} as "${name}". `) +
+          (found.length
+            ? `${found.length} browser(s) available: ${found.map((b) => `"${browserLabel(b)}"`).join(', ')}. ` +
+              'Bind one with browser_window action:"use" browser:<name>.'
+            : 'It has no browsers connected yet; they appear here as they arrive.'),
+      };
+    }
+
+    if (args.action === 'disconnect') {
+      this.disconnectRemote(args.name || args.hub);
+      return { text: `Disconnected from remote hub "${args.name || args.hub}".` };
+    }
+
+    if (args.action === 'remotes') {
+      if (!this.remotes.size) {
+        return {
+          text: 'No remote hubs connected. Attach one with browser_window action:"connect" hub:"<host>" — the far end must be running with --host 0.0.0.0.',
+        };
+      }
+      const lines = [...this.remotes.values()].map((link) => {
+        const bs = link.liveBrowsers();
+        return (
+          `  "${link.name}" — ${link.address} — ${link.closed ? 'disconnected (retrying)' : 'connected'}` +
+          (bs.length ? `, ${bs.length} browser(s): ${bs.map((b) => `"${browserLabel(b)}"`).join(', ')}` : ', no browsers') +
+          (link.lastError ? `  [${link.lastError}]` : '')
+        );
+      });
+      return { text: `${this.remotes.size} remote hub(s):\n${lines.join('\n')}` };
+    }
+
+    if (args.action !== 'browsers') return null;
 
     const live = this.liveBrowsers();
     if (!live.length) return { text: NO_EXTENSION };
@@ -657,8 +937,13 @@ export class Hub {
 
   /** Invoke a tool in the session's browser. @returns {Promise<any>} */
   async call(tool, args = {}, { timeout } = {}) {
-    if (!this.connected) await this.waitForExtension();
-    const local = this._localAnswer(tool, args);
+    // `connect` is the one call that must work with nothing attached — it is
+    // how you attach something. Waiting for a browser first would deadlock a
+    // hub whose only browsers are on the machine it has not connected to yet.
+    const hubOnly =
+      tool === 'browser_window' && ['connect', 'disconnect', 'remotes'].includes(args.action);
+    if (!hubOnly && !this.connected) await this.waitForExtension();
+    const local = await this._localAnswer(tool, args);
     if (local) return local;
     const conn = await this._routeFor(args);
     return this._rawCallTo(conn, tool, args, { timeout });
@@ -691,6 +976,8 @@ export class Hub {
   }
 
   async stop() {
+    for (const link of this.remotes.values()) link.stop();
+    this.remotes.clear();
     this.pending.rejectAll('hub shutting down');
     // A peer's cleanup is triggered by its socket closing; the hub owner has no
     // socket to close, so it has to say so on the way out. The short wait is

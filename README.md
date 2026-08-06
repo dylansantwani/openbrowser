@@ -124,6 +124,38 @@ same session without fighting over it.
 Everything is local. Nothing leaves your machine except the pages you ask it to
 visit.
 
+### Browsers on other machines
+
+A hub can attach to hubs elsewhere, so one agent with **one** MCP config drives
+browsers on any number of boxes:
+
+```
+  your agent ──> hub (laptop) ──┬──> Chrome, here
+                                ├──ws──> hub (10.0.0.5) ──> Chrome, there
+                                └──ws──> hub (10.0.0.6) ──> Chrome, there
+```
+
+On each remote machine, let the hub listen off-loopback:
+
+```bash
+node mcp-server/src/index.js --hub --host 0.0.0.0
+```
+
+Then, from an agent:
+
+```
+browser_window action:"connect" hub:"10.0.0.5"
+```
+
+Its browsers appear as `10.0.0.5/<name>` and are used exactly like local ones.
+`action:"remotes"` lists what is attached; `action:"disconnect"` detaches.
+`--connect 10.0.0.5,10.0.0.6` attaches them at startup instead.
+
+> ⚠️ **The hub has no authentication.** Anything that can reach it can run
+> JavaScript in a logged-in browser. `--host` defaults to `127.0.0.1` for that
+> reason — keep federated hubs on a private network or a VPN mesh, never on a
+> public IP.
+
 ---
 
 ## The tools
@@ -145,7 +177,7 @@ single-purpose ones — models pick an enum value far more reliably.
 | `browser_inspect` | console, network, cookies, storage, downloads, frames |
 | `browser_batch` | run many calls as one request, optionally across many tabs |
 | `browser_upload` | attach local files to a file input |
-| `browser_window` | resize, emulate a device, force dark mode, throttle network |
+| `browser_window` | pick the window/browser, attach a hub on another machine, resize, emulate a device, throttle network |
 | `browser_macro` | save and replay step sequences |
 
 Full parameter reference: **[docs/TOOLS.md](docs/TOOLS.md)**.

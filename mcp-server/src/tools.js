@@ -412,12 +412,13 @@ export const TOOLS = [
       properties: {
         action: {
           type: 'string',
-          enum: ['list', 'use', 'pick', 'browsers'],
+          enum: ['list', 'use', 'pick', 'browsers', 'connect', 'disconnect', 'remotes'],
           description:
-            'Where this session works. "list" windows; "browsers" lists them; "use" takes browser and/or windowId; "pick" asks the user. Only when a call reports several — relay the list, never guess.',
+            'Where this session works. "list" windows; "browsers" lists them; "use" takes browser and/or windowId; "pick" asks the user. Only when a call reports several — relay the list, never guess. "connect" hub:<host> adds another machine\'s browsers as "remote/browser"; also "remotes", "disconnect".',
         },
         windowId: { type: 'number', description: 'For "use".' },
         browser: { type: 'string', description: 'For "use": browser name.' },
+        hub: { type: 'string', description: 'host[:port].' },
         tabId: TAB,
         preset: { type: 'string', enum: ['mobile', 'tablet', 'desktop', 'wide'] },
         width: { type: 'number' },
