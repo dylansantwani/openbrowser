@@ -15,7 +15,7 @@
  */
 
 import { WebSocketServer, connectWebSocket } from './ws.js';
-import { RemoteLink, aliasFor } from './federation.js';
+import { RemoteLink, aliasFor, toHubUrl } from './federation.js';
 
 export const DEFAULT_PORT = 8848;
 
@@ -756,10 +756,26 @@ export class Hub {
    * Attach to another hub. Its browsers join `liveBrowsers()` under `alias/…`.
    */
   async connectRemote(address, alias) {
+    // Idempotent by *destination*, not by name.
+    //
+    // Deduping on the alias alone was wrong in the one way that matters: a
+    // second `connect` to an address already attached found the name taken,
+    // auto-aliased to `10.0.0.5-2`, and opened a second link to the same
+    // machine. One physical browser then appeared twice under two names, and
+    // every session that had not bound explicitly was pushed into a chooser
+    // offering two identical-looking options — manufacturing precisely the
+    // ambiguity the chooser exists to resolve. Reconnecting is a normal thing
+    // for an agent to do when it is unsure of its state, so this has to be a
+    // no-op rather than an error.
+    const url = toHubUrl(address);
+    for (const link of this.remotes.values()) {
+      if (link.url === url) return { name: link.name, link, reused: true };
+    }
+
     const name = String(alias || aliasFor(address, new Set(this.remotes.keys()))).trim();
     if (!name) throw new Error('a name for the remote hub is required');
     if (this.remotes.has(name)) {
-      throw new Error(`already connected to a remote hub called "${name}" — disconnect it first.`);
+      throw new Error(`a different remote hub is already called "${name}" — disconnect it first.`);
     }
 
     const link = new RemoteLink({
@@ -852,12 +868,14 @@ export class Hub {
     if (tool !== 'browser_window') return null;
 
     if (args.action === 'connect') {
-      const { name } = await this.connectRemote(args.hub, args.name);
+      const { name, reused } = await this.connectRemote(args.hub, args.name);
       const link = this.remotes.get(name);
       const found = link.liveBrowsers();
       return {
         text:
-          `Connected to the hub at ${args.hub} as "${name}". ` +
+          (reused
+            ? `Already connected to the hub at ${args.hub} as "${name}" — nothing changed. `
+            : `Connected to the hub at ${args.hub} as "${name}". `) +
           (found.length
             ? `${found.length} browser(s) available: ${found.map((b) => `"${browserLabel(b)}"`).join(', ')}. ` +
               'Bind one with browser_window action:"use" browser:<name>.'

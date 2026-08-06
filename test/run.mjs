@@ -754,6 +754,24 @@ async function testFederation() {
   const relayed = cloud.seen.find((c) => c.tool === 'browser_tabs');
   check('the far side receives its own browser id', relayed?.args?._browser === 'inst-cloud', relayed?.args?._browser);
 
+  // Reconnecting to a hub already attached must be a no-op. Minting a second
+  // link put one physical browser in the chooser twice under two names, which
+  // is the ambiguity the chooser exists to remove rather than create. An agent
+  // unsure of its state reissuing `connect` is normal, so this cannot error.
+  const again = await local.call('browser_window', {
+    action: 'connect',
+    hub: `127.0.0.1:${REMOTE}`,
+    _session: 'claude · harbor',
+  });
+  check('reconnecting the same hub makes no second link', local.remotes.size === 1, `${local.remotes.size} links`);
+  check('and says so rather than erroring', /Already connected/.test(again.text || ''), again.text);
+  check('the browser is still listed once', local.liveBrowsers().length === 1);
+
+  // A different port is a different machine as far as this is concerned.
+  check('dedupe is by destination, not by name',
+    toHubUrl(`127.0.0.1:${REMOTE}`) === toHubUrl(`127.0.0.1:${REMOTE}`) &&
+    toHubUrl('127.0.0.1:1') !== toHubUrl('127.0.0.1:2'));
+
   // `remotes` is how an agent checks what it is attached to.
   const listed = await local.call('browser_window', { action: 'remotes', _session: 'claude · harbor' });
   check('remotes lists the hub', /127\.0\.0\.1/.test(listed.text || ''), listed.text);
