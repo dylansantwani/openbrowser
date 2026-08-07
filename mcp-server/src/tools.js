@@ -406,7 +406,7 @@ export const TOOLS = [
   {
     name: 'browser_window',
     description:
-      'Pick the Chrome window this session works in, or resize/emulate a device/force light-dark/zoom/throttle.',
+      'Pick the Chrome window this session works in, here or on another machine (action:"connect"); resize/emulate a device/force light-dark/zoom/throttle.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -418,7 +418,7 @@ export const TOOLS = [
         },
         windowId: { type: 'number', description: 'For "use".' },
         browser: { type: 'string', description: 'For "use": browser name.' },
-        hub: { type: 'string', description: 'host[:port].' },
+        hub: { type: 'string', description: 'host[:port], or wss://host if published behind TLS.' },
         tabId: TAB,
         preset: { type: 'string', enum: ['mobile', 'tablet', 'desktop', 'wide'] },
         width: { type: 'number' },

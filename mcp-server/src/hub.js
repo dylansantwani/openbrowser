@@ -514,11 +514,11 @@ export class Hub {
         return;
       }
 
-      // Results for a peer's call are relayed back to that peer verbatim.
+      // Results for a peer's call are relayed back to that peer.
       const owner = this._callOwners?.get(msg.id);
       if (owner) {
         this._callOwners.delete(msg.id);
-        if (!owner.closed) owner.sendJSON(msg);
+        if (!owner.peer.closed) owner.peer.sendJSON(this._nameBrowserIn(msg, owner));
         return;
       }
       this.pending.settle(msg.id, msg.ok, msg.ok ? msg.result : msg.error);
@@ -562,7 +562,10 @@ export class Hub {
         // agent running in another mcp-server process.
         return this._routeFor(msg.args || {}).then((conn) => {
           this._callOwners ??= new Map();
-          this._callOwners.set(msg.id, peer);
+          // The conn rides along so the result can say which browser answered.
+          // Held here rather than in a map of its own so it cannot outlive the
+          // owner entry and leak on a browser that never replies.
+          this._callOwners.set(msg.id, { peer, conn, tool: msg.tool, args: msg.args || {} });
           this._callConn.set(msg.id, conn);
           conn.sendJSON({ ...msg, args: { ...(msg.args || {}), _browser: conn.instance } });
         });
@@ -847,8 +850,10 @@ export class Hub {
     const owner = this._callOwners?.get(id);
     if (owner) {
       this._callOwners.delete(id);
-      if (!owner.closed) {
-        owner.sendJSON({ type: 'result', id, ok, ...(ok ? { result: payload } : { error: payload }) });
+      if (!owner.peer.closed) {
+        owner.peer.sendJSON(
+          this._nameBrowserIn({ type: 'result', id, ok, ...(ok ? { result: payload } : { error: payload }) }, owner)
+        );
       }
       return;
     }
@@ -962,7 +967,62 @@ export class Hub {
     const local = await this._localAnswer(tool, args);
     if (local) return local;
     const conn = await this._routeFor(args);
-    return this._rawCallTo(conn, tool, args, { timeout });
+    const res = await this._rawCallTo(conn, tool, args, { timeout });
+    return this._nameBrowser(res, tool, args, conn);
+  }
+
+  /**
+   * Say which browser answered, on the calls an agent makes to work out where
+   * it is.
+   *
+   * `browser_tabs list` and `browser_window list` are both answered by *one*
+   * browser and neither said which, so a hub with a local Chrome attached and a
+   * hub federated to another machine produce identical-looking output. An agent
+   * told to work on a remote box therefore gets a perfectly successful tab list
+   * from the wrong machine and reads it as confirmation — observed live: it
+   * concluded "the browser is connected" without ever issuing `connect`, and
+   * went on driving the local Chrome. That is the same silent wrong-target
+   * failure `_browser` makes loud at the protocol layer, surviving in the one
+   * place the protocol cannot see: the prose a model actually reads.
+   *
+   * It is the second time this exact shape has bitten. `browser_tabs list` used
+   * to be a flat list with the *window* nowhere in it, so two windows returned
+   * byte-identical output; the browser was left out for the same reason and
+   * costs more, because a window is at least in the same Chrome.
+   *
+   * Deliberately only these two actions. Naming the browser on every call would
+   * tax every step of every task to answer a question only orientation asks —
+   * and doing it only when several browsers are live would have missed the case
+   * above entirely, where exactly one was.
+   */
+  _nameBrowser(res, tool, args, conn) {
+    if (args?.action !== 'list') return res;
+    if (tool !== 'browser_tabs' && tool !== 'browser_window') return res;
+
+    // A RemoteBrowser's instance is `hub/instance`; the hub half is the link.
+    const link = conn?.isRemote ? this.remotes.get(String(conn.instance).split('/')[0]) : null;
+    const line =
+      `\nBrowser: "${browserLabel(conn)}"` +
+      (link ? ` — remote hub "${link.name}" (${link.address}).` : ' — this machine.');
+
+    if (typeof res === 'string') return res + line;
+    if (res && typeof res === 'object') return { ...res, text: `${res.text || ''}${line}` };
+    return res;
+  }
+
+  /**
+   * The same annotation, applied to a result frame on its way back to a peer.
+   *
+   * Peers do not go through `call()` — `_onPeerMessage` routes them straight at
+   * a connection — so a fix that lived only there would work for the process
+   * that owns the hub and silently not for every other MCP client on it, which
+   * is most of them. Errors are left alone: they already name the browser where
+   * it matters, and appending to one would put the line after the recovery
+   * instruction the message ends with.
+   */
+  _nameBrowserIn(frame, owner) {
+    if (!frame.ok) return frame;
+    return { ...frame, result: this._nameBrowser(frame.result, owner.tool, owner.args, owner.conn) };
   }
 
   /**

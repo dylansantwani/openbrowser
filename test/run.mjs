@@ -228,8 +228,26 @@ async function main() {
   // browsers on different boxes. Trimmed twice before raising — 14461 to 14401
   // by shortening prose, then to 14326 by deleting the `name` parameter and
   // routing `disconnect` through `hub` instead.
+  //
+  // Raised to 14.5KB to name the remote case in `browser_window`'s own
+  // description, and the `wss://` scheme in `hub`. The previous raise added the
+  // syntax for reaching another machine but left it addressable only from
+  // inside the `action` enum, and the tool's description — the text a model
+  // scans when deciding which tool can do a thing at all — still described a
+  // purely local window picker. Two sessions were lost to that: told to reach a
+  // hub on another host, both concluded no tool could, and went reading
+  // `ws.js`, `index.js` and `hub.js` for a config knob or env var to point the
+  // server at a remote endpoint. Neither ever issued `connect`, and one spent
+  // its remaining turns on a CDP endpoint that does not exist. A capability
+  // findable only by reading the source of the thing that offers it is not
+  // findable. `wss://` costs its bytes for the same reason one level down: a
+  // hub behind a tunnel answers on 443 and a bare hostname resolves to 8848,
+  // so the default guess fails by two-minute timeout with nothing naming the
+  // scheme as the variable. Trimmed to 2 bytes under the old ceiling first,
+  // which is no headroom at all — the next edit would have had to cut guidance
+  // to fit rather than raise this deliberately.
   const schemaBytes = JSON.stringify(tools).length;
-  check('tool schemas stay under 14.4KB', schemaBytes < 14_400, `${schemaBytes} bytes`);
+  check('tool schemas stay under 14.5KB', schemaBytes < 14_500, `${schemaBytes} bytes`);
 
   // Exactly one blank line between paragraphs was unreachable in rich editors
   // until `newline` existed, so the option has to stay advertised — a model
@@ -706,6 +724,14 @@ async function testFederation() {
   check('host:port is respected', toHubUrl('10.0.0.5:9000') === 'ws://10.0.0.5:9000/hub');
   check('a ws:// URL is normalised to /hub', toHubUrl('ws://10.0.0.5:9000/mcp') === 'ws://10.0.0.5:9000/hub');
   check('bracketed IPv6 keeps its address', toHubUrl('[::1]:9000') === 'ws://[::1]:9000/hub');
+  // A hub behind a tunnel or reverse proxy answers on 443, never 8848, so
+  // carrying the plaintext default over to wss:// only buys a handshake timeout.
+  check('a portless wss:// goes to 443, not 8848',
+    toHubUrl('wss://ob1.example.com') === 'wss://ob1.example.com/hub');
+  check('an explicit TLS port is kept',
+    toHubUrl('wss://ob1.example.com:8443') === 'wss://ob1.example.com:8443/hub');
+  check('a wss:// URL is normalised to /hub too',
+    toHubUrl('wss://ob1.example.com/mcp') === 'wss://ob1.example.com/hub');
   check('a duplicate alias is disambiguated', aliasFor('10.0.0.5', new Set(['10.0.0.5'])) === '10.0.0.5-2');
 
   const remote = await new Hub({ port: REMOTE }).start();
@@ -754,6 +780,15 @@ async function testFederation() {
   const relayed = cloud.seen.find((c) => c.tool === 'browser_tabs');
   check('the far side receives its own browser id', relayed?.args?._browser === 'inst-cloud', relayed?.args?._browser);
 
+  // A tab list from another machine used to be indistinguishable from a local
+  // one, so an agent that never issued `connect` read a successful call against
+  // the wrong browser as proof it had reached the right one. Orientation has to
+  // name the machine.
+  check('a tab list says which browser answered', /Browser: "127\.0\.0\.1\/sandbox"/.test(res?.text || ''), res?.text);
+  check('and that it is reached through a remote hub', /remote hub "127\.0\.0\.1"/.test(res?.text || ''), res?.text);
+  const acted = await local.call('browser_act', { action: 'click', ref: 'e1', _session: 'claude · harbor' });
+  check('a non-orienting call is not annotated', !/Browser: /.test(acted?.text || ''), acted?.text);
+
   // Reconnecting to a hub already attached must be a no-op. Minting a second
   // link put one physical browser in the chooser twice under two names, which
   // is the ambiguity the chooser exists to remove rather than create. An agent
@@ -794,6 +829,16 @@ async function testFederation() {
   check('the chooser offers the remote one by namespaced name',
     !!threw && /browser:"127\.0\.0\.1\/sandbox"/.test(threw), threw);
   check('the remote window is listed', !!threw && /windowId:77/.test(threw), threw);
+
+  // The local half of the same question. "this machine" is what tells an agent
+  // aiming at a remote box that it has landed on the wrong one.
+  const hereList = await local.call('browser_tabs', {
+    action: 'list',
+    browser: 'laptop',
+    _session: 'claude · meadow',
+  });
+  check('a local tab list names the browser as local',
+    /Browser: "laptop" — this machine\./.test(hereList?.text || ''), hereList?.text);
 
   // Now that a local browser exists, it — and only it — is shared onward.
   check('only the local browser is shared onward', local._sharedBrowsers().length === 1);
@@ -855,6 +900,31 @@ async function testHubTakeover() {
 
   await secondary.call('browser_tabs', { action: 'list' }).catch(() => {});
   check('calls flow through the promoted server', ext.seen.some((c) => c.tool === 'browser_tabs'));
+
+  // A peer's call never goes through `call()` — the owner routes the frame
+  // straight at a connection — so anything that shapes a result has to be in
+  // the relay too. Naming the browser was written in `call()` first and was
+  // silently absent for every MCP client that was not the hub owner, which is
+  // most of them: one client starts the hub and the rest join it.
+  const owner2 = await new Hub({ port: PORT4 + 60 }).start();
+  const ext2 = await fakeExtension(PORT4 + 60, {
+    instance: 'inst-peer',
+    browser: 'chrome',
+    name: 'desk',
+    onCall: () => ({ text: '1 tab(s):\nwindow 9 (1 tab) [your window]' }),
+  });
+  await sleep(200);
+  const peer = await new HubClient({ port: PORT4 + 60 }).start();
+  check('the peer joined rather than took over', peer.owner === null);
+  const relayed = await peer.call('browser_tabs', { action: 'list', _session: 'claude · peerless' });
+  check('a peer\'s tab list names the browser too',
+    /Browser: "desk" — this machine\./.test(relayed?.text || ''), relayed?.text);
+  const acted2 = await peer.call('browser_act', { action: 'click', ref: 'e1', _session: 'claude · peerless' });
+  check('and a peer\'s non-orienting call is left alone', !/Browser: /.test(acted2?.text || ''), acted2?.text);
+  await peer.stop();
+  ext2.conn.close();
+  await sleep(100);
+  await owner2.stop();
 
   // The name a session already holds must survive election, or its tab group is
   // stranded under a label nothing will clean up.

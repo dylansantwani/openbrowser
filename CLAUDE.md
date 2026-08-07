@@ -295,6 +295,29 @@ returned byte-identical output. An agent trying to work out where it was
 literally could not. It is grouped by window now, with the session's own window
 marked.
 
+**The same omission one level up cost more, because a browser can be a different
+machine.** `browser_tabs list` and `browser_window list` are each answered by one
+browser and neither said which, so a hub driving the local Chrome and a hub
+federated to a box in another building produced indistinguishable output. An
+agent told to work on a remote machine called `browser_tabs list`, got a
+perfectly good answer from the local Chrome, and concluded it was already
+connected — it never issued `connect` at all, then spent the rest of the session
+reading `ws.js` to find a connection problem that did not exist. `_nameBrowser`
+appends one line naming the browser, and the remote hub when there is one.
+
+Only on those two actions. Naming the browser on every call taxes every step of
+every task to answer a question only orientation asks; doing it only when several
+browsers are live — the tempting cheap version — would have missed the case above
+entirely, where exactly one was.
+
+**A peer's call does not go through `Hub.call()`.** `_onPeerMessage` routes the
+frame straight at a connection, so anything that shapes a *result* has to be in
+the relay as well — `_nameBrowserIn`, at both settle points, local and remote.
+Written in `call()` alone it worked perfectly for the process that owns the hub
+and was silently absent for every other MCP client on it, which is most of them:
+one client starts the hub and the rest join. Nothing in `test/run.mjs` covered
+the peer path at all, which is how it got that far; it does now.
+
 **`chrome.tabs.create({windowId})` is a request, not a promise of placement.** A
 `windowId` Chrome will not honour does not reliably throw; the tab appears in the
 last-focused window instead — the exact window the binding exists to keep agents
