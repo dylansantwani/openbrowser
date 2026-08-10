@@ -4,8 +4,17 @@
   "use strict";
 
   const prefersReduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const hasIO = "IntersectionObserver" in window;
+  const root = document.documentElement;
 
-  /* ---------- scroll progress ---------- */
+  /* An IntersectionObserver can be registered and still never fire — a
+     background tab, a prerender, a hidden webview. Every scroll-triggered
+     effect below therefore records that it saw at least one callback, and
+     `bailOut` runs if none of them did. Without it the page renders blank. */
+  let ioFired = false;
+  const seen = () => { ioFired = true; };
+
+  /* ---------- scroll progress + nav state ---------- */
   const progress = document.getElementById("progress");
   const nav = document.getElementById("nav");
 
@@ -13,7 +22,7 @@
     const doc = document.documentElement;
     const max = doc.scrollHeight - doc.clientHeight;
     progress.style.width = max > 0 ? (window.scrollY / max) * 100 + "%" : "0%";
-    nav.classList.toggle("scrolled", window.scrollY > 24);
+    nav.classList.toggle("scrolled", window.scrollY > 16);
   }
   window.addEventListener("scroll", onScroll, { passive: true });
   onScroll();
@@ -45,17 +54,17 @@
 
   /* ---------- reveal on scroll ---------- */
   const revealables = document.querySelectorAll(".reveal");
-  if ("IntersectionObserver" in window && !prefersReduced) {
+  if (hasIO && !prefersReduced) {
     const io = new IntersectionObserver(
       (entries) => {
+        seen();
         entries.forEach((entry) => {
-          if (entry.isIntersecting) {
-            entry.target.classList.add("in-view");
-            io.unobserve(entry.target);
-          }
+          if (!entry.isIntersecting) return;
+          entry.target.classList.add("in-view");
+          io.unobserve(entry.target);
         });
       },
-      { threshold: 0.12, rootMargin: "0px 0px -6% 0px" }
+      { threshold: 0.1, rootMargin: "0px 0px -5% 0px" }
     );
     revealables.forEach((el) => io.observe(el));
   } else {
@@ -65,120 +74,166 @@
   /* ---------- stat counters ---------- */
   const stats = document.querySelectorAll(".stat-num");
 
+  function finalValue(el) {
+    const parent = el.parentElement;
+    const target = parseInt(parent.dataset.count, 10) || 0;
+    return (target ? target.toLocaleString() : "0") + (parent.dataset.suffix || "");
+  }
+
   function animateStat(el) {
-    const target = parseInt(el.dataset.count || el.parentElement.dataset.count, 10) || 0;
-    const suffix = el.parentElement.dataset.suffix || "";
-    const dur = 1400;
+    const target = parseInt(el.parentElement.dataset.count, 10) || 0;
+    const dur = 1100;
     const start = performance.now();
 
     function tick(now) {
       const t = Math.min((now - start) / dur, 1);
       const eased = 1 - Math.pow(1 - t, 3);
-      el.textContent = Math.round(target * eased).toLocaleString();
-      if (t < 1) requestAnimationFrame(tick);
-      else el.textContent = (target ? target.toLocaleString() : "0") + suffix;
+      if (t < 1) {
+        el.textContent = Math.round(target * eased).toLocaleString();
+        requestAnimationFrame(tick);
+      } else {
+        el.textContent = finalValue(el);
+      }
     }
     requestAnimationFrame(tick);
   }
 
-  if ("IntersectionObserver" in window && !prefersReduced) {
+  if (hasIO && !prefersReduced) {
     const statIo = new IntersectionObserver(
       (entries) => {
+        seen();
         entries.forEach((entry) => {
-          if (entry.isIntersecting) {
-            animateStat(entry.target);
-            statIo.unobserve(entry.target);
-          }
+          if (!entry.isIntersecting) return;
+          animateStat(entry.target);
+          statIo.unobserve(entry.target);
         });
       },
       { threshold: 0.5 }
     );
     stats.forEach((el) => statIo.observe(el));
   } else {
-    stats.forEach((el) => {
-      const target = parseInt(el.parentElement.dataset.count, 10) || 0;
-      el.textContent = (target ? target.toLocaleString() : "0") + (el.parentElement.dataset.suffix || "");
-    });
+    stats.forEach((el) => { el.textContent = finalValue(el); });
   }
 
-  /* ---------- hero typewriter ---------- */
+  /* ---------- hero typewriter ----------
+     Lines are token arrays so [refs] can be highlighted as they are typed.
+  */
   const mockCode = document.getElementById("mock-code");
-  const mockCaret = document.getElementById("mock-caret");
-  const mockPill = document.getElementById("mock-pill");
-  const mockPillText = document.getElementById("mock-pill-text");
+  const mockFoot = document.getElementById("mock-foot");
+
+  const REF = "c-ref";
+  const DIM = "c-dim";
 
   const snapshotLines = [
-    { text: "app.example.com/login · \"Sign in · Example\" · tab 481 · 1280x800", cls: "c-dim" },
-    { text: "banner" },
-    { text: "  link \"Example\" [e1] /" },
-    { text: "main" },
-    { text: "  heading \"Sign in\" h1" },
-    { text: "  form" },
-    { text: "    textbox \"Email\" [e2] required" },
-    { text: "    password \"Password\" [e3] required" },
-    { text: "    checkbox \"Remember me\" [e4] unchecked" },
-    { text: "    button \"Sign in\" [e5]" },
-    { text: "  link \"Forgot your password?\" [e6] /reset" }
+    [['"Sign in · Example" · 1280x800 · 6 refs', DIM]],
+    [["banner"]],
+    [['  link "Example" '], ["[e1]", REF], [" /"]],
+    [["main"]],
+    [['  heading "Sign in" h1']],
+    [["  form"]],
+    [['    textbox "Email" '], ["[e2]", REF], [" required"]],
+    [['    password "Password" '], ["[e3]", REF], [" required"]],
+    [['    checkbox "Remember me" '], ["[e4]", REF], [" unchecked"]],
+    [['    button "Sign in" '], ["[e5]", REF]],
+    [['  link "Forgot your password?" '], ["[e6]", REF], [" /reset"]]
   ];
+
+  /* Flatten to a per-character stream, so typing is a single index. */
+  const chars = [];
+  snapshotLines.forEach((line, i) => {
+    line.forEach(([text, cls]) => {
+      for (const ch of text) chars.push([ch, cls || ""]);
+    });
+    if (i < snapshotLines.length - 1) chars.push(["\n", ""]);
+  });
+
+  function escapeHtml(s) {
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  /* Render the first `n` characters, coalescing runs that share a class. */
+  function render(n, caret) {
+    let html = "";
+    let runCls = null;
+    let run = "";
+
+    const flush = () => {
+      if (!run) return;
+      html += runCls
+        ? '<span class="' + runCls + '">' + escapeHtml(run) + "</span>"
+        : escapeHtml(run);
+      run = "";
+    };
+
+    for (let i = 0; i < n; i++) {
+      const [ch, cls] = chars[i];
+      if (cls !== runCls) { flush(); runCls = cls; }
+      run += ch;
+    }
+    flush();
+
+    if (caret) html += '<span class="mock-caret visible" aria-hidden="true"></span>';
+    mockCode.innerHTML = html;
+  }
 
   let typed = false;
 
   function typeSnapshot() {
     if (typed) return;
     typed = true;
+
     if (prefersReduced) {
-      mockCode.innerHTML = snapshotLines
-        .map((l) => '<span class="' + (l.cls || "") + '">' + escapeHtml(l.text) + "</span>")
-        .join("\n");
-      mockCaret.classList.add("visible");
-      showPill();
+      render(chars.length, false);
+      mockFoot.classList.add("is-ready");
       return;
     }
-    mockCaret.classList.add("visible");
-    let line = 0;
-    let col = 0;
 
-    function typeNext() {
-      if (line >= snapshotLines.length) {
-        showPill();
-        return;
+    let i = 0;
+    (function step() {
+      i = Math.min(i + 2, chars.length);
+      render(i, true);
+      if (i < chars.length) {
+        setTimeout(step, 16);
+      } else {
+        render(chars.length, true);
+        setTimeout(() => mockFoot.classList.add("is-ready"), 260);
       }
-      const current = snapshotLines[line];
-      const frag = document.createElement("span");
-      if (current.cls) frag.className = current.cls;
-      frag.textContent = current.text.slice(0, col);
-      mockCode.appendChild(frag);
-      col += 1;
-      if (col > current.text.length) {
-        mockCode.appendChild(document.createTextNode("\n"));
-        line += 1;
-        col = 0;
-      }
-      setTimeout(typeNext, 14);
-    }
-    setTimeout(typeNext, 350);
-  }
-
-  function showPill() {
-    setTimeout(() => {
-      mockPillText.textContent = "356 characters · ~90 tokens";
-      mockPill.classList.add("show");
-    }, 350);
-  }
-
-  function escapeHtml(s) {
-    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    })();
   }
 
   const mock = document.getElementById("mock");
-  if ("IntersectionObserver" in window) {
+  if (hasIO) {
     new IntersectionObserver(
-      (entries) => entries.forEach((e) => e.isIntersecting && typeSnapshot()),
-      { threshold: 0.3 }
+      (entries, obs) => {
+        seen();
+        entries.forEach((e) => {
+          if (!e.isIntersecting) return;
+          typeSnapshot();
+          obs.disconnect();
+        });
+      },
+      { threshold: 0.25 }
     ).observe(mock);
   } else {
     typeSnapshot();
   }
+
+  /* ---------- failsafe ----------
+     If nothing has intersected shortly after load, the observers are not
+     going to fire. Show the page rather than leaving it blank, and settle
+     every scroll-driven effect on its finished state.
+  */
+  setTimeout(function bailOut() {
+    if (ioFired) return;
+    root.classList.remove("js-reveal");
+    revealables.forEach((el) => el.classList.add("in-view"));
+    stats.forEach((el) => { el.textContent = finalValue(el); });
+    if (!typed) {
+      typed = true;
+      render(chars.length, false);
+    }
+    mockFoot.classList.add("is-ready");
+  }, 1200);
 
   /* ---------- install tabs ---------- */
   const tabs = document.querySelectorAll(".tab");
@@ -202,16 +257,12 @@
 
       const label = btn.querySelector("span");
       const original = label.textContent;
-      const done = () => {
-        label.textContent = "Copied!";
-        btn.classList.add("copied");
-        setTimeout(() => {
-          label.textContent = original;
-          btn.classList.remove("copied");
-        }, 1800);
-      };
-
-      done();
+      label.textContent = "Copied";
+      btn.classList.add("copied");
+      setTimeout(() => {
+        label.textContent = original;
+        btn.classList.remove("copied");
+      }, 1600);
 
       const text = codeEl.textContent.trim();
       try {
@@ -232,15 +283,14 @@
   const sections = document.querySelectorAll("main section[id]");
   const navLinks = document.querySelectorAll(".nav-links a");
 
-  if ("IntersectionObserver" in window && navLinks.length) {
+  if (hasIO && navLinks.length) {
     const spy = new IntersectionObserver(
       (entries) => {
         entries.forEach((entry) => {
-          if (entry.isIntersecting) {
-            navLinks.forEach((a) => {
-              a.style.color = a.getAttribute("href") === "#" + entry.target.id ? "var(--text)" : "";
-            });
-          }
+          if (!entry.isIntersecting) return;
+          navLinks.forEach((a) => {
+            a.classList.toggle("current", a.getAttribute("href") === "#" + entry.target.id);
+          });
         });
       },
       { rootMargin: "-40% 0px -55% 0px" }

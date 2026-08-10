@@ -396,6 +396,35 @@ docs/           capabilities, tools reference, architecture, test checklist
 site/           the source of openbrowser.pulse-core.com (static, no build step)
 ```
 
+The site is three files — `index.html`, `styles.css`, `app.js` — with no build
+step, and `site/` is deployed as the web root (assets resolve at `/styles.css`,
+not `/site/styles.css`). Preview it locally with `npm run preview` and open
+<http://localhost:8850/site/index.html> — the dev server has no directory
+index, so the filename is required.
+
+It is hosted on **Cloudflare Pages**, project `openbrowser`, at
+<https://openbrowser.pulse-core.com>. Nothing in this repo deploys it — there is
+no CI and no `wrangler.toml`, so editing `site/` does not change what is live.
+Publish with:
+
+```
+npx wrangler login    # once — opens a browser to authorise
+npm run deploy        # wrangler pages deploy site --project-name=openbrowser --branch=main
+```
+
+`--branch=main` pins it to the production deployment; without it wrangler
+infers the branch from git and a detached HEAD lands on a preview URL instead.
+
+Two things the markup depends on, worth keeping if you edit it:
+
+- **Content is visible by default.** The scroll-reveal effect only engages
+  under the `js-reveal` class that the inline script in `<head>` sets, and
+  `app.js` removes it again if the IntersectionObserver never reports anything
+  (background tab, prerender, some webviews). Hiding first and un-hiding with
+  JS means one observer that never fires renders the whole page blank.
+- **Links point at `github.com/dylansantwani/openbrowser`.** They used to point
+  into the private `dylansantwani/claude` monorepo path, which 404s.
+
 | Doc | What it is for |
 |---|---|
 | [docs/CAPABILITIES.md](docs/CAPABILITIES.md) | What the fourteen tools can do in combination — parallel tabs, macros, retroactive network capture, trusted input, iframe reach |
