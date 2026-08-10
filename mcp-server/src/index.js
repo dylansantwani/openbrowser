@@ -233,6 +233,12 @@ function checkArgs(name, args) {
 function checkPaths(paths) {
   if (!Array.isArray(paths) || !paths.length) return;
 
+  // Federated hubs: the browser runs on a different machine, so the file
+  // legitimately exists there but not here. The local stat is only sound when
+  // the browser is on this machine (see the note below). When remote hubs are
+  // attached, skip the check — the browser's own file chooser still validates.
+  if (process.env.OPENBROWSER_TRUST_REMOTE_PATHS || transport.remotes?.size > 0) return;
+
   const bad = [];
   for (const path of paths) {
     try {

@@ -63,6 +63,25 @@ const DEFAULTS = {
   chooseWindow: true,
 
   /**
+   * Give each session a window of its own rather than the one you are in.
+   *
+   * Trusted input only lands on a *foreground* tab, so an agent has to activate
+   * its tab before every click. When its tab is in your window, that activation
+   * is the view being pulled out from under you — several times a second during
+   * a run, which is what makes working alongside an agent impossible. Restoring
+   * focus afterwards does not help; it makes it flicker instead of stick.
+   *
+   * A window of its own removes the conflict rather than managing it: only one
+   * tab per window can be foreground, and a tab that is foreground in an
+   * *unfocused* window is still visible, so the agent gets the visibility it
+   * needs and you keep the window you were in.
+   *
+   * Off restores the old behaviour of silently taking the focused window, which
+   * is what you want if the reason you are watching is to watch.
+   */
+  soloWindow: true,
+
+  /**
    * When an MCP client disconnects, close the tabs that session opened.
    *
    * Only tabs the session created itself are closed — never one it adopted

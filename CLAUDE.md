@@ -318,6 +318,28 @@ and was silently absent for every other MCP client on it, which is most of them:
 one client starts the hub and the rest join. Nothing in `test/run.mjs` covered
 the peer path at all, which is how it got that far; it does now.
 
+**`chrome.tabs.group()` moves tabs, and it moves them to the wrong window.**
+With no `createProperties.windowId`, the new group is created in the *current*
+window — Chrome's last-focused one, which is the human's — and the tabs are
+**moved there** to join it. Grouping is presentation: its failures are swallowed
+on purpose, because a tab that could not be coloured still works. That reasoning
+is only sound while grouping cannot do anything but colour.
+
+Invisible for as long as agents worked in the window that was already current,
+where the move was a no-op. `soloWindow` made it total: every first tab of every
+workstream was dragged straight back into the user's window, and the agent's own
+window — now empty — closed itself, so the session reported no window bound two
+calls after being given one. Three separate symptoms, one line.
+
+Two lessons worth more than the fix. The first is that it hid behind a *better*
+symptom: the tab was misplaced, so the obvious suspect was `tabs.create`, and
+`createTabIn` grew a readback that was correct, tested, and irrelevant. The
+thing that moved the tab ran afterwards. The second is that `test/run.mjs`
+modelled `tabs.group` as leaving tabs where they were — a stub that implements
+the API you assume rather than the one that ships cannot fail. It models the
+real contract now, and the group assertions were verified to fail without
+`createProperties` (`[99,99,99]` — every tab in the focused window).
+
 **`chrome.tabs.create({windowId})` is a request, not a promise of placement.** A
 `windowId` Chrome will not honour does not reliably throw; the tab appears in the
 last-focused window instead — the exact window the binding exists to keep agents
@@ -352,6 +374,92 @@ what makes this so easy to miss. Anything dispatching trusted input must
 foreground the tab first; see `ensureForeground()` in `background/router.js`.
 The cost is that input cannot be parallelised across tabs in one window, which
 is a Chrome constraint, not a design choice.
+
+**`active` is necessary and not sufficient, and that is why an agent made the
+browser unusable.** Everything above is about *tabs*, and the window the tab is
+in has the same power to hide it: a tab is `active` in a minimized window and
+`active` in a window another window completely covers, and Chrome calls the
+document hidden in both. So `chrome.tabs.get().active` cannot answer the only
+question `ensureForeground` cares about. The page can, and now does — one
+`visibility` round trip after activating, reported rather than fixed, because
+the fix is a human uncovering a window and a click that lies about landing is
+worse than a warning. The minimized case was not merely unhandled but
+*advertised*: `browser_window state:"minimized"` said "automation keeps running",
+and every click after it went nowhere. Input un-minimizes now.
+
+The bigger half of this is social rather than technical. Foregrounding is
+correct and unavoidable, and in *your* window it means the view being yanked to
+the agent's tab several times a second for the length of a run — reported as
+"the agent makes the window unusable while I am working in it".
+`restoreFocusAfterInput` does not fix it; it converts a steal into a flicker.
+Nothing polite is available, because only one tab per window is foreground and
+the agent needs that slot.
+
+So a session stops sharing: `soloWindow` (default on) has `ensureWindow` open a
+window rather than hand over the one you are in. A tab that is foreground in an
+*unfocused* window is still visible, so the agent gets what it needs and you
+keep what you were doing. Three consequences worth keeping in view:
+
+- **The chooser leaves the common path entirely.** It existed to stop agents
+  landing in the wrong window; with a window of its own there is no wrong window,
+  so there is nothing to ask. It still fires under `soloWindow: false`, which is
+  the setting for people whose reason to share a window is to watch. This also
+  removed a bug the fix would otherwise have created: the first agent's new
+  window made a *second* window exist, so the next session hit "2 browser windows
+  are open" and blocked on a human who had done nothing.
+- **`focused: false` governs keyboard focus, not stacking order.** A window
+  created unfocused is still placed *above* its siblings on macOS, so an agent
+  starting up threw its window over the page being read. From the outside that
+  is the takeover this whole module exists to prevent — the agent did not steal
+  the window, it parked in front of it, and nobody cares about the difference.
+  `createFor` reads `getLastFocused` before creating and puts that window back
+  on top after, but only when it was genuinely focused: `getLastFocused` answers
+  with a window whether or not Chrome is the front application, and raising one
+  in a browser nobody is looking at drags the entire browser in front of the app
+  they are actually using. Worth knowing that this is invisible to
+  `browser_window action:"list"` whenever Chrome is backgrounded — every window
+  reports unfocused, so the instrument reads clean at exactly the moment the
+  behaviour is worth measuring.
+- **The window a session is given must be reused, not decorated.** A fresh window
+  arrives holding a New Tab page; opening a second tab beside it means closing
+  the session's tabs at the end leaves that one behind, and Chrome keeps the
+  window open for it — an empty window per finished session. `adoptBlankTab`
+  takes the existing tab when it is a New Tab or blank page and nothing else,
+  which is the narrowest reading of "empty" and the reason it does not violate
+  "never act on a tab the session did not choose".
+- **Sharing is still reachable, so it still has to be survivable.** An explicit
+  `use`/`pick`, or adopting a tab in your window, puts a session back in it. That
+  path now says so once per session per window and names `action:"new"` — once,
+  because advice repeated on every click is just cost.
+
+**A screenshot is not a coordinate space, and pretending it is puts every click
+in the wrong place.** Coordinates *in* — `browser_act coordinate`, `region` —
+are viewport CSS pixels. The image *out* is neither: it has been through two
+independent rescalings, the device pixel ratio at capture and the `maxWidth`
+downscale, and on a 2560px viewport at dpr 1.5 that lands at 1280px wide, a
+factor of exactly 0.5. A model reading a button's centre off the image and
+passing it back clicks at half the intended offset — and does so silently,
+because there is always *something* at the wrong coordinate.
+
+This is why `fmt.captureGeometry` exists, and why it earns its bytes: every
+capture states what it covers and how to invert it (`0.50x of 2560x1271 CSS px
+· divide image coords by 0.50`), and says nothing extra when the mapping is 1:1.
+Two properties are load-bearing and easy to lose:
+
+- **Viewport-relative, not document-relative.** Scrolling does not shift the
+  input space — the same coordinate is the same screen position at any scroll
+  offset — so a coordinate cannot be reached by adding `scrollY` to a
+  document-space number. `full_page` is the exception and the reason the note
+  says so: its image runs past the viewport, so its coordinates are document
+  space and the scroll offset has to come back off before clicking.
+- **CSS pixels, not device pixels.** `devicePixelRatio` is part of why the image
+  is the size it is and no part of the coordinate space.
+
+Worth knowing when comparing against Claude in Chrome, which takes the opposite
+side of the same trade: its coordinates are in *screenshot* pixels and it
+converts for you, so a `getBoundingClientRect()` value passed straight through
+is wrong there by exactly the factor above. Neither convention is wrong; a
+capture that does not state which one it is using is.
 
 **`element.click()` is ignored by serious sites.** It produces `isTrusted:
 false`. Everything pointer-related goes through CDP's Input domain for this

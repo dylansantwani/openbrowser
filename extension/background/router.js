@@ -231,7 +231,7 @@ async function openSessionTab(args) {
   const settings = await getSettings();
   const windowId = await windows.ensureWindow(label, settings);
 
-  const tab = await createTabIn({ url: 'about:blank', active: false }, windowId);
+  const tab = await openInWindow({ url: 'about:blank', active: false }, windowId);
   await claimTab(tab.id, label);
   await rememberCreatedTab(args._session || label, tab.id);
   return tab.id;
@@ -259,6 +259,57 @@ async function rehomeSession(label, windowId) {
 }
 
 /**
+ * The one empty tab a freshly created window arrives with, or null.
+ *
+ * Only a blank or New Tab page counts, which is the narrowest possible reading
+ * of "empty" and the reason using it does not violate the rule it looks like it
+ * breaks — a session must never act on a tab the human was using — since neither
+ * holds anything a human could be in the middle of.
+ */
+async function blankTabIn(windowId) {
+  if (windowId == null) return null;
+  try {
+    const tabs = await chrome.tabs.query({ windowId });
+    if (tabs.length !== 1) return null;
+    const url = tabs[0].url || tabs[0].pendingUrl || '';
+    return /^(chrome:\/\/newtab\/?|about:blank|about:newtab)$/.test(url) ? tabs[0] : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Open a page in a specific window, reusing that window's blank tab if it has
+ * one. Two separate failures, one answer.
+ *
+ * The first is litter: a window opened for a session arrives holding an empty
+ * tab, so creating a second beside it means closing the session's tabs at the
+ * end leaves that one behind, and Chrome keeps the window open for it. An empty
+ * window per finished session accumulates fast.
+ *
+ * The second is worse and is why this is not just a tidiness helper. A window
+ * that Chrome has created but not finished setting up does not honour
+ * `tabs.create({windowId})` — the tab is placed in the last-focused window
+ * instead, which is the human's, and `create` reports the window that was
+ * *asked for* rather than the one it used, so `createTabIn`'s readback agrees
+ * with itself and corrects nothing. Observed live: the session bound to a new
+ * window while its first tab, its tab group, and everything it then did were in
+ * the window the fix exists to stay out of.
+ *
+ * Navigating a tab that already exists in the right window has no such race.
+ */
+async function openInWindow({ url, active }, windowId) {
+  const blank = await blankTabIn(windowId);
+  if (!blank) return createTabIn({ url, active }, windowId);
+
+  const patch = {};
+  if (url && url !== 'about:blank') patch.url = url;
+  if (active) patch.active = true;
+  if (!Object.keys(patch).length) return blank;
+  return (await chrome.tabs.update(blank.id, patch)) || blank;
+}
+
+/**
  * Create a tab, and make sure it really is where it was asked to be.
  *
  * `chrome.tabs.create({windowId})` is not a promise of placement. A window that
@@ -272,8 +323,15 @@ async function rehomeSession(label, windowId) {
  * because the tab already exists by then.
  */
 async function createTabIn(props, windowId) {
-  const tab = await chrome.tabs.create({ ...props, ...(windowId ? { windowId } : {}) });
-  if (windowId == null || tab.windowId === windowId) return tab;
+  const created = await chrome.tabs.create({ ...props, ...(windowId ? { windowId } : {}) });
+  if (windowId == null) return created;
+
+  // The readback has to be a fresh `tabs.get`, not `create`'s own return value.
+  // Against a window Chrome has not finished setting up, `create` reports the
+  // `windowId` it was *asked* for while placing the tab in the last-focused
+  // window — so checking its return agrees with itself and corrects nothing.
+  const tab = (await chrome.tabs.get(created.id).catch(() => null)) || created;
+  if (tab.windowId === windowId) return tab;
   try {
     const moved = await chrome.tabs.move(tab.id, { windowId, index: -1 });
     return { ...tab, windowId: (Array.isArray(moved) ? moved[0] : moved)?.windowId ?? windowId };
@@ -632,29 +690,109 @@ async function withDelta(tabId, fn) {
  * input paths need this. The cost is real — parallel work cannot type into
  * several tabs at once, because only one tab per window can be foreground — but
  * serialising input is strictly better than dropping it.
+ *
+ * `active` is necessary and not sufficient, which is the part that took longest
+ * to see. A tab is `active` in a window that is minimized, and `active` in a
+ * window another window completely covers, and Chrome calls the document hidden
+ * in both — so the check that matters is the page's own `visibilityState`, and
+ * the only thing that can answer it is the page. Without that round trip the
+ * minimized case is not merely unhandled, it is *advertised*: `browser_window
+ * state:"minimized"` says automation keeps running, and every click after it
+ * silently lands nowhere.
+ *
+ * @param {number} tabId
+ * @param {string} [label] the session, for the shared-window advice
+ * @returns {Promise<string|null>} something the caller should tell the model
  */
-async function ensureForeground(tabId) {
+async function ensureForeground(tabId, label) {
+  let note = null;
   try {
     const tab = await chrome.tabs.get(tabId);
-    if (tab.active) return;
+    const win = await chrome.windows.get(tab.windowId).catch(() => null);
 
-    // Remember what the human was looking at, so it can be put back. Only the
-    // first steal in a burst is recorded: a run of twenty clicks should return
-    // to the tab you were on before the first one, not to tab nineteen.
-    if (!borrowedFocus.has(tab.windowId)) {
-      const [wasActive] = await chrome.tabs.query({ active: true, windowId: tab.windowId });
-      if (wasActive && wasActive.id !== tabId) {
-        borrowedFocus.set(tab.windowId, { previousTabId: wasActive.id, agentTabId: tabId });
-      }
+    // Restoring a minimized window is not focus theft — a minimized window is
+    // one nobody is looking at, and leaving it minimized means the action does
+    // nothing at all.
+    if (win?.state === 'minimized') {
+      await chrome.windows.update(tab.windowId, { state: 'normal' }).catch(() => {});
+      await settle(150);
     }
 
-    await chrome.tabs.update(tabId, { active: true });
-    // The compositor needs a moment before it will accept input.
-    await settle(120);
+    if (!tab.active) {
+      // Sharing a window with the person using the browser. Activating is still
+      // the only way to make the click land, so this is said rather than
+      // avoided — once per session per window, because it is advice, and advice
+      // repeated on every click is just cost.
+      if (win?.focused && label) note = sharedWindowNote(label, tab.windowId);
+
+      // Remember what the human was looking at, so it can be put back. Only the
+      // first steal in a burst is recorded: a run of twenty clicks should return
+      // to the tab you were on before the first one, not to tab nineteen.
+      if (!borrowedFocus.has(tab.windowId)) {
+        const [wasActive] = await chrome.tabs.query({ active: true, windowId: tab.windowId });
+        if (wasActive && wasActive.id !== tabId) {
+          borrowedFocus.set(tab.windowId, { previousTabId: wasActive.id, agentTabId: tabId });
+        }
+      }
+
+      await chrome.tabs.update(tabId, { active: true });
+      // The compositor needs a moment before it will accept input.
+      await settle(120);
+    }
+
+    return (await hiddenTabWarning(tabId, tab.windowId)) || note;
   } catch {
     // If it cannot be activated the input may still land; failing the action
     // here would turn a maybe into a definite no.
+    return note;
   }
+}
+
+/** `${label}:${windowId}` already told. In-memory: a repeat costs one line. */
+const sharedWindowTold = new Set();
+
+function sharedWindowNote(label, windowId) {
+  const key = `${label}:${windowId}`;
+  if (sharedWindowTold.has(key)) return null;
+  sharedWindowTold.add(key);
+  return (
+    `NOTE: this session shares window ${windowId} with the user, so every click has to pull ` +
+    'their view to its tab. browser_window action:"new" gives it a window of its own.'
+  );
+}
+
+/**
+ * Ask the page whether it is actually visible, after everything above has tried
+ * to make it so.
+ *
+ * Best-effort by design: a tab with no content script cannot answer, and that
+ * has always been a case where the input may still land. Silence is read as
+ * "probably fine" rather than escalated, because the alternative — raising the
+ * window — is the exact interruption the caller is trying to avoid, and this
+ * would do it on every page the scripts have not reached yet.
+ *
+ * A confirmed hidden tab is reported instead of fixed, for the same reason. The
+ * fix is a human uncovering a window; saying which window, and that the input
+ * probably went nowhere, is worth more than a click that lies about landing.
+ */
+async function hiddenTabWarning(tabId, windowId) {
+  // A native JS dialog pauses the renderer, so the content script cannot answer
+  // and `sendToTab` has no timeout — asking here would hang the call outright.
+  // `pageMeta` guards the same way for the same reason.
+  if (cdp.pendingDialog(tabId)) return null;
+
+  let state;
+  try {
+    state = (await frames.sendToTab(tabId, 'visibility', {}))?.visibility;
+  } catch {
+    return null;
+  }
+  if (state !== 'hidden') return null;
+  return (
+    `WARNING: tab ${tabId} is hidden — window ${windowId} is covered by another window or off-screen, ` +
+    'and Chrome drops trusted input into hidden tabs, so this action probably did not reach the page. ' +
+    'Ask the user to uncover that window, or move this session with browser_window action:"new".'
+  );
 }
 
 /** windowId -> {previousTabId, agentTabId} while the agent has focus on loan. */
@@ -927,8 +1065,10 @@ const HANDLERS = {
         const windowId = args.windowId ?? (await windows.ensureWindow(sessionLabel, settings)) ?? undefined;
 
         // Background by default: opening ten tabs should not yank focus ten times.
-        // Placement is verified rather than assumed — see `createTabIn`.
-        const tab = await createTabIn({ url, active: args.background === false }, windowId);
+        // Placement is verified rather than assumed — see `openInWindow`, which
+        // also covers the case where the session's window was made moments ago
+        // and is not yet ready to be created into.
+        const tab = await openInWindow({ url, active: args.background === false }, windowId);
         // Group before waiting for load, so the tab is visibly labelled the
         // moment it appears rather than after the page settles. An explicit
         // `group` wins over the session label, letting an agent split its own
@@ -1228,7 +1368,7 @@ const HANDLERS = {
     // Everything below needs a real pointer event at a real coordinate — and a
     // hidden tab drops those on the floor. Foreground it before locating the
     // target, since becoming visible can change layout.
-    await ensureForeground(tabId);
+    const fgNote = await ensureForeground(tabId, args.group || args._session);
 
     const target = await locateTarget(tabId, args);
 
@@ -1296,7 +1436,7 @@ const HANDLERS = {
     const nothingHappened = !changed || fmt.isFocusOnly(changed);
     const note = nothingHappened && action !== 'hover' && !dlg ? await settlingNote(tabId) : null;
 
-    let label2 = label;
+    let label2 = fgNote ? `${label}\n${fgNote}` : label;
     if (dlg) {
       // The action itself opened a native dialog. The renderer is paused now;
       // say what it is and how to answer it instead of leaving the next call
@@ -1316,7 +1456,7 @@ const HANDLERS = {
     const tabId = await resolveTab(args);
     const { settings } = await prepareTab(tabId);
     // Keystrokes are dropped by a hidden tab exactly as clicks are.
-    await ensureForeground(tabId);
+    const fgNote = await ensureForeground(tabId, args.group || args._session);
     const summary = [];
 
     const { changed } = await withDelta(tabId, async () => {
@@ -1427,7 +1567,10 @@ const HANDLERS = {
       throw new Error('nothing to do — pass `fields`, `text`, or `keys`.');
     }
 
-    return fmt.actionResult(summary.join('\n'), { changed, meta: await pageMeta(tabId), tabId });
+    // Appended after the "did anything happen at all?" check below, so a note
+    // can never stand in for work and turn an empty call into a successful one.
+    const done = fgNote ? `${summary.join('\n')}\n${fgNote}` : summary.join('\n');
+    return fmt.actionResult(done, { changed, meta: await pageMeta(tabId), tabId });
   },
 
   // ---------------------------------------------------------- screenshot ----
@@ -1714,7 +1857,7 @@ const HANDLERS = {
     const tabId = await resolveTab(args);
     await prepareTab(tabId);
     // The file-picker path clicks the trigger, so it needs a visible tab too.
-    await ensureForeground(tabId);
+    const fgNote = await ensureForeground(tabId, args.group || args._session);
 
     const route = args.ref ? await frames.routeRef(tabId, args.ref) : { frameId: 0, localRef: undefined };
     const target = await frames.sendToFrame(tabId, route.frameId, 'uploadTarget', { ref: route.localRef });
@@ -1753,7 +1896,8 @@ const HANDLERS = {
 
     await settle(600);
     const meta = await pageMeta(tabId);
-    return fmt.actionResult(`attached ${args.paths.length} file(s) (${how})`, { meta, tabId });
+    const attached = `attached ${args.paths.length} file(s) (${how})`;
+    return fmt.actionResult(fgNote ? `${attached}\n${fgNote}` : attached, { meta, tabId });
   },
 
   // -------------------------------------------------------------- window ----
@@ -1805,6 +1949,20 @@ const HANDLERS = {
           );
         }
 
+        // The answer to "the agent keeps stealing the window I am working in".
+        // Sharing a window is not a thing that can be done politely: trusted
+        // input needs a foreground tab, only one tab per window is foreground,
+        // so every click is the view changing under whoever else is there.
+        case 'new': {
+          const id = await windows.createFor(label);
+          const moved = await rehomeSession(label, id);
+          return (
+            `opened window ${id} for "${label}" alone. Its tabs go there, and activating them ` +
+            'no longer pulls the user out of what they are doing.' +
+            (moved ? ` Moved ${moved} tab(s) it already had into it.` : '')
+          );
+        }
+
         case 'pick': {
           const res = await windows.pick(label);
           const moved = await rehomeSession(label, res.windowId);
@@ -1818,7 +1976,7 @@ const HANDLERS = {
         }
 
         default:
-          throw new Error(`unknown window action: ${args.action}. Use "list", "use", or "pick".`);
+          throw new Error(`unknown window action: ${args.action}. Use "list", "new", "use", or "pick".`);
       }
     }
 
@@ -1870,9 +2028,20 @@ const HANDLERS = {
     if (args.state) {
       const { windowId } = await chrome.tabs.get(tabId);
       await chrome.windows.update(windowId, { state: args.state });
-      // Worth saying out loud: a minimized window still renders and still
-      // accepts debugger input, so nothing about the run changes.
-      done.push(args.state === 'minimized' ? 'minimized (automation continues)' : args.state);
+      // This used to claim a minimized window "still accepts debugger input, so
+      // nothing about the run changes". Half of that is true and the half that
+      // is not is the expensive half: snapshots and screenshots do keep working,
+      // but every tab in a minimized window is `hidden`, and Chrome drops
+      // trusted input into hidden tabs. So the tool was recommending a state in
+      // which every subsequent click silently landed nowhere.
+      //
+      // `ensureForeground` now un-minimizes before dispatching input, which
+      // makes the recommendation safe and also makes it partly self-cancelling
+      // — worth saying, since "minimized" that quietly un-minimizes on the next
+      // click is otherwise a surprise.
+      done.push(
+        args.state === 'minimized' ? 'minimized (reads continue; input un-minimizes it)' : args.state
+      );
     }
 
     if (!done.length) {

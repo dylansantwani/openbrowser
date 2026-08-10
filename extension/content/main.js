@@ -311,6 +311,19 @@ var OB = globalThis.OB || (globalThis.OB = {});
       };
     },
 
+    /**
+     * Whether this tab can actually receive trusted input.
+     *
+     * `chrome.tabs.get().active` is not the answer: a tab is `active` in a
+     * window that is minimized or completely covered by another, and in both of
+     * those Chrome reports the document hidden and drops every dispatched mouse
+     * and key event on the floor. Only the page knows, so only the page can be
+     * asked. See `ensureForeground` in background/router.js.
+     */
+    visibility() {
+      return { visibility: document.visibilityState, hasFocus: document.hasFocus() };
+    },
+
     storage() {
       const dump = (store) => {
         const out = {};

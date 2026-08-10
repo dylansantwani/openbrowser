@@ -412,9 +412,9 @@ export const TOOLS = [
       properties: {
         action: {
           type: 'string',
-          enum: ['list', 'use', 'pick', 'browsers', 'connect', 'disconnect', 'remotes'],
+          enum: ['list', 'new', 'use', 'pick', 'browsers', 'connect', 'disconnect', 'remotes'],
           description:
-            'Where this session works. "list" windows; "browsers" lists them; "use" takes browser and/or windowId; "pick" asks the user. Only when a call reports several — relay the list, never guess. "connect" hub:<host> adds another machine\'s browsers as "remote/browser"; also "remotes", "disconnect".',
+            'Where this session works. "list" windows; "new" gives it one of its own, right if the user is browsing; "browsers" lists them; "use" takes browser and/or windowId; "pick" asks the user. Only when a call reports several — relay the list, never guess. "connect" hub:<host> adds another machine\'s browsers as "remote/browser"; also "remotes", "disconnect".',
         },
         windowId: { type: 'number', description: 'For "use".' },
         browser: { type: 'string', description: 'For "use": browser name.' },
@@ -435,7 +435,7 @@ export const TOOLS = [
         state: {
           type: 'string',
           enum: ['normal', 'minimized', 'maximized', 'fullscreen'],
-          description: 'Automation keeps running while minimized — use it to get the browser out of the way.',
+          description: 'Reads keep working while minimized; input un-minimizes it first.',
         },
       },
     },

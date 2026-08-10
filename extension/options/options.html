@@ -116,17 +116,35 @@
         </label>
 
         <label class="check">
+          <input type="checkbox" id="soloWindow" />
+          <span>
+            <strong>Give each agent its own window</strong>
+            <small class="muted">
+              Clicks and keystrokes only land on a <em>foreground</em> tab, and
+              only one tab per window is foreground — so an agent sharing your
+              window has to take your view every time it acts, several times a
+              second during a run. A window of its own removes the conflict
+              instead of managing it: a tab that is foreground in a window you
+              are not looking at is still visible, so the agent can work while
+              you carry on in yours. Turn this off if the reason you keep an
+              agent in your window is to watch it.
+            </small>
+          </span>
+        </label>
+
+        <label class="check">
           <input type="checkbox" id="chooseWindow" />
           <span>
             <strong>Ask which window an agent should work in</strong>
             <small class="muted">
-              A tab group only organises tabs within one window, so with several
-              windows open an agent's tabs land in whichever one Chrome
-              considers current — usually the one you are reading. When this is
-              on and more than one window is open, a session has to be told
-              which window to use before it can open anything, either by you in
-              chat or by clicking the prompt it puts in each window. With one
-              window open you are never asked.
+              Only applies when the setting above is off. A tab group only
+              organises tabs within one window, so with several windows open an
+              agent's tabs land in whichever one Chrome considers current —
+              usually the one you are reading. When this is on and more than one
+              window is open, a session has to be told which window to use
+              before it can open anything, either by you in chat or by clicking
+              the prompt it puts in each window. With one window open you are
+              never asked.
             </small>
           </span>
         </label>

@@ -1120,10 +1120,32 @@ async function testWindowBinding() {
         if (!w) throw new Error('No window with id');
         return w;
       },
-      async create() {
-        const w = { id: 99, focused: true, tabs: [] };
+      // Unique ids, because a session taking a window of its own is now the
+      // normal path and two sessions doing it must not land on one window.
+      //
+      // `front` is tracked separately from `focused` because Chrome separates
+      // them and the bug lived in the gap: a window created with
+      // `focused: false` still goes on *top*, which is the whole of what the
+      // user sees. A stub that models only `focused` cannot fail on it.
+      async create({ focused = true } = {}) {
+        const w = { id: 90 + windows.length, focused, front: true, tabs: [] };
+        for (const other of windows) other.front = false;
         windows.push(w);
         return w;
+      },
+      async getLastFocused() {
+        return windows.find((w) => w.focused) || windows[0] || null;
+      },
+      async update(id, patch) {
+        const w = windows.find((x) => x.id === id);
+        if (!w) throw new Error('No window with id');
+        if (patch.focused) {
+          for (const other of windows) {
+            other.focused = other === w;
+            other.front = other === w;
+          }
+        }
+        return Object.assign(w, patch);
       },
     },
     storage: {
@@ -1158,10 +1180,13 @@ async function testWindowBinding() {
 
   const win = await importFrom('extension', 'background', 'windows.js');
 
-  // Two windows, no binding: the session must not pick for itself.
+  // Two windows, no binding, and sharing opted into: the session must not pick
+  // for itself. (With the default `soloWindow` it never shares, so it is never
+  // choosing between the human's windows and there is nothing to ask — that
+  // path is covered further down.)
   let threw = null;
   try {
-    await win.ensureWindow('claude · harbor', {});
+    await win.ensureWindow('claude · harbor', { soloWindow: false });
   } catch (err) {
     threw = err.message;
   }
@@ -1222,16 +1247,84 @@ async function testWindowBinding() {
     (await win.boundWindowId('race · one')) === 1 &&
     (await win.boundWindowId('race · two')) === null);
 
-  // One window is never a question — asking would be noise.
+  // One window is never a question. It used to be answered with that window,
+  // which is the one window a session must not be handed: trusted input only
+  // lands on a foreground tab, so a session sharing your window pulls your view
+  // to its tab on every single click. Reported as "the agent makes the window
+  // unusable while I am working in it", and no amount of restoring focus
+  // afterwards fixes it — that only turns a steal into a flicker.
   windows = [{ id: 1, focused: true, tabs: [] }];
-  check('a single window binds silently', (await win.ensureWindow('solo', {})) === 1);
+  const solo = await win.ensureWindow('solo', {});
+  check('the human\'s only window is not handed to a session', solo !== 1);
+  check('the session is given one of its own', windows.some((w) => w.id === solo));
+  check('and is bound to it', (await win.boundWindowId('solo')) === solo);
+  // Unfocused: it has to exist and be visible, not be in front.
+  check('the new window does not take the front', windows.find((w) => w.id === solo).focused === false);
 
-  // The escape hatch for people who never want to be asked.
+  // Two sessions starting together must not be given the same window, which is
+  // the same lost-update shape as the binding race above one level out.
+  const [a, b] = await Promise.all([win.ensureWindow('solo · a', {}), win.ensureWindow('solo · b', {})]);
+  check('two sessions get two windows', a !== b);
+
+  // And the chooser is gone from the common path rather than answered: with a
+  // window of its own there is no wrong window to land in, so a second session
+  // starting while a first one runs is never blocked on a human. That question
+  // used to fire the moment a second window existed — including one another
+  // agent had just opened for itself.
+  windows = [
+    { id: 1, focused: true, tabs: [] },
+    { id: 2, focused: false, tabs: [] },
+  ];
+  check('several windows no longer raise the chooser',
+    typeof (await win.ensureWindow('unasked', {})) === 'number');
+
+  // Off, for people whose reason for sharing a window is to watch. Then the old
+  // behaviour returns in full, chooser included.
+  windows = [{ id: 1, focused: true, tabs: [] }];
+  check('soloWindow:false takes the focused window',
+    (await win.ensureWindow('watcher', { soloWindow: false })) === 1);
+
   windows = [
     { id: 1, focused: false, tabs: [] },
     { id: 2, focused: true, tabs: [] },
   ];
-  check('chooseWindow:false takes the focused window', (await win.ensureWindow('quiet', { chooseWindow: false })) === 2);
+  check('soloWindow:false with chooseWindow:false takes the focused window',
+    (await win.ensureWindow('quiet', { soloWindow: false, chooseWindow: false })) === 2);
+
+  // A model that has not been told action:"new" exists cannot offer it, and
+  // this error is the one place a session learns which windows there are.
+  let chooser = null;
+  try {
+    await win.ensureWindow('asker', { soloWindow: false });
+  } catch (err) {
+    chooser = err.message;
+  }
+  check('the chooser still fires when sharing is opted into', !!chooser);
+  check('the chooser offers a window of its own', !!chooser && chooser.includes('action:"new"'));
+
+  // Not taking the window is not enough if the new one lands on top of it.
+  // `focused: false` governs keyboard focus, not stacking — on macOS a new
+  // window is placed above its siblings regardless — so an agent starting up
+  // threw its window over the page being read. Indistinguishable, from the
+  // outside, from the takeover this module exists to prevent.
+  windows = [{ id: 1, focused: true, front: true, tabs: [] }];
+  const front = await win.createFor('front-test');
+  check('the user\'s window is put back on top', windows.find((w) => w.id === 1).front === true);
+  check('the session still gets its own window', front !== 1 && (await win.boundWindowId('front-test')) === front);
+
+  // But only when Chrome was the front application to begin with. Raising a
+  // window in a browser the user is not even looking at drags the whole browser
+  // in front of whatever app they are actually in — a bigger interruption than
+  // the one being fixed, and one they did not ask for.
+  windows = [{ id: 1, focused: false, front: true, tabs: [] }];
+  await win.createFor('bg-test');
+  check('a backgrounded browser is not dragged forward',
+    windows.find((w) => w.id === 1).focused === false);
+
+  // The explicit form of the same thing, for a session that is already sharing.
+  const own = await win.createFor('mover');
+  check('createFor opens and binds a window', own != null && (await win.boundWindowId('mover')) === own);
+  check('createFor refuses an unlabelled caller', await win.createFor().then(() => false, () => true));
 
   // The human closed the window the session was working in. A stale id turns
   // every later call into an unexplained Chrome error, so it must be dropped.
@@ -1373,6 +1466,10 @@ async function testWindowBinding() {
  * one from a group in a different window.
  */
 async function testGroupConcurrency() {
+  // A window none of the fixture tabs live in, standing in for "whatever Chrome
+  // last focused" — which is the human's window, and the one an agent must not
+  // be dragged into.
+  const CURRENT_WINDOW = 99;
   let nextGroupId = 100;
   const tabGroups = new Map(); // id -> {id, title, color, windowId}
   const tabs = new Map(); // id -> {id, windowId, groupId}
@@ -1391,13 +1488,24 @@ async function testGroupConcurrency() {
         if (!tabs.has(id)) throw new Error('no tab');
         return tabs.get(id);
       },
-      async group({ tabIds, groupId }) {
+      // Chrome's actual contract, which this stub used to quietly improve on.
+      // With no `createProperties.windowId`, a new group is created in the
+      // *current* window — not the tabs' window — and the tabs are MOVED there
+      // to join it. Modelling the polite version is exactly why the real bug
+      // reached a real browser: grouping, whose failures are swallowed because
+      // it is only cosmetic, was relocating the tab it was asked to colour.
+      async group({ tabIds, groupId, createProperties }) {
         await nap();
         const id = groupId ?? nextGroupId++;
         if (!tabGroups.has(id)) {
-          tabGroups.set(id, { id, title: '', color: 'grey', windowId: tabs.get(tabIds[0]).windowId });
+          const windowId = createProperties?.windowId ?? CURRENT_WINDOW;
+          tabGroups.set(id, { id, title: '', color: 'grey', windowId });
         }
-        for (const t of tabIds) tabs.get(t).groupId = id;
+        const target = tabGroups.get(id).windowId;
+        for (const t of tabIds) {
+          tabs.get(t).groupId = id;
+          tabs.get(t).windowId = target;
+        }
         return id;
       },
       async ungroup(ids) {
@@ -1455,6 +1563,18 @@ async function testGroupConcurrency() {
   const harbor = [...tabGroups.values()].filter((g) => g.title.endsWith('dev · harbor'));
   check('concurrent grouping creates one group, not several', harbor.length === 1, `got ${harbor.length}`);
   check('every tab lands in that group', (await groups.tabsFor('dev · harbor')).length === 3);
+
+  // Grouping colours a tab. It must not move it. Verified to fail when
+  // `createProperties.windowId` is dropped from `assignNow`, which is how it
+  // behaved in Chrome: a session given a window of its own had its first tab
+  // pulled straight back into the human's, and its now-empty window closed
+  // itself — so the session reported no window bound, two calls after being
+  // given one.
+  check('grouping leaves tabs in their own window',
+    [1, 2, 3].every((id) => tabs.get(id).windowId === 10),
+    JSON.stringify([1, 2, 3].map((id) => tabs.get(id).windowId)));
+  check('the group is created in the tabs\' window, not the focused one',
+    harbor[0]?.windowId === 10, `group in window ${harbor[0]?.windowId}`);
 
   // Separate workstreams stay separate under the same load.
   await Promise.all([groups.assign(4, 'dev · meadow'), groups.assign(1, 'dev · harbor')]);

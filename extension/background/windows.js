@@ -175,10 +175,58 @@ function chooserError(label, wins) {
     `${wins.length} browser windows are open — ask the user which one "${label}" should work in. ` +
       'Nothing has been opened yet.\n' +
       wins.map((w, i) => describe(w, i + 1)).join('\n') +
-      `\n  ${wins.length + 1} · let the user choose in the browser  →  browser_window action:"pick"\n` +
+      `\n  ${wins.length + 1} · a new window, so this session shares none of them  →  browser_window action:"new"` +
+      `\n  ${wins.length + 2} · let the user choose in the browser  →  browser_window action:"pick"\n` +
       'Then call browser_window action:"use" windowId:<id>, or action:"pick" to put the ' +
-      'question in every window and wait for a click.'
+      'question in every window and wait for a click. Prefer action:"new" if the user is ' +
+      'working in the browser: sharing their window means taking it back on every click.'
   );
+}
+
+/**
+ * Open a window for this session and bind it.
+ *
+ * Unfocused deliberately. The window has to *exist* for the agent to work in,
+ * and it has to be un-occluded enough that Chrome still calls its tab visible —
+ * but it does not have to be in front, and taking the front is the specific
+ * rudeness this whole path exists to avoid.
+ */
+export async function createFor(label, { focused = false } = {}) {
+  if (!label) {
+    throw new Error('only an MCP session can take a window of its own; the side panel drives the window it is in.');
+  }
+  // Which window was on top before, so it can be put back on top after.
+  //
+  // `focused: false` is not enough, and this is the whole reason this function
+  // is more than one line. It governs *keyboard focus*, not stacking order: on
+  // macOS a newly created browser window is placed above its siblings anyway,
+  // so an agent starting up threw its window over the page the user was
+  // reading. From the outside that is indistinguishable from the takeover this
+  // module exists to prevent — the agent did not steal the window, it just
+  // parked in front of it, and nobody cares about the difference.
+  //
+  // Read before creating, because creating is what changes the answer.
+  const previous = await chrome.windows.getLastFocused().catch(() => null);
+
+  // `about:blank` rather than the default New Tab page, which is a real
+  // navigation and leaves the window `loading` for long enough that the next
+  // `tabs.create({windowId})` is issued against a window Chrome does not yet
+  // consider ready — and silently places elsewhere. See `openInWindow`.
+  const created = await chrome.windows.create({ focused, url: 'about:blank' });
+
+  // Only when Chrome was genuinely the front application and that window held
+  // focus. `getLastFocused` answers with a window either way — its `focused`
+  // flag is the only thing that distinguishes "the user is looking at this" from
+  // "this is where they were last time they looked at Chrome at all". Raising it
+  // in the second case would drag the whole browser in front of whatever app
+  // they are actually in, which is a bigger interruption than the one being
+  // fixed.
+  if (!focused && previous?.focused && previous.id !== created.id) {
+    await chrome.windows.update(previous.id, { focused: true }).catch(() => {});
+  }
+
+  await bind(label, created.id);
+  return created.id;
 }
 
 /**
@@ -189,6 +237,14 @@ function chooserError(label, wins) {
  * escape hatch for people running one agent and one window who never want the
  * question.
  *
+ * The silent answer used to be "the focused window", and that is the one window
+ * an agent must not be handed. Trusted input only lands on a foreground tab, so
+ * the agent activates its tab before every click; in your window that is your
+ * view being taken, on a loop, for as long as the run lasts. Opening a window
+ * for it is not a heavier answer than that — it is the only one that leaves you
+ * able to keep working. `soloWindow: false` restores the old behaviour for
+ * people whose reason for sharing a window is to watch.
+ *
  * @throws {Error} the chooser, when a human has to decide
  */
 export async function ensureWindow(label, settings = {}) {
@@ -197,14 +253,21 @@ export async function ensureWindow(label, settings = {}) {
   const bound = await boundWindowId(label);
   if (bound != null) return bound;
 
+  // With a window of its own there is no wrong window to land in, so there is
+  // also nothing to ask. That deletes the chooser from the common path rather
+  // than answering it — worth noting, because the chooser was itself the fix
+  // for agents landing in the human's window, and this is the same fix taken
+  // one step further: do not choose between someone else's windows at all.
+  //
+  // The cost is a window per session, which is visible and understandable. The
+  // thing it buys is that the browser stays usable while an agent runs in it.
+  if (settings.soloWindow !== false) return createFor(label);
+
   const wins = await listWindows();
 
   // No normal window at all — every one closed, or Chrome is showing only a
   // popup. Asking which of nothing to use would be absurd; make one.
-  if (!wins.length) {
-    const created = await chrome.windows.create({ focused: false });
-    return bind(label, created.id);
-  }
+  if (!wins.length) return createFor(label);
 
   if (wins.length === 1 || settings.chooseWindow === false) {
     return bind(label, (wins.find((w) => w.focused) || wins[0]).windowId);

@@ -128,7 +128,24 @@ async function assignNow(tabId, name) {
     }
   }
 
-  const groupId = await chrome.tabs.group({ tabIds: [tabId] });
+  // `createProperties.windowId` is not optional in practice, whatever the API
+  // says. Without it a new group is created in the *current* window — Chrome's
+  // last-focused one — and the tabs are **moved** there to join it. So grouping,
+  // a purely cosmetic step whose failures are deliberately swallowed, silently
+  // relocates the tab it was only supposed to colour.
+  //
+  // Invisible for as long as agents worked in the window that was already
+  // current: the move was a no-op. The moment a session got a window of its own
+  // it became total — every first tab of every workstream was dragged back into
+  // the user's window, and the agent's own window, now empty, closed itself. The
+  // session then reported no window bound, having been given one two calls ago.
+  //
+  // Read from `tab`, which was fetched above, so this is the window the tab is
+  // actually in rather than the one anybody believes it is in.
+  const groupId = await chrome.tabs.group({
+    tabIds: [tabId],
+    createProperties: { windowId: tab.windowId },
+  });
   const color = COLORS[colorCursor++ % COLORS.length];
 
   await chrome.tabGroups.update(groupId, {

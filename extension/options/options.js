@@ -15,6 +15,7 @@ const BOOLEAN_FIELDS = [
   'useDebugger',
   'highlightActions',
   'showAgentBadge',
+  'soloWindow',
   'chooseWindow',
   'restoreFocusAfterInput',
   'autoConfirmLeave',
