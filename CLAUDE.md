@@ -427,6 +427,37 @@ keep what you were doing. Three consequences worth keeping in view:
   takes the existing tab when it is a New Tab or blank page and nothing else,
   which is the narrowest reading of "empty" and the reason it does not violate
   "never act on a tab the session did not choose".
+- **Owning a window and being bound to one are different facts, and only the
+  first makes a tab switch invisible.** A window id says nothing about who else
+  is in it, so ownership is recorded when the window is opened (`{id, own}`)
+  rather than inferred. Bare ids from before that distinction read as *not*
+  owned, which is the safe side. The hole this closed: `claimTab` used to bind a
+  session to the window of any tab it was handed, and an explicit `tabId` only
+  ever comes from one place — a tab of yours. Handing an agent one tab handed it
+  your whole window, one switch at a time. The tab comes to the session now; the
+  session never goes to the window.
+- **The guard fails closed.** Relocating a tab home is best-effort; refusing to
+  activate one anywhere else is not. The tempting fallback — activate it where
+  it is, the call succeeds, the agent gets on with it — is the failure worth
+  refusing over, because the tab in front of someone can change while they are
+  typing into it, and the next keystrokes of whatever they were writing go to a
+  page an agent chose. A stopped call is recoverable and names its remedy; a
+  stolen keystroke is neither. Every path that can bring a tab forward goes
+  through `assertOwnWindow`.
+- **Only trusted input needs the tab in front, and most work is not trusted
+  input.** Filling fields goes through the content script, which writes the DOM
+  and works perfectly on a tab reporting `visibilityState: "hidden"` — measured,
+  along with navigation, snapshots, screenshots and eval. So `browser_input`
+  foregrounds lazily, at the first thing that actually needs it, and a form fill
+  now surfaces nothing at all. `browser_upload` likewise: `setFileInput` never
+  foregrounds, only the file-picker click does.
+- **Occlusion does not hide a tab.** Measured, after being assumed twice in the
+  other direction: a window completely covered by a maximized one keeps
+  `visibilityState: "visible"`, as does every tab in a Chrome that is behind
+  another application. Only *not being the active tab of its window* hides a
+  tab. So an agent's window can sit permanently behind yours, or on another
+  Space, and still take trusted input — which is the whole reason the
+  one-window-per-session design works rather than merely relocating the problem.
 - **Sharing is still reachable, so it still has to be survivable.** An explicit
   `use`/`pick`, or adopting a tab in your window, puts a session back in it. That
   path now says so once per session per window and names `action:"new"` — once,

@@ -96,10 +96,23 @@ function mutate(key, fn) {
 
 const mutateBindings = (fn) => mutate(BOUND_KEY, fn);
 
-export async function bind(label, windowId) {
+/**
+ * A binding is `{id, own}`, where `own` means "this window was opened for this
+ * session and holds nothing else".
+ *
+ * That distinction has to be recorded rather than inferred, because it decides
+ * whether switching tabs is invisible or is taking the view off whoever else is
+ * in the window — and nothing about a window id says which kind it is. Bare
+ * numbers from an older run still read correctly, as not-own, which is the safe
+ * side: a window whose provenance is unknown is treated as someone else's.
+ */
+const idOf = (entry) => (entry && typeof entry === 'object' ? entry.id : entry);
+const isOwn = (entry) => !!(entry && typeof entry === 'object' && entry.own);
+
+export async function bind(label, windowId, { own = false } = {}) {
   if (!label) return null;
   await mutateBindings((all) => {
-    all[label] = windowId;
+    all[label] = { id: windowId, own };
   });
   return windowId;
 }
@@ -121,8 +134,30 @@ export async function unbind(label) {
  */
 export async function boundWindowId(label) {
   if (!label) return null;
-  const id = (await readBindings())[label];
+  const id = idOf((await readBindings())[label]);
   if (id == null) return null;
+  try {
+    await chrome.windows.get(id);
+    return id;
+  } catch {
+    await unbind(label);
+    return null;
+  }
+}
+
+/**
+ * The window this session was given for itself, or null if it is working in one
+ * that belongs to somebody else.
+ *
+ * The caller that matters is `ensureForeground`: activating a tab is invisible
+ * inside a window the session owns and is a takeover anywhere else, and this is
+ * the only thing that can tell those apart.
+ */
+export async function ownWindowId(label) {
+  if (!label) return null;
+  const entry = (await readBindings())[label];
+  if (!isOwn(entry)) return null;
+  const id = idOf(entry);
   try {
     await chrome.windows.get(id);
     return id;
@@ -225,7 +260,10 @@ export async function createFor(label, { focused = false } = {}) {
     await chrome.windows.update(previous.id, { focused: true }).catch(() => {});
   }
 
-  await bind(label, created.id);
+  // `own: true` is the whole point of this function: it records that the window
+  // holds nothing but this session's work, which is what later lets tab
+  // switching inside it be treated as invisible.
+  await bind(label, created.id, { own: true });
   return created.id;
 }
 
@@ -590,7 +628,7 @@ chrome.windows.onRemoved.addListener((windowId) => {
   // mid-call, and it used to be the third writer racing the other two.
   mutateBindings((all) => {
     for (const [label, id] of Object.entries(all)) {
-      if (id === windowId) delete all[label];
+      if (idOf(id) === windowId) delete all[label];
     }
   }).catch(() => {});
 });
@@ -602,7 +640,7 @@ export async function summary() {
   return wins.map((w) => ({
     ...w,
     sessions: Object.entries(all)
-      .filter(([, id]) => id === w.windowId)
+      .filter(([, entry]) => idOf(entry) === w.windowId)
       .map(([label]) => label),
   }));
 }

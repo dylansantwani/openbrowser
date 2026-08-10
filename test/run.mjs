@@ -1321,6 +1321,23 @@ async function testWindowBinding() {
   check('a backgrounded browser is not dragged forward',
     windows.find((w) => w.id === 1).focused === false);
 
+  // Owning a window and merely being bound to one are different facts, and only
+  // the first makes switching tabs invisible. A window id says nothing about who
+  // else is in it, so this has to be recorded when the window is opened.
+  windows = [{ id: 1, focused: true, front: true, tabs: [] }];
+  const mine = await win.createFor('owner');
+  check('a window opened for a session is its own', (await win.ownWindowId('owner')) === mine);
+
+  await win.use('owner', 1);
+  check('binding to the user\'s window is not ownership', (await win.ownWindowId('owner')) === null);
+  check('but it is still the bound window', (await win.boundWindowId('owner')) === 1);
+
+  // A binding written before ownership existed is a bare number. It has to read
+  // as *not* owned — a window whose provenance is unknown is someone else's,
+  // which is the side that costs a window rather than a stolen view.
+  await win.bind('legacy', 1);
+  check('an explicit bind is never own', (await win.ownWindowId('legacy')) === null);
+
   // The explicit form of the same thing, for a session that is already sharing.
   const own = await win.createFor('mover');
   check('createFor opens and binds a window', own != null && (await win.boundWindowId('mover')) === own);

@@ -188,23 +188,39 @@ async function claimTab(tabId, label) {
   // `tabId` would silently move to a different tab, in a different window, than
   // the one just worked on. Both ways of restoring the invariant are honest;
   // which applies depends on whether the session has committed to a window yet.
+  const settings = await getSettings();
   const tab = await chrome.tabs.get(tabId).catch(() => null);
   if (tab) {
-    const bound = await windows.boundWindowId(label);
+    let bound = await windows.boundWindowId(label);
+
     if (bound == null) {
-      // Nothing committed yet, so the tab decides. This is also the nicest path
-      // for "drive my Gmail tab" as a session's first call: it binds a window
-      // without anyone having to answer the chooser.
-      await windows.bind(label, tab.windowId);
-    } else if (tab.windowId !== bound) {
-      // Already committed. Bring the tab to the session rather than the session
-      // to the tab — the binding may be the user's own answer to the chooser,
-      // and quietly reassigning it would undo a decision they made.
+      // This branch used to bind the session to the tab's own window — "drive
+      // my Gmail tab" settling the window without anyone answering the chooser.
+      // It reads well and it is how an agent ends up owning the window you are
+      // working in, because an explicit `tabId` comes from exactly one place:
+      // a tab of yours. From that moment resolution is scoped to your window
+      // and every action activates a tab inside it, so handing an agent one tab
+      // hands it the whole window, one view-stealing switch at a time.
+      //
+      // The tab still comes to the session. The session no longer goes to the
+      // window.
+      bound =
+        settings.soloWindow === false
+          ? await windows.bind(label, tab.windowId)
+          : await windows.createFor(label);
+    }
+
+    if (tab.windowId !== bound) {
+      // Bring the tab to the session rather than the session to the tab. When
+      // the binding was a human's answer to the chooser, quietly reassigning it
+      // would undo a decision they made; when it is a window opened for this
+      // session, moving is what taking the tab means.
       await chrome.tabs.move(tabId, { windowId: bound, index: -1 }).catch(() => {});
+      await tidyBlankTabs(bound, tabId);
     }
   }
 
-  const settings = await getSettings();
+
   if (settings.groupTabs === false) return;
   await groups.assign(tabId, label).catch(() => {});
 }
@@ -266,15 +282,39 @@ async function rehomeSession(label, windowId) {
  * breaks — a session must never act on a tab the human was using — since neither
  * holds anything a human could be in the middle of.
  */
+const BLANK_URL = /^(chrome:\/\/newtab\/?|about:blank|about:newtab)$/;
+
 async function blankTabIn(windowId) {
   if (windowId == null) return null;
   try {
     const tabs = await chrome.tabs.query({ windowId });
     if (tabs.length !== 1) return null;
-    const url = tabs[0].url || tabs[0].pendingUrl || '';
-    return /^(chrome:\/\/newtab\/?|about:blank|about:newtab)$/.test(url) ? tabs[0] : null;
+    return BLANK_URL.test(tabs[0].url || tabs[0].pendingUrl || '') ? tabs[0] : null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Drop the placeholder a fresh window came with, once real work has arrived.
+ *
+ * A window opened for a session holds one blank tab. When the session's first
+ * page is *moved* in rather than opened there, that placeholder is left over —
+ * and nothing tracks it for cleanup, so it keeps the window alive after every
+ * tab the session actually opened has been closed.
+ */
+async function tidyBlankTabs(windowId, keepTabId) {
+  try {
+    const tabs = await chrome.tabs.query({ windowId });
+    if (tabs.length < 2) return;
+    const spare = tabs.filter(
+      (t) => t.id !== keepTabId && BLANK_URL.test(t.url || t.pendingUrl || '')
+    );
+    if (spare.length && spare.length < tabs.length) {
+      await chrome.tabs.remove(spare.map((t) => t.id));
+    }
+  } catch {
+    // A leftover blank tab is untidy. Failing the call over it would be worse.
   }
 }
 
@@ -707,7 +747,23 @@ async function withDelta(tabId, fn) {
 async function ensureForeground(tabId, label) {
   let note = null;
   try {
-    const tab = await chrome.tabs.get(tabId);
+    let tab = await chrome.tabs.get(tabId);
+
+    // Activating a tab is invisible inside a window that holds nothing but this
+    // session's work, and is somebody's view being taken anywhere else. So the
+    // tab comes home before it is activated, rather than the window being
+    // switched around whoever is in it. `ownWindowId` is the only thing that
+    // can tell the two cases apart — a window id says nothing about who else is
+    // in it — and it answers null for a window the session merely landed in,
+    // including a binding written before this distinction existed.
+    const relocated = await relocateToOwnWindow(tab, label);
+    if (relocated) tab = relocated;
+
+    // Relocation is best-effort; this is not. If the tab could not be brought
+    // home, the call stops here rather than switching tabs under whoever is in
+    // that window.
+    await assertOwnWindow(tab.id, label, 'foreground');
+
     const win = await chrome.windows.get(tab.windowId).catch(() => null);
 
     // Restoring a minimized window is not focus theft — a minimized window is
@@ -741,11 +797,86 @@ async function ensureForeground(tabId, label) {
     }
 
     return (await hiddenTabWarning(tabId, tab.windowId)) || note;
-  } catch {
-    // If it cannot be activated the input may still land; failing the action
-    // here would turn a maybe into a definite no.
+  } catch (err) {
+    // The refusal is the one error here that must reach the caller. Everything
+    // else is best-effort: if the tab cannot be activated the input may still
+    // land, and failing the action would turn a maybe into a definite no.
+    if (err?.obRefuse) throw err;
     return note;
   }
+}
+
+/**
+ * Bring a tab into the window this session owns, so activating it disturbs
+ * nobody.
+ *
+ * Only ever moves *to* a window opened for the session, never into one someone
+ * else is in, and does nothing at all when the tab is already home — which is
+ * the common case, so the common case costs one storage read.
+ *
+ * The whole workstream travels, not just this tab. Moving one tab and leaving
+ * its siblings is the drift that reads, from inside an agent, as being told it
+ * works in one window while demonstrably acting in another.
+ *
+ * `soloWindow: false` opts out of all of it: someone who deliberately keeps an
+ * agent in their own window to watch it has asked for the tab switching too.
+ */
+async function relocateToOwnWindow(tab, label) {
+  if (!label || tab.active) return null;
+
+  const settings = await getSettings();
+  if (settings.soloWindow === false) return null;
+
+  let own = await windows.ownWindowId(label);
+  if (own === tab.windowId) return null;
+  if (own == null) own = await windows.createFor(label);
+  if (own == null || own === tab.windowId) return null;
+
+  try {
+    await rehomeSession(label, own);
+    const now = await chrome.tabs.get(tab.id);
+    if (now.windowId !== own) await chrome.tabs.move(tab.id, { windowId: own, index: -1 });
+    await tidyBlankTabs(own, tab.id);
+    return await chrome.tabs.get(tab.id);
+  } catch {
+    // Better to click in the wrong window than not to click at all.
+    return null;
+  }
+}
+
+/**
+ * Refuse to change what is on screen in a window this session does not own.
+ *
+ * Relocating the tab is the answer almost every time, and this is what happens
+ * when it did not work. The tempting fallback is to activate the tab where it
+ * is — the call succeeds, the agent gets on with it — and that is precisely the
+ * failure worth refusing over: the tab in front of someone can change while they
+ * are typing into it, which sends the next keystrokes of whatever they were
+ * writing, password included, to a page an agent chose.
+ *
+ * A stopped call is recoverable and says what to do. A stolen keystroke is not
+ * recoverable and says nothing at all. `soloWindow: false` turns the whole thing
+ * off for anyone who wants an agent in their own window on purpose.
+ */
+async function assertOwnWindow(tabId, label, what) {
+  if (!label) return; // the side panel is a human, driving their own window
+  const settings = await getSettings();
+  if (settings.soloWindow === false) return;
+
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tab || tab.active) return;
+
+  const own = await windows.ownWindowId(label);
+  if (own === tab.windowId) return;
+
+  const err = new Error(
+    `refusing to ${what} tab ${tabId}: window ${tab.windowId} is not this session's, and bringing a tab ` +
+      'to the front there changes what the user is looking at — possibly mid-keystroke. ' +
+      'Give this session a window of its own with browser_window action:"new", which moves its tabs across, ' +
+      'or pass an explicit tabId for a tab it already owns.'
+  );
+  err.obRefuse = true;
+  throw err;
 }
 
 /** `${label}:${windowId}` already told. In-memory: a repeat costs one line. */
@@ -1068,7 +1199,21 @@ const HANDLERS = {
         // Placement is verified rather than assumed — see `openInWindow`, which
         // also covers the case where the session's window was made moments ago
         // and is not yet ready to be created into.
-        const tab = await openInWindow({ url, active: args.background === false }, windowId);
+        // Opening in the foreground is this session's business inside its own
+        // window and nobody else's anywhere else. Downgraded rather than
+        // refused — the tab is still opened, it just does not jump in front of
+        // whoever is there — and said out loud, because silently ignoring what
+        // was asked for is its own kind of wrong.
+        let active = args.background === false;
+        let downgraded = '';
+        if (active && settings.soloWindow !== false) {
+          if ((await windows.ownWindowId(sessionLabel)) !== windowId) {
+            active = false;
+            downgraded = ` (opened in the background: window ${windowId} is not this session's)`;
+          }
+        }
+
+        const tab = await openInWindow({ url, active }, windowId);
         // Group before waiting for load, so the tab is visibly labelled the
         // moment it appears rather than after the page settles. An explicit
         // `group` wins over the session label, letting an agent split its own
@@ -1087,7 +1232,7 @@ const HANDLERS = {
 
         if (url !== 'about:blank') await waitForLoad(tab.id, 15000).catch(() => {});
         const meta = await pageMeta(tab.id).catch(() => ({ url }));
-        return `opened tab ${tab.id}${grouped}\n${fmt.pageHeader(meta, tab.id)}`;
+        return `opened tab ${tab.id}${grouped}${downgraded}\n${fmt.pageHeader(meta, tab.id)}`;
       }
 
       case 'group': {
@@ -1119,6 +1264,11 @@ const HANDLERS = {
 
       case 'select': {
         const tabId = await resolveTab(args, { create: false });
+        // Asking for a tab to be brought forward is not authority to bring a
+        // *window* forward that belongs to somebody else. `resolveTab` will
+        // normally have moved this tab home already, so this only bites when
+        // that failed.
+        await assertOwnWindow(tabId, args.group || args._session, 'select');
         const tab = await chrome.tabs.update(tabId, { active: true });
         await chrome.windows.update(tab.windowId, { focused: true });
         return `tab ${tabId} is now active\n${fmt.pageHeader(await pageMeta(tabId), tabId)}`;
@@ -1455,8 +1605,26 @@ const HANDLERS = {
   async browser_input(args) {
     const tabId = await resolveTab(args);
     const { settings } = await prepareTab(tabId);
-    // Keystrokes are dropped by a hidden tab exactly as clicks are.
-    const fgNote = await ensureForeground(tabId, args.group || args._session);
+    // Keystrokes are dropped by a hidden tab exactly as clicks are — but only
+    // keystrokes. Filling fields goes through the content script, which writes
+    // the DOM directly and works perfectly on a tab nobody can see. Measured,
+    // not assumed: a field set on a tab reporting `visibilityState: "hidden"`
+    // reads back correctly, while a trusted click on the same tab is dropped
+    // without an error.
+    //
+    // So this is deferred to the moment something actually needs the tab in
+    // front, rather than paid on the way in. A form fill — the most common
+    // thing this tool does — now disturbs nothing at all. Memoised, because
+    // several branches below can each be the first to need it, and lazy rather
+    // than a precomputed flag so a future CDP path cannot forget to ask.
+    let fgNote = null;
+    let foregrounded = false;
+    const foreground = async () => {
+      if (foregrounded) return;
+      foregrounded = true;
+      fgNote = await ensureForeground(tabId, args.group || args._session);
+    };
+
     const summary = [];
 
     const { changed } = await withDelta(tabId, async () => {
@@ -1487,6 +1655,7 @@ const HANDLERS = {
 
       // 2. Free-text typing, as trusted keystrokes.
       if (args.text != null) {
+        await foreground();
         if (args.ref) {
           const route = await frames.routeRef(tabId, args.ref);
           const target = await frames.sendToFrame(tabId, route.frameId, 'resolve', { ref: route.localRef });
@@ -1525,6 +1694,7 @@ const HANDLERS = {
 
       // 3. Explicit key presses.
       if (args.keys?.length) {
+        await foreground();
         if (args.ref && args.text == null) {
           // `text` clicks its ref to focus; keys have to as well, or a chord
           // goes wherever focus happened to already be.
@@ -1556,6 +1726,7 @@ const HANDLERS = {
       }
 
       if (args.submit) {
+        await foreground();
         await cdp.pressKey(tabId, 'Enter');
         summary.push('pressed Enter');
       }
@@ -1856,8 +2027,12 @@ const HANDLERS = {
   async browser_upload(args) {
     const tabId = await resolveTab(args);
     await prepareTab(tabId);
-    // The file-picker path clicks the trigger, so it needs a visible tab too.
-    const fgNote = await ensureForeground(tabId, args.group || args._session);
+    // Only one of the two paths below needs a visible tab, and which one it is
+    // is not known until the page has been asked whether a file input exists.
+    // Foregrounding up front paid that cost every time for the sake of the
+    // branch that is taken less often — `setFileInput` writes the input through
+    // CDP without a pointer event anywhere near it.
+    let fgNote = null;
 
     const route = args.ref ? await frames.routeRef(tabId, args.ref) : { frameId: 0, localRef: undefined };
     const target = await frames.sendToFrame(tabId, route.frameId, 'uploadTarget', { ref: route.localRef });
@@ -1879,6 +2054,9 @@ const HANDLERS = {
           `${target.error} and no ref was given. Pass ref: the upload button, so the input can be created and intercepted.`
         );
       }
+
+      // This branch clicks the trigger, so now the tab has to be in front.
+      fgNote = await ensureForeground(tabId, args.group || args._session);
 
       // Re-locate on every attempt rather than closing over one point: the
       // retry exists because the page was still settling, and a settling page
@@ -2020,6 +2198,7 @@ const HANDLERS = {
       done.push(`network ${args.throttle}`);
     }
     if (args.focus) {
+      await assertOwnWindow(tabId, args.group || args._session, 'focus');
       const tab = await chrome.tabs.update(tabId, { active: true });
       await chrome.windows.update(tab.windowId, { focused: true });
       done.push('focused');
