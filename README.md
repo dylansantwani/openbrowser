@@ -415,7 +415,13 @@ npm run deploy        # wrangler pages deploy site --project-name=openbrowser --
 `--branch=main` pins it to the production deployment; without it wrangler
 infers the branch from git and a detached HEAD lands on a preview URL instead.
 
-Two things the markup depends on, worth keeping if you edit it:
+**Bump the `?v=` on the asset links in `index.html` whenever you change
+`styles.css` or `app.js`.** Pages serves HTML with `max-age=0` but static
+assets with `max-age=14400` — four hours. Without the version bump a returning
+visitor gets new HTML against four-hour-old CSS and JS, which is not a
+combination the page is built to survive: it renders blank.
+
+Three things the markup depends on, worth keeping if you edit it:
 
 - **Content is visible by default.** The scroll-reveal effect only engages
   under the `js-reveal` class that the inline script in `<head>` sets, and
