@@ -98,7 +98,12 @@ export class Bridge {
 
   async connect() {
     this.stopped = false;
-    if (this.status === 'connected' || this.status === 'connecting') return;
+    // `restore()` intentionally renders a fresh MV3 worker as "connecting"
+    // when the previous worker had an active bridge.  That is only a UI
+    // state: the new worker has no socket yet.  Treating it as a live
+    // connection made every such worker return here forever, leaving the
+    // extension stuck on "connecting" until its storage was cleared.
+    if (this.status === 'connected' || (this.status === 'connecting' && this.socket)) return;
 
     const settings = await getSettings();
     this.port = settings.port;
