@@ -118,16 +118,13 @@
         <label class="check">
           <input type="checkbox" id="soloWindow" />
           <span>
-            <strong>Give each agent its own window</strong>
+            <strong>Keep agent tabs in a background window</strong>
             <small class="muted">
-              Clicks and keystrokes only land on a <em>foreground</em> tab, and
-              only one tab per window is foreground — so an agent sharing your
-              window has to take your view every time it acts, several times a
-              second during a run. A window of its own removes the conflict
-              instead of managing it: a tab that is foreground in a window you
-              are not looking at is still visible, so the agent can work while
-              you carry on in yours. Turn this off if the reason you keep an
-              agent in your window is to watch it.
+              Sessions share one background container window while their tabs,
+              ownership, and mutation queues remain isolated. Ordinary clicks
+              and typing are sent directly to their target tabs and do not
+              select a tab or raise Chrome. Turn this off only when you
+              deliberately want agents working inside a window you chose.
             </small>
           </span>
         </label>
@@ -145,20 +142,6 @@
               before it can open anything, either by you in chat or by clicking
               the prompt it puts in each window. With one window open you are
               never asked.
-            </small>
-          </span>
-        </label>
-
-        <label class="check">
-          <input type="checkbox" id="restoreFocusAfterInput" />
-          <span>
-            <strong>Give the tab back after clicking or typing</strong>
-            <small class="muted">
-              Clicks and keystrokes only land on a foreground tab, so the agent
-              has to switch to its own to act — which pulls you out of whatever
-              you were reading, tab groups included, since a group shares your
-              window. This switches back once it is done. If you changed tabs
-              yourself in the meantime, you are left where you are.
             </small>
           </span>
         </label>

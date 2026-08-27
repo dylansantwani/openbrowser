@@ -39,7 +39,7 @@ export const TOOLS = [
   {
     name: 'browser_tabs',
     description:
-      'List, open, close, select, or reload tabs. Every other tool takes a tabId, so many sites can be driven in parallel. Pass "group" to label a workstream — its tabs collect into a coloured Chrome tab group.',
+      'List, open, close, select, or reload tabs. Every other tool takes a tabId, so many sites can be driven in parallel. Optional "group" splits your tabs into named, coloured workstreams.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -50,7 +50,7 @@ export const TOOLS = [
         },
         group: {
           type: 'string',
-          description: 'Workstream label. Tabs sharing a label group together. One label per parallel job.',
+          description: 'Optional workstream label; omit for normal work. Splits one session into named tab groups.',
         },
         tabId: TAB,
         tabIds: {
@@ -485,6 +485,8 @@ Reliability:
 - After anything that triggers a load, browser_wait rather than assuming.
 - If a ref is stale, re-snapshot; refs are invalidated when the DOM changes materially.
 
-Parallelism: every tool takes a tabId. Open tabs with browser_tabs action:"new" (background by default) and fan work across them with the browser_batch "parallel" param.
+Parallelism: every tool takes a tabId. Open tabs with browser_tabs action:"new" (background by default) and fan work across them with the browser_batch "parallel" param. You never need a tab in the foreground to act on it — clicks, typing, navigation, snapshots and uploads all work on a background tab. Don't call browser_tabs action:"select" or browser_window focus just to interact: those raise the user's Chrome window and interrupt them. Reserve them for when a human genuinely needs to look at the tab.
 
-Label your work: pass group:"<short task name>" on every call. Tabs sharing a label collect into one Chrome tab group, and a session only drives tabs in its own group — so one label per task keeps concurrent jobs from reaching into each other, and makes the tab strip say what is running. If you are working on several unrelated things at once, give each its own label.`;
+Groups are optional, and sessions are already isolated from one another — so omit "group" for ordinary work. Pass it only to split your own session's tabs into named workstreams (e.g. group:"invoices" vs group:"emails"); those tabs then collect into one coloured Chrome tab group. Two different sessions using the same label never share tabs.
+
+Trust the result, not the attempt. When an action reports "UNVERIFIED … dispatched", the input was sent but no page change was observed — the tab may be covered, or the control may do nothing on its own. Re-snapshot and confirm the expected state before continuing; do not blindly retry with force. A fully covered agent window drops trusted input silently, so hammering a click just repeats one that already landed or never will.`;

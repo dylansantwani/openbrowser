@@ -17,7 +17,6 @@ const BOOLEAN_FIELDS = [
   'showAgentBadge',
   'soloWindow',
   'chooseWindow',
-  'restoreFocusAfterInput',
   'autoConfirmLeave',
   'captureBodies',
 ];

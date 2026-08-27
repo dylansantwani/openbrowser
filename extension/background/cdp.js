@@ -43,6 +43,7 @@ export async function attach(tabId) {
     try {
       await chrome.debugger.attach({ tabId }, PROTOCOL_VERSION);
       sessions.set(tabId, { attached: true, domains: new Set() });
+      await emulateFocus(tabId);
       return true;
     } catch (err) {
       const message = err?.message || String(err);
@@ -57,6 +58,7 @@ export async function attach(tabId) {
           );
         }
         sessions.set(tabId, { attached: true, domains: new Set() });
+        await emulateFocus(tabId);
         return true;
       }
 
@@ -71,6 +73,28 @@ export async function attach(tabId) {
 
   attaching.set(tabId, promise);
   return promise;
+}
+
+/**
+ * Optional focus-state emulation for sites whose own logic gates behaviour on
+ * document focus. This is not a window-management primitive and is deliberately
+ * off by default: CDP does not document it as an occlusion/compositing override,
+ * and direct Input.dispatch* already targets background tabs without raising
+ * Chrome. Keep it available for controlled A/B diagnosis, not as a hidden
+ * prerequisite for input delivery.
+ *
+ * Direct `chrome.debugger.sendCommand`, not `send()`, to avoid re-entering
+ * `attach()` from inside it. Best-effort throughout: a browser too old to know
+ * the method, or any other refusal, must never turn a successful attach into a
+ * failed one — the tab still works, it just works the way it did before.
+ */
+async function emulateFocus(tabId) {
+  try {
+    if ((await getSettings()).emulateFocus === false) return;
+    await chrome.debugger.sendCommand({ tabId }, 'Emulation.setFocusEmulationEnabled', { enabled: true });
+  } catch {
+    /* older Chrome, or a race with detach — the attach itself still stands */
+  }
 }
 
 export async function detach(tabId) {
@@ -142,13 +166,13 @@ export async function click(tabId, x, y, { button = 'left', clickCount = 1, modi
   const btn = BUTTON_NAMES[button] || 'left';
   const base = { x: Math.round(x), y: Math.round(y), button: btn, modifiers: mods, pointerType: 'mouse' };
 
-  await send(tabId, 'Input.dispatchMouseEvent', { ...base, type: 'mouseMoved', buttons: 0 });
+  await send(tabId, 'Input.dispatchMouseEvent', { ...base, type: 'mouseMoved', buttons: 0, force: 0 });
   if (delay) await sleep(delay);
 
   const buttons = btn === 'left' ? 1 : btn === 'right' ? 2 : 4;
-  await send(tabId, 'Input.dispatchMouseEvent', { ...base, type: 'mousePressed', clickCount, buttons });
+  await send(tabId, 'Input.dispatchMouseEvent', { ...base, type: 'mousePressed', clickCount, buttons, force: 0.5 });
   await sleep(delay || 20); // a zero-duration press reads as a glitch to some UIs
-  await send(tabId, 'Input.dispatchMouseEvent', { ...base, type: 'mouseReleased', clickCount, buttons: 0 });
+  await send(tabId, 'Input.dispatchMouseEvent', { ...base, type: 'mouseReleased', clickCount, buttons: 0, force: 0 });
 }
 
 export async function doubleClick(tabId, x, y, opts = {}) {
@@ -183,7 +207,7 @@ export async function drag(tabId, from, to, { steps = 12, modifiers = [] } = {})
   const point = (x, y, type, buttons) =>
     send(tabId, 'Input.dispatchMouseEvent', {
       type, x: Math.round(x), y: Math.round(y),
-      button: 'left', buttons, modifiers: mods, pointerType: 'mouse',
+      button: 'left', buttons, force: buttons ? 0.5 : 0, modifiers: mods, pointerType: 'mouse',
     });
 
   await point(from.x, from.y, 'mouseMoved', 0);

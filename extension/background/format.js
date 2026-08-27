@@ -240,10 +240,11 @@ export function renderFindResults(results, query) {
 export function renderTabs(tabs, activeTabId, workstreams = [], opts = {}) {
   if (!tabs.length) return 'No tabs open.';
 
-  // tabId -> workstream label, so each row says which job owns it.
+  // tabId -> ownership, so same-named workstreams from different sessions are
+  // never rendered as if they were one job.
   const owner = new Map();
   for (const w of workstreams) {
-    for (const id of w.tabIds) owner.set(id, w.name);
+    for (const id of w.tabIds) owner.set(id, { workstream: w.name, sessionId: w.sessionId });
   }
 
   const row = (t) => {
@@ -253,7 +254,13 @@ export function renderTabs(tabs, activeTabId, workstreams = [], opts = {}) {
     if (t.discarded) marks.push('discarded');
     if (t.status === 'loading') marks.push('loading');
     const suffix = marks.length ? ` (${marks.join(', ')})` : '';
-    const stream = owner.has(t.id) ? `  [${owner.get(t.id)}]` : '';
+    const owned = owner.get(t.id);
+    // The session id disambiguates same-named workstreams across sessions, but
+    // with no explicit group the workstream *is* the session label, and
+    // "harbor · harbor" is just noise — show the one name then.
+    const stream = owned
+      ? `  [${owned.workstream}${owned.sessionId && owned.sessionId !== owned.workstream ? ` · ${owned.sessionId}` : ''}]`
+      : '';
     return `  ${t.id}  ${shortUrl(t.url || t.pendingUrl || 'about:blank')}  "${truncate(t.title || '', 60)}"${suffix}${stream}`;
   };
 
@@ -270,9 +277,9 @@ export function renderTabs(tabs, activeTabId, workstreams = [], opts = {}) {
   for (const [windowId, group] of byWindow) {
     // Which sessions have tabs here. The header is where an agent looks to see
     // it is about to act in a window another agent is mid-task in.
-    const here = [...new Set(group.map((t) => owner.get(t.id)).filter(Boolean))];
+    const here = [...new Set(group.map((t) => owner.get(t.id)?.sessionId).filter(Boolean))];
     const who = here.length
-      ? `  ← ${here.map((n) => (n === opts.label ? `${n} (you)` : n)).join(', ')}`
+      ? `  ← ${here.map((n) => (n === opts.sessionId ? `${n} (you)` : n)).join(', ')}`
       : '';
     // Bracketed rather than a second arrow: the two say different things, and a
     // session *can* have tabs in a window it is not bound to — that mismatch is

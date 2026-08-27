@@ -17,6 +17,9 @@
 import { WebSocketServer, connectWebSocket } from './ws.js';
 import { RemoteLink, aliasFor, toHubUrl } from './federation.js';
 
+/** Must match extension/background/bridge.js. */
+const PROTOCOL_REVISION = 2;
+
 export const DEFAULT_PORT = 8848;
 
 /**
@@ -331,7 +334,14 @@ export class Hub {
     return this.localBrowsers().map((c) => ({
       instance: c.instance,
       label: browserLabel(c),
-      info: c.info ? { browser: c.info.browser, version: c.info.version, name: c.info.name } : null,
+      info: c.info
+        ? {
+            browser: c.info.browser,
+            version: c.info.version,
+            name: c.info.name,
+            protocolRevision: c.info.protocolRevision,
+          }
+        : null,
     }));
   }
 
@@ -383,7 +393,9 @@ export class Hub {
       // any call whose `_browser` is not its own, and the calling hub sent the
       // id it knows, which is the same one — but restamping here keeps the
       // guarantee local rather than trusting the peer to have got it right.
-      args: { ...(msg.args || {}), _browser: target.instance },
+      // `_protocolRevision` is *our* revision, because this is our local
+      // extension we are relaying to — the far hub's revision is its own affair.
+      args: { ...(msg.args || {}), _browser: target.instance, _protocolRevision: PROTOCOL_REVISION },
     });
   }
 
@@ -567,7 +579,14 @@ export class Hub {
           // owner entry and leak on a browser that never replies.
           this._callOwners.set(msg.id, { peer, conn, tool: msg.tool, args: msg.args || {} });
           this._callConn.set(msg.id, conn);
-          conn.sendJSON({ ...msg, args: { ...(msg.args || {}), _browser: conn.instance } });
+          // Stamp our revision here too. A peer's call does not pass through
+          // `call()`, so the stamp added there is absent on this path — and
+          // without it every secondary MCP client (any that did not start the
+          // hub) is rejected by a current extension as "server legacy".
+          conn.sendJSON({
+            ...msg,
+            args: { ...(msg.args || {}), _browser: conn.instance, _protocolRevision: PROTOCOL_REVISION },
+          });
         });
       })
       .catch((err) => {
@@ -627,7 +646,10 @@ export class Hub {
         type: 'call',
         id: `session-end-${name}-${this.peers.size}`,
         tool: '__session_end',
-        args: { _session: name, _browser: conn.instance },
+        // The extension guards every 'call', cleanup included — without the
+        // stamp a current extension rejects session-end and never tidies the
+        // tabs of a hub-initiated cleanup.
+        args: { _session: name, _browser: conn.instance, _protocolRevision: PROTOCOL_REVISION },
       });
     }
   }
@@ -1032,6 +1054,13 @@ export class Hub {
    * ending; routing uses it because it has already chosen the browser.
    */
   _rawCallTo(conn, tool, args = {}, { timeout } = {}) {
+    if (conn.info?.protocolRevision !== PROTOCOL_REVISION) {
+      throw new Error(
+        `OpenBrowser server/extension revision mismatch (server ${PROTOCOL_REVISION}, ` +
+          `extension ${conn.info?.protocolRevision ?? 'legacy'}). Restart every OpenBrowser MCP server from the same checkout, ` +
+          'then reload the extension; the call was not run.'
+      );
+    }
     const id = nextId();
     const promise = this.pending.create(id, { timeout });
     this._callConn.set(id, conn);
@@ -1041,7 +1070,12 @@ export class Hub {
     // any call whose `_browser` is not its own instance, which turns a misroute
     // — otherwise a silent success on the wrong browser's tab of the same id —
     // into a loud error.
-    conn.sendJSON({ type: 'call', id, tool, args: { ...args, _browser: conn.instance } });
+    conn.sendJSON({
+      type: 'call',
+      id,
+      tool,
+      args: { ...args, _browser: conn.instance, _protocolRevision: PROTOCOL_REVISION },
+    });
     return promise;
   }
 

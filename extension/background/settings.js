@@ -81,6 +81,17 @@ const DEFAULTS = {
    */
   soloWindow: true,
 
+  /** Share one background agent window; tab ownership still stays per session. */
+  agentWindowPool: true,
+
+  /**
+   * Experimental page-focus emulation. It can help a site whose JavaScript
+   * explicitly checks document focus, but it is not documented as a native
+   * window-occlusion override and is not required for background CDP input.
+   * Leave off unless comparing a reproducible site failure with and without it.
+   */
+  emulateFocus: false,
+
   /**
    * When an MCP client disconnects, close the tabs that session opened.
    *
@@ -115,20 +126,6 @@ const DEFAULTS = {
    * explicit browser_act action:"dialog".
    */
   autoConfirmLeave: true,
-
-  /**
-   * Put the tab back after the agent borrows the foreground.
-   *
-   * Trusted input can only be dispatched at a foreground tab — a hidden one
-   * drops mouse and key events silently — so the agent has to activate its tab
-   * to click. Keeping it afterwards is no part of that requirement, and a
-   * background job stealing the tab you are reading is the tool interrupting
-   * you to do the thing you asked it to do quietly. A tab group does not help:
-   * groups share a window, so activating a tab in one pulls you out of another.
-   *
-   * Restoring is skipped if you switched tabs yourself in the meantime.
-   */
-  restoreFocusAfterInput: true,
 
   /**
    * Draw a persistent border and caption on pages an agent is driving.

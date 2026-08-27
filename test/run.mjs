@@ -21,6 +21,7 @@ import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { readFileSync } from 'node:fs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const SERVER = join(ROOT, 'mcp-server', 'src', 'index.js');
@@ -86,7 +87,9 @@ async function fakeExtension(port, { onCall, instance = 'fake-instance', browser
     }
   });
 
-  conn.sendJSON({ type: 'hello', role: 'extension', version: '1.0.0', browser, instance, name });
+  conn.sendJSON({
+    type: 'hello', role: 'extension', version: '1.0.0', protocolRevision: 2, browser, instance, name,
+  });
   return {
     conn,
     seen,
@@ -462,6 +465,11 @@ async function main() {
     ended.some((c) => c.args._session === secondLabel) && !ended.some((c) => c.args._session === firstLabel),
     JSON.stringify(ended.map((c) => c.args._session))
   );
+  // The extension guards every 'call', session-end included, so the cleanup must
+  // carry the revision stamp or a current extension drops it and never tidies.
+  check('session-end cleanup carries the protocol revision',
+    ended.every((c) => c.args?._protocolRevision === 2),
+    JSON.stringify(ended.map((c) => c.args?._protocolRevision)));
 
   // ── Names vs. what is already in the browser ─────────────────────────────
   section('Session names never collide with tab groups already on screen');
@@ -552,6 +560,10 @@ async function main() {
   // ── Tab groups under load ────────────────────────────────────────────────
   section('Tab groups with several agents');
   await testGroupConcurrency();
+
+  // ── Background input and mutation isolation ─────────────────────────────
+  section('Background input and mutation isolation');
+  await testBackgroundInputInvariants();
 
   // ── Hub-to-hub federation ────────────────────────────────────────────────
   section('Federation between hubs');
@@ -762,6 +774,7 @@ async function testFederation() {
   const [rb] = local.liveBrowsers();
   check('its id is namespaced by the remote', rb.instance === `127.0.0.1/inst-cloud`, rb.instance);
   check('its name is namespaced too', /^127\.0\.0\.1\/sandbox$/.test(rb.info?.name || ''), rb.info?.name);
+  check('its protocol revision crosses the federation boundary', rb.info?.protocolRevision === 2);
 
   // One level deep: what we expose to a federated hub is only ever our own
   // browsers. This is the cycle guard, and it is structural rather than a check.
@@ -921,6 +934,14 @@ async function testHubTakeover() {
     /Browser: "desk" — this machine\./.test(relayed?.text || ''), relayed?.text);
   const acted2 = await peer.call('browser_act', { action: 'click', ref: 'e1', _session: 'claude · peerless' });
   check('and a peer\'s non-orienting call is left alone', !/Browser: /.test(acted2?.text || ''), acted2?.text);
+  // The stamp `call()` adds must also be on the peer-relay path, or a current
+  // extension rejects every secondary MCP client's call as "server legacy".
+  // The mock extension does not enforce it, so assert it directly on what the
+  // extension was sent.
+  const peerCalls = ext2.seen.filter((c) => c.tool === 'browser_tabs' || c.tool === 'browser_act');
+  check('a peer\'s relayed call carries the protocol revision',
+    peerCalls.length > 0 && peerCalls.every((c) => c.args?._protocolRevision === 2),
+    JSON.stringify(peerCalls.map((c) => [c.tool, c.args?._protocolRevision])));
   await peer.stop();
   ext2.conn.close();
   await sleep(100);
@@ -986,10 +1007,10 @@ async function testFormatting() {
     ],
     11,
     [
-      { name: 'claude · harbor', tabIds: [11, 12], windowId: 501 },
-      { name: 'claude · meadow', tabIds: [21], windowId: 502 },
+      { name: 'mail', sessionId: 'claude · harbor', tabIds: [11, 12], windowId: 501 },
+      { name: 'research', sessionId: 'claude · meadow', tabIds: [21], windowId: 502 },
     ],
-    { boundWindowId: 501, label: 'claude · harbor' }
+    { boundWindowId: 501, sessionId: 'claude · harbor' }
   );
   check('tabs are grouped under a window header', /window 501 \(2 tabs\)/.test(tabList), tabList);
   check('both windows appear', /window 502 \(1 tab\)/.test(tabList));
@@ -1261,10 +1282,12 @@ async function testWindowBinding() {
   // Unfocused: it has to exist and be visible, not be in front.
   check('the new window does not take the front', windows.find((w) => w.id === solo).focused === false);
 
-  // Two sessions starting together must not be given the same window, which is
-  // the same lost-update shape as the binding race above one level out.
+  // Direct CDP input is target-addressed, so sessions share one background
+  // container without sharing tab ownership. This prevents window-per-agent
+  // sprawl and means later sessions create no new window that can stack above
+  // the user's work on macOS.
   const [a, b] = await Promise.all([win.ensureWindow('solo · a', {}), win.ensureWindow('solo · b', {})]);
-  check('two sessions get two windows', a !== b);
+  check('two sessions reuse the background agent window', a === b && a === solo);
 
   // And the chooser is gone from the common path rather than answered: with a
   // window of its own there is no wrong window to land in, so a second session
@@ -1490,9 +1513,10 @@ async function testGroupConcurrency() {
   let nextGroupId = 100;
   const tabGroups = new Map(); // id -> {id, title, color, windowId}
   const tabs = new Map(); // id -> {id, windowId, groupId}
+  const sessionStore = {};
   const nap = () => new Promise((r) => setTimeout(r, 1));
 
-  for (const [id, windowId] of [[1, 10], [2, 10], [3, 10], [4, 20]]) {
+  for (const [id, windowId] of [[1, 10], [2, 10], [3, 10], [4, 20], [5, 10]]) {
     tabs.set(id, { id, windowId, groupId: -1 });
   }
 
@@ -1561,7 +1585,14 @@ async function testGroupConcurrency() {
     webNavigation: { onCommitted: { addListener() {} } },
     storage: {
       local: { async get() { return {}; }, async set() {} },
-      session: { async get() { return {}; }, async set() {} },
+      session: {
+        async get(key) {
+          return key in sessionStore ? { [key]: structuredClone(sessionStore[key]) } : {};
+        },
+        async set(obj) {
+          Object.assign(sessionStore, structuredClone(obj));
+        },
+      },
       onChanged: { addListener() {} },
     },
     runtime: { getManifest: () => ({ version: '1.0.0' }) },
@@ -1572,14 +1603,14 @@ async function testGroupConcurrency() {
   // Three tabs into one workstream, all at once — an agent opening a batch, or
   // three agents sharing a label.
   await Promise.all([
-    groups.assign(1, 'dev · harbor'),
-    groups.assign(2, 'dev · harbor'),
-    groups.assign(3, 'dev · harbor'),
+    groups.assign(1, 'session-a', 'dev · harbor'),
+    groups.assign(2, 'session-a', 'dev · harbor'),
+    groups.assign(3, 'session-a', 'dev · harbor'),
   ]);
 
   const harbor = [...tabGroups.values()].filter((g) => g.title.endsWith('dev · harbor'));
   check('concurrent grouping creates one group, not several', harbor.length === 1, `got ${harbor.length}`);
-  check('every tab lands in that group', (await groups.tabsFor('dev · harbor')).length === 3);
+  check('every tab lands in that group', (await groups.tabsFor('session-a', 'dev · harbor')).length === 3);
 
   // Grouping colours a tab. It must not move it. Verified to fail when
   // `createProperties.windowId` is dropped from `assignNow`, which is how it
@@ -1594,18 +1625,34 @@ async function testGroupConcurrency() {
     harbor[0]?.windowId === 10, `group in window ${harbor[0]?.windowId}`);
 
   // Separate workstreams stay separate under the same load.
-  await Promise.all([groups.assign(4, 'dev · meadow'), groups.assign(1, 'dev · harbor')]);
+  await Promise.all([
+    groups.assign(4, 'session-a', 'dev · meadow'),
+    groups.assign(1, 'session-a', 'dev · harbor'),
+  ]);
   check('a second workstream gets its own group',
     [...tabGroups.values()].filter((g) => g.title.endsWith('dev · meadow')).length === 1);
-  check('the first workstream is unchanged', (await groups.tabsFor('dev · harbor')).length === 3);
+  check('the first workstream is unchanged', (await groups.tabsFor('session-a', 'dev · harbor')).length === 3);
+
+  // A display label is not authority. Another session can use the same short
+  // workstream name without joining, resolving, releasing, or closing the
+  // first session's tabs.
+  await groups.assign(5, 'session-b', 'dev · harbor');
+  check('same-named workstreams from different sessions get separate groups',
+    [...tabGroups.values()].filter((g) => g.title.endsWith('dev · harbor')).length === 2);
+  check('same-named workstreams do not share tabs',
+    (await groups.tabsFor('session-a', 'dev · harbor')).length === 3 &&
+      (await groups.tabsFor('session-b', 'dev · harbor')).join() === '5');
+  check('tab ownership records the stamped session, not the display label',
+    (await groups.ownerFor(5))?.sessionId === 'session-b');
 
   // A duplicate that already exists — made by hand, or left by an older build —
   // must not hide half the workstream from the session that owns it.
   const stray = { id: nextGroupId++, title: '⚡ dev · harbor', color: 'blue', windowId: 20 };
   tabGroups.set(stray.id, stray);
   tabs.set(9, { id: 9, windowId: 20, groupId: stray.id });
+  sessionStore.tabGroupOwnersV2[stray.id] = { sessionId: 'session-a', workstream: 'dev · harbor' };
   check('a duplicate group is not allowed to hide tabs',
-    (await groups.tabsFor('dev · harbor')).length === 4);
+    (await groups.tabsFor('session-a', 'dev · harbor')).length === 4);
 
   // ── The same duplicate, from the point of view of resolving a tab ────────
   //
@@ -1615,27 +1662,77 @@ async function testGroupConcurrency() {
   // lands somewhere the session has been told it is not. Tabs 1-3 are in
   // window 10, the stray is in window 20.
   check('resolution scoped to a window sees only that window',
-    (await groups.tabsFor('dev · harbor', 10)).length === 3,
-    JSON.stringify(await groups.tabsFor('dev · harbor', 10)));
+    (await groups.tabsFor('session-a', 'dev · harbor', 10)).length === 3,
+    JSON.stringify(await groups.tabsFor('session-a', 'dev · harbor', 10)));
   check('the other window holds only the stray',
-    (await groups.tabsFor('dev · harbor', 20)).join() === '9');
+    (await groups.tabsFor('session-a', 'dev · harbor', 20)).join() === '9');
   check('an unscoped lookup still spans windows, for cleanup',
-    (await groups.tabsFor('dev · harbor')).length === 4);
+    (await groups.tabsFor('session-a', 'dev · harbor')).length === 4);
 
   // Rebinding a session used to move only the bookkeeping: new tabs went to the
   // new window while the group and everything in it stayed put, so a listing
   // and reality told two different stories. Moving is what "works here now"
   // has to mean.
-  const moved = await groups.moveTo('dev · harbor', 10);
+  const moved = await groups.moveTo('session-a', 10, 'dev · harbor');
   check('rebinding brings the workstream along', moved === 1, `moved ${moved}`);
   check('every tab is in the bound window afterwards',
-    (await groups.tabsFor('dev · harbor', 10)).length === 4);
+    (await groups.tabsFor('session-a', 'dev · harbor', 10)).length === 4);
   check('nothing is left behind in the old window',
-    (await groups.tabsFor('dev · harbor', 20)).length === 0);
+    (await groups.tabsFor('session-a', 'dev · harbor', 20)).length === 0);
 
-  check('release covers every duplicate', (await groups.release('dev · harbor')) === true);
+  check('release covers every duplicate', (await groups.release('session-a', 'dev · harbor')) === true);
   check('nothing is left grouped after release',
-    (await groups.tabsFor('dev · harbor')).length === 0);
+    (await groups.tabsFor('session-a', 'dev · harbor')).length === 0);
+  check('releasing one session leaves the same-named other session intact',
+    (await groups.tabsFor('session-b', 'dev · harbor')).join() === '5');
+}
+
+async function testBackgroundInputInvariants() {
+  const router = readFileSync(join(ROOT, 'extension', 'background', 'router.js'), 'utf8');
+  const cdp = readFileSync(join(ROOT, 'extension', 'background', 'cdp.js'), 'utf8');
+  const settings = readFileSync(join(ROOT, 'extension', 'background', 'settings.js'), 'utf8');
+
+  check('ordinary input has no automatic foreground helper', !/ensureForeground|hiddenTabWarning/.test(router));
+  check('explicit select still focuses only when explicitly requested',
+    /case 'select'[\s\S]*chrome\.windows\.update\(tab\.windowId, \{ focused: true \}\)/.test(router));
+  check('mouse presses carry real pointer pressure',
+    /type: 'mousePressed'[\s\S]{0,120}force: 0\.5/.test(cdp));
+  check('focus emulation is diagnostic and default-off', /emulateFocus: false/.test(settings));
+  check('model-controlled group never replaces stamped session identity', !/args\.group \|\| args\._session/.test(router));
+
+  const { serializeTabMutation } = await importFrom('extension', 'background', 'mutation-queue.js');
+  const order = [];
+  await Promise.all([
+    serializeTabMutation(10, async () => {
+      order.push('a:start');
+      await sleep(15);
+      order.push('a:end');
+    }),
+    serializeTabMutation(10, async () => {
+      order.push('b:start');
+      await sleep(1);
+      order.push('b:end');
+    }),
+  ]);
+  check('same-tab mutations serialize the whole sequence', order.join(',') === 'a:start,a:end,b:start,b:end', order.join(','));
+
+  let overlap = false;
+  let running = 0;
+  await Promise.all([
+    serializeTabMutation(20, async () => {
+      running++;
+      await sleep(10);
+      overlap ||= running > 1;
+      running--;
+    }),
+    serializeTabMutation(21, async () => {
+      running++;
+      await sleep(10);
+      overlap ||= running > 1;
+      running--;
+    }),
+  ]);
+  check('different tabs still mutate in parallel', overlap);
 }
 
 main().catch((err) => {
