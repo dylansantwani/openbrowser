@@ -1,0 +1,20 @@
+# EditorConfig — https://editorconfig.org
+# Matches the style already used across the repo: 2-space indent, LF, UTF-8.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+# Markdown: trailing spaces are significant (hard line breaks).
+[*.md]
+trim_trailing_whitespace = false
+
+# Keep generated/vendored artifacts untouched.
+[*.min.*]
+insert_final_newline = false
+trim_trailing_whitespace = false
