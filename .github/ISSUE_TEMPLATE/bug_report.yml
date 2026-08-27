@@ -1,0 +1,66 @@
+name: Bug report
+description: Something is broken or behaves differently than documented.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. Since OpenBrowser drives a real browser, the
+        exact site and the extension/server split matter — please be specific.
+        Tip: `node mcp-server/src/index.js --health` tells you whether Chrome is
+        connected, and the side panel's **Activity** tab shows the failing call.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What went wrong, and what did you expect instead?
+      placeholder: I called browser_act to click a button and it reported success, but nothing happened on the page.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The exact tool calls (or side-panel actions) and the site they ran against, in order.
+      placeholder: |
+        1. browser_navigate url:"https://example.com/login"
+        2. browser_snapshot
+        3. browser_act action:"click" ref:"e5"
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: input
+    id: site
+    attributes:
+      label: Site / URL
+      description: The page you were automating (if it can be shared). "Difficult sites" bugs are almost always site-specific.
+    validations:
+      required: false
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Fill in what you can.
+      value: |
+        - OpenBrowser version (from `manifest.json` / `package.json`):
+        - OS:
+        - Chrome version (`chrome://version`):
+        - Node version (`node --version`):
+        - MCP client (Claude Code / opencode / Cursor / other):
+        - Federated hub / remote browser involved? (yes/no):
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant server stderr (run with `--verbose`), extension service-worker console, or the Activity-tab error. Redact anything sensitive.
+      render: shell
+    validations:
+      required: false

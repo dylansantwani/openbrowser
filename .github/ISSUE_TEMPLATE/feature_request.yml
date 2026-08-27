@@ -1,0 +1,42 @@
+name: Feature request
+description: Suggest a capability or improvement.
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Two things worth knowing before you file:
+        - **Zero dependencies is non-negotiable.** Proposals that require an npm
+          package are unlikely to land — the hand-rolled approach is the point.
+        - **Fourteen tools is deliberate.** New capabilities usually fit best as
+          a new `action` enum on an existing tool rather than a fifteenth tool.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that OpenBrowser can't do well today?
+      placeholder: When automating <site>, I need to ... but there's no way to ...
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should it do? If it's a tool change, which tool/action, and what would the call and result look like?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you tried or thought about, including combinations of the existing tools.
+    validations:
+      required: false
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Sites, screenshots, or links that help explain the use case.
+    validations:
+      required: false

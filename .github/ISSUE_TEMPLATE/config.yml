@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Website
+    url: https://openbrowser.pulse-core.com
+    about: Project overview, tour of the tools, and install walkthrough.
+  - name: Security note
+    url: https://github.com/dylansantwani/openbrowser/blob/main/README.md#security
+    about: The hub has no auth and binds loopback by design — read this before exposing it.

@@ -6,38 +6,56 @@
 
 **Browser automation for AI agents — in your real Chrome, with your real logins.**
 
-A Chrome extension with a side-panel UI, plus a zero-dependency MCP server, so any
-MCP client can drive an actual browser instead of a headless copy of one.
+A Chrome extension plus a zero-dependency MCP server, so any MCP client can drive
+an actual browser instead of a headless copy of one.
 
-[![Website](https://img.shields.io/badge/site-openbrowser.pulse--core.com-38bdf8?style=flat-square)](https://openbrowser.pulse-core.com)
 [![License: MIT](https://img.shields.io/badge/license-MIT-22d3ee?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.0.0-64748b?style=flat-square)](package.json)
 [![Node](https://img.shields.io/badge/node-%E2%89%A518-5b8c5a?style=flat-square)](package.json)
 [![Chrome](https://img.shields.io/badge/chrome-%E2%89%A5116-5b8c5a?style=flat-square)](#install)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen?style=flat-square)](#zero-dependencies)
+[![Website](https://img.shields.io/badge/site-openbrowser.pulse--core.com-38bdf8?style=flat-square)](https://openbrowser.pulse-core.com)
 
 ### [🌐 openbrowser.pulse-core.com](https://openbrowser.pulse-core.com)
 
-[Install](#install) · [Tools](#the-tools) · [Token cost](#keeping-token-cost-down) · [Difficult sites](#difficult-sites) · [Security](#security) · [Docs](#development)
+[Install](#install) · [Quickstart](#quickstart) · [Tools](#the-tools) · [Token cost](#keeping-token-cost-down) · [Difficult sites](#difficult-sites) · [Security](#security) · [Contributing](#contributing)
 
 </div>
 
 ---
 
-## Why this exists
+## What it is
 
-Most browser automation hands your agent a fresh headless browser: signed out of
-everything, fingerprinted as a bot, and reading pages as either raw DOM or
-screenshots. OpenBrowser takes the opposite position on all three.
+OpenBrowser lets an AI agent drive **your** Chrome — the one already signed in to
+your accounts, running your extensions — over the [Model Context
+Protocol](https://modelcontextprotocol.io). It has two halves: a Manifest V3
+Chrome extension with a side-panel UI, and a small MCP stdio server that any MCP
+client (Claude Code, opencode, Cursor, Windsurf, Zed, or your own) can launch.
 
-|  | What it means |
-|---|---|
-| 🔓 **Real browser, real session** | Runs in your actual Chrome, with your logins, cookies, and extensions. Nothing to keep signed in. |
-| ⌨️ **Trusted input events** | Clicks and keystrokes go through the Chrome debugger, so they are indistinguishable from a real user's. Payment forms, login pages, and drag-and-drop all work. |
-| 🪶 **Built for token cost** | Pages are read as a compact accessibility tree, not screenshots or raw DOM. A full login page costs ~350 characters. |
-| ⚡ **Parallel by default** | Every tool takes a `tabId`. Read twenty tabs at once. |
-| 📦 **Zero dependencies** | No `npm install`. Node 18+ and Chrome 116+ is the whole requirement. |
-| 🏠 **Entirely local** | Loopback only. No telemetry, no analytics, no outbound calls. |
+Most browser automation hands the agent a fresh headless browser instead: signed
+out of everything, fingerprinted as a bot, and reading pages as either raw DOM or
+screenshots. OpenBrowser takes the opposite position on all three — real session,
+trusted input, and a compact accessibility tree that keeps token cost low.
+
+## Highlights
+
+- 🔓 **Real browser, real session.** Runs in your actual Chrome, with your logins,
+  cookies, and extensions. Nothing extra to keep signed in.
+- ⌨️ **Trusted input events.** Clicks and keystrokes go through the Chrome
+  debugger, so they are indistinguishable from a real user's. Payment forms, login
+  pages, and drag-and-drop all work where synthetic clicks are rejected.
+- 🪶 **Built for token cost.** Pages are read as a compact accessibility tree, not
+  screenshots or raw DOM. A full login page costs ~350 characters.
+- ⚡ **Parallel by default.** Every tool takes a `tabId`. Read twenty tabs at once.
+- 🧩 **Fourteen composable tools.** Grouped by `action` enums rather than split
+  into forty single-purpose ones — models pick an enum value far more reliably.
+- 🖥️ **Side-panel UI.** Run any tool by hand and see exactly what an agent would
+  get back — the fastest way to debug a flow.
+- 🌐 **Multi-browser and multi-machine.** Several agents share one browser; one
+  hub can federate to hubs on other machines and drive their browsers too.
+- 📦 **Zero dependencies.** No `npm install`. Node 18+ and Chrome 116+ is the whole
+  requirement.
+- 🏠 **Entirely local.** Loopback only by default. No telemetry, no analytics, no
+  outbound calls.
 
 <a id="zero-dependencies"></a>
 
@@ -50,12 +68,20 @@ screenshots. OpenBrowser takes the opposite position on all three.
 
 ## Install
 
-### 1. Load the extension
+### 1. Get the code
+
+```bash
+git clone https://github.com/dylansantwani/openbrowser.git
+```
+
+There is nothing to build and nothing to install — no `npm install` step.
+
+### 2. Load the extension
 
 Open `chrome://extensions`, turn on **Developer mode**, click **Load unpacked**,
 and select the `extension/` folder.
 
-### 2. Point your MCP client at the server
+### 3. Point your MCP client at the server
 
 <details open>
 <summary><b>Claude Code</b></summary>
@@ -98,7 +124,11 @@ Standard MCP stdio server:
 ```
 </details>
 
-### 3. Check it
+---
+
+## Quickstart
+
+First, confirm Chrome is connected. The server prints its status and exits:
 
 ```bash
 node mcp-server/src/index.js --health
@@ -107,54 +137,57 @@ node mcp-server/src/index.js --health
 The toolbar badge clears when Chrome is connected. If it doesn't, see
 [Troubleshooting](#troubleshooting).
 
----
-
-## How it fits together
-
-```
-  Claude Code ─┐
-               ├─ stdio ─> mcp-server ─ ws://127.0.0.1:8848 ─> Chrome extension ─> your tabs
-  opencode ────┘
-```
-
-The first server to start binds the hub port; later ones join it. So several
-agents can share one browser — an editor agent and a CLI agent can work in the
-same session without fighting over it.
-
-Everything is local. Nothing leaves your machine except the pages you ask it to
-visit.
-
-### Browsers on other machines
-
-A hub can attach to hubs elsewhere, so one agent with **one** MCP config drives
-browsers on any number of boxes:
+Now hand your agent a task. Everything an agent does reduces to two moves — read
+the page, then act on it. A read looks like this:
 
 ```
-  your agent ──> hub (laptop) ──┬──> Chrome, here
-                                ├──ws──> hub (10.0.0.5) ──> Chrome, there
-                                └──ws──> hub (10.0.0.6) ──> Chrome, there
+browser_navigate url:"example.com"
+browser_snapshot
 ```
 
-On each remote machine, let the hub listen off-loopback:
-
-```bash
-node mcp-server/src/index.js --hub --host 0.0.0.0
-```
-
-Then, from an agent:
+and `browser_snapshot` renders the page as a compact accessibility tree with
+`[ref=eN]` handles you can act on directly:
 
 ```
-browser_window action:"connect" hub:"10.0.0.5"
+app.example.com/login · "Sign in · Example" · tab 481 · 1280x800
+banner
+  link "Example" [e1] /
+main
+  heading "Sign in" h1
+  form
+    textbox "Email" [e2] required
+    password "Password" [e3] required
+    checkbox "Remember me" [e4] unchecked
+    button "Sign in" [e5]
+  link "Forgot your password?" [e6] /reset
 ```
 
-Its browsers appear as `10.0.0.5/<name>` and are used exactly like local ones.
-`action:"remotes"` lists what is attached; `action:"disconnect"` detaches.
-`--connect 10.0.0.5,10.0.0.6` attaches them at startup instead.
+356 characters — roughly 90 tokens. The same page is ~4,000 tokens as raw
+accessibility JSON and ~1,500 as a screenshot.
 
-> ⚠️ **The hub has no authentication.** Anything that can reach it can run
-> JavaScript in a logged-in browser. `--host` defaults to `127.0.0.1` for that
-> reason — keep federated hubs on a private network or a VPN mesh, never on a
-> public IP.
+### A whole login in one call
+
+Once you know a flow, `browser_batch` collapses it into a single round-trip:
+
+```json
+{
+  "tool": "browser_batch",
+  "args": {
+    "steps": [
+      { "tool": "browser_navigate", "args": { "url": "app.example.com/login" } },
+      { "tool": "browser_input", "args": {
+          "fields": [
+            { "ref": "e2", "value": "ada@example.com" },
+            { "ref": "e3", "value": "correct horse battery staple" }
+          ]}},
+      { "tool": "browser_act", "args": { "action": "click", "ref": "e5" } },
+      { "tool": "browser_wait", "args": { "for": "text", "value": "Dashboard" } }
+    ]
+  }
+}
+```
+
+One round-trip instead of eight.
 
 ---
 
@@ -181,49 +214,6 @@ single-purpose ones — models pick an enum value far more reliably.
 | `browser_macro` | save and replay step sequences |
 
 Full parameter reference: **[docs/TOOLS.md](docs/TOOLS.md)**.
-
-### What a page looks like
-
-`browser_snapshot` renders this:
-
-```
-app.example.com/login · "Sign in · Example" · tab 481 · 1280x800
-banner
-  link "Example" [e1] /
-main
-  heading "Sign in" h1
-  form
-    textbox "Email" [e2] required
-    password "Password" [e3] required
-    checkbox "Remember me" [e4] unchecked
-    button "Sign in" [e5]
-  link "Forgot your password?" [e6] /reset
-```
-
-356 characters — roughly 90 tokens. The same page is ~4,000 tokens as raw
-accessibility JSON and ~1,500 as a screenshot.
-
-### A whole login in one call
-
-```json
-{
-  "tool": "browser_batch",
-  "args": {
-    "steps": [
-      { "tool": "browser_navigate", "args": { "url": "app.example.com/login" } },
-      { "tool": "browser_input", "args": {
-          "fields": [
-            { "ref": "e2", "value": "ada@example.com" },
-            { "ref": "e3", "value": "correct horse battery staple" }
-          ]}},
-      { "tool": "browser_act", "args": { "action": "click", "ref": "e5" } },
-      { "tool": "browser_wait", "args": { "for": "text", "value": "Dashboard" } }
-    ]
-  }
-}
-```
-
-One round-trip instead of eight.
 
 ---
 
@@ -262,7 +252,6 @@ The cases that usually break browser automation, and what handles them here:
 | CAPTCHA | Detected and reported. **Not bypassed** — that needs a human |
 | Click opens a new tab or popup | Reported with the new tab's id, rather than looking like nothing happened |
 | Tab is in the background | Foregrounded before input; Chrome silently discards clicks aimed at hidden tabs |
-| Click seems to do nothing | Distinguishes "the app has not reacted yet" from "the click missed" |
 | Native JS dialog (alert/confirm/beforeunload) | Reported with the dialog's text; answered with `browser_act action:"dialog" accept:true/false` |
 
 Every row above is a bug that was found by driving the extension against a real
@@ -274,7 +263,8 @@ site, not a hypothetical. The write-ups are in
 
 ## Side panel
 
-Click the toolbar icon or press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>U</kbd>.
+Click the toolbar icon or press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>U</kbd>
+(<kbd>⌘</kbd>+<kbd>Shift</kbd>+<kbd>U</kbd> on macOS).
 
 - **Control** — tabs, quick actions, element search
 - **Tools** — run any tool by hand and see exactly what an agent would get
@@ -301,6 +291,71 @@ Extension options (`chrome://extensions` → Details → Extension options):
 | Blocklist | identity providers | Never automated |
 | Allowlist | empty | If non-empty, *only* these sites are automated |
 
+Server flags (`node mcp-server/src/index.js …`, or the matching env var):
+
+| Flag | Env | Default | What it does |
+|---|---|---|---|
+| `--port N` | `OPENBROWSER_PORT` | `8848` | Hub port |
+| `--host H` | `OPENBROWSER_HOST` | `127.0.0.1` | Bind address; `0.0.0.0` accepts remote hubs |
+| `--connect A,B` | `OPENBROWSER_CONNECT` | — | Attach to remote hub(s) at startup |
+| `--health` | | | Print hub + browser status and exit |
+| `--hub` | | | Run the hub only, no MCP |
+| `--verbose` | | | Log to stderr |
+
+---
+
+## How it works
+
+```
+  Claude Code ─┐
+               ├─ stdio ─> mcp-server ─ ws://127.0.0.1:8848 ─> Chrome extension ─> your tabs
+  opencode ────┘
+```
+
+The MCP server speaks stdio to your client and WebSocket to the extension. The
+first server to start binds the hub port; later ones join it. So several agents
+can share one browser — an editor agent and a CLI agent can work in the same
+session without fighting over it, because each session is bound to its own window
+and tab group.
+
+Everything is local. Nothing leaves your machine except the pages you ask it to
+visit.
+
+### Browsers on other machines
+
+A hub can attach to hubs elsewhere, so one agent with **one** MCP config drives
+browsers on any number of boxes:
+
+```
+  your agent ──> hub (laptop) ──┬──> Chrome, here
+                                ├──ws──> hub (10.0.0.5) ──> Chrome, there
+                                └──ws──> hub (10.0.0.6) ──> Chrome, there
+```
+
+On each remote machine, let the hub listen off-loopback:
+
+```bash
+node mcp-server/src/index.js --hub --host 0.0.0.0
+```
+
+Then, from an agent:
+
+```
+browser_window action:"connect" hub:"10.0.0.5"
+```
+
+Its browsers appear as `10.0.0.5/<name>` and are used exactly like local ones.
+`action:"remotes"` lists what is attached; `action:"disconnect"` detaches.
+`--connect 10.0.0.5,10.0.0.6` attaches them at startup instead.
+
+> ⚠️ **The hub has no authentication.** Anything that can reach it can run
+> JavaScript in a logged-in browser. `--host` defaults to `127.0.0.1` for that
+> reason — keep federated hubs on a private network or a VPN mesh, never on a
+> public IP.
+
+For why the pieces are split the way they are, see
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 ---
 
 ## Security
@@ -311,8 +366,8 @@ Extension options (`chrome://extensions` → Details → Extension options):
   mistake against an SSO flow is expensive and hard to undo.
 - CAPTCHAs are reported, never solved or bypassed.
 - The `debugger` permission is what makes trusted input possible. It is broad —
-  read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#permissions) for exactly what
-  it is used for, and turn it off in options if you would rather not grant it.
+  read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for exactly what it is used
+  for, and turn it off in options if you would rather not grant it.
 
 > ⚠️ **Treat an agent with browser access as having your logged-in privileges.**
 > Use the allowlist when running unattended.
@@ -374,8 +429,8 @@ Chrome caches extension files. Anything under `extension/` needs
 ## Development
 
 ```bash
-npm test          # 75 tests: WebSocket framing, MCP protocol, round trip, formatting
-npm run preview   # UI preview + 68 browser tests at :8850
+npm test          # 232 tests: WebSocket framing, MCP protocol, round trip, formatting
+npm run preview   # UI preview + in-browser accessibility-tree tests at :8850
 npm run hub       # hub only, verbose
 npm run icons     # regenerate icon PNGs
 ```
@@ -396,41 +451,6 @@ docs/           capabilities, tools reference, architecture, test checklist
 site/           the source of openbrowser.pulse-core.com (static, no build step)
 ```
 
-The site is three files — `index.html`, `styles.css`, `app.js` — with no build
-step, and `site/` is deployed as the web root (assets resolve at `/styles.css`,
-not `/site/styles.css`). Preview it locally with `npm run preview` and open
-<http://localhost:8850/site/index.html> — the dev server has no directory
-index, so the filename is required.
-
-It is hosted on **Cloudflare Pages**, project `openbrowser`, at
-<https://openbrowser.pulse-core.com>. Nothing in this repo deploys it — there is
-no CI and no `wrangler.toml`, so editing `site/` does not change what is live.
-Publish with:
-
-```
-npx wrangler login    # once — opens a browser to authorise
-npm run deploy        # wrangler pages deploy site --project-name=openbrowser --branch=main
-```
-
-`--branch=main` pins it to the production deployment; without it wrangler
-infers the branch from git and a detached HEAD lands on a preview URL instead.
-
-**Bump the `?v=` on the asset links in `index.html` whenever you change
-`styles.css` or `app.js`.** Pages serves HTML with `max-age=0` but static
-assets with `max-age=14400` — four hours. Without the version bump a returning
-visitor gets new HTML against four-hour-old CSS and JS, which is not a
-combination the page is built to survive: it renders blank.
-
-Three things the markup depends on, worth keeping if you edit it:
-
-- **Content is visible by default.** The scroll-reveal effect only engages
-  under the `js-reveal` class that the inline script in `<head>` sets, and
-  `app.js` removes it again if the IntersectionObserver never reports anything
-  (background tab, prerender, some webviews). Hiding first and un-hiding with
-  JS means one observer that never fires renders the whole page blank.
-- **Links point at `github.com/dylansantwani/openbrowser`.** They used to point
-  into the private `dylansantwani/claude` monorepo path, which 404s.
-
 | Doc | What it is for |
 |---|---|
 | [docs/CAPABILITIES.md](docs/CAPABILITIES.md) | What the fourteen tools can do in combination — parallel tabs, macros, retroactive network capture, trusted input, iframe reach |
@@ -441,9 +461,18 @@ Three things the markup depends on, worth keeping if you edit it:
 | [docs/SESSION-2026-08-03.md](docs/SESSION-2026-08-03.md) | Second pass — OAuth, popups, checkout forms, and the backgrounded-tab input bug |
 
 `CLAUDE.md` carries the hard rules and the platform behaviours that each cost a
-real bug to discover. `TODO.md` has the open work with reproduction details.
+real bug to discover. `AGENTS.md` is the short version for AI coding agents.
+`TODO.md` has the open work with reproduction details.
 
 ---
+
+## Contributing
+
+Contributions are welcome. The short version: no dependencies, ever; `npm test`
+stays green; commits follow [Conventional
+Commits](https://www.conventionalcommits.org/). The full guide — dev setup,
+testing, commit convention, and PR process — is in
+**[CONTRIBUTING.md](CONTRIBUTING.md)**.
 
 ## License
 
