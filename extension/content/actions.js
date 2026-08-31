@@ -415,7 +415,9 @@ var OB = globalThis.OB || (globalThis.OB = {});
   function buildCursor() {
     const el = document.createElement('div');
     el.className = 'ob-cursor';
-    el.innerHTML = `${CURSOR_SVG}<span class="ob-cursor-ripple"></span><span class="ob-cursor-label"></span>`;
+    el.innerHTML =
+      `<span class="ob-cursor-halo"></span>${CURSOR_SVG}` +
+      '<span class="ob-cursor-ripple"></span><span class="ob-cursor-label"></span>';
     return el;
   }
 
@@ -455,6 +457,8 @@ var OB = globalThis.OB || (globalThis.OB = {});
    * the press + ripple. `label` names the action so a coordinate click — which
    * draws no target box — still says what happened.
    */
+  let cursorArrival = null; // pending click-mark timer, superseded by any newer move
+
   function cursor({ x, y, action = 'click', label, click = true } = {}) {
     if (window.top !== window) return false;
     if (typeof x !== 'number' || typeof y !== 'number') return false;
@@ -463,6 +467,13 @@ var OB = globalThis.OB || (globalThis.OB = {});
     const el = ensureCursor();
     if (!el) return false;
 
+    // Travel time proportional to distance. A fixed duration reads as
+    // teleporting on a cross-page move and as sluggish on a nearby one;
+    // clamped so short hops still register as movement and long sweeps stay
+    // brisk. Under prefers-reduced-motion the stylesheet forces the transition
+    // off, and this inline duration — deliberately not `!important` — loses to
+    // it, which is the desired outcome.
+    let travelMs = 0;
     if (first) {
       // Nothing to travel from on the very first placement of a fresh document.
       el.style.transition = 'none';
@@ -471,6 +482,9 @@ var OB = globalThis.OB || (globalThis.OB = {});
       void el.offsetWidth;
       el.style.transition = '';
     } else {
+      const dist = Math.hypot(x - cursorPos.x, y - cursorPos.y);
+      travelMs = dist < 2 ? 0 : Math.round(Math.min(600, 120 + dist * 0.45));
+      el.style.transitionDuration = `${travelMs}ms`;
       el.style.setProperty('--ob-x', `${x}px`);
       el.style.setProperty('--ob-y', `${y}px`);
     }
@@ -486,23 +500,40 @@ var OB = globalThis.OB || (globalThis.OB = {});
       pill.classList.add('ob-cursor-label-show');
     }
 
+    // The press and ripple mark *contact*, so they wait for the travel to end —
+    // fired at send time they play mid-flight and the ring lands nowhere. A
+    // newer move supersedes a pending mark rather than stacking on top of it.
+    if (cursorArrival) {
+      clearTimeout(cursorArrival);
+      cursorArrival = null;
+    }
     if (click) {
-      el.classList.remove('ob-cursor-press');
-      void el.offsetWidth;
-      el.classList.add('ob-cursor-press');
+      const mark = () => {
+        cursorArrival = null;
+        if (!el.isConnected) return;
+        el.classList.remove('ob-cursor-press');
+        void el.offsetWidth;
+        el.classList.add('ob-cursor-press');
 
-      const ripple = el.querySelector('.ob-cursor-ripple');
-      if (ripple) {
-        ripple.classList.remove('ob-cursor-ripple-go');
-        void ripple.offsetWidth;
-        ripple.classList.add('ob-cursor-ripple-go');
-      }
+        const ripple = el.querySelector('.ob-cursor-ripple');
+        if (ripple) {
+          ripple.classList.remove('ob-cursor-ripple-go');
+          void ripple.offsetWidth;
+          ripple.classList.add('ob-cursor-ripple-go');
+        }
+      };
+      if (travelMs > 0) cursorArrival = setTimeout(mark, travelMs);
+      else mark();
     }
     return true;
   }
 
   /** Remove the cursor — the session that was driving this tab has stopped. */
   function hideCursor() {
+    if (cursorArrival) {
+      clearTimeout(cursorArrival);
+      cursorArrival = null;
+    }
     cursorEl?.remove();
     cursorEl = null;
     cursorPos = null;

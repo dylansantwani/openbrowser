@@ -420,9 +420,73 @@ function agentFrameLabel(tabId) {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   agentLabels.delete(tabId);
+  navCommits.delete(tabId);
   // The saved screenshot mapping dies with the tab; without this its
   // session-storage entry would leak for the life of the browser.
   clearCaptureGeometry(tabId);
+  // So does the pointer's remembered position.
+  mutateStored(CURSOR_POS_KEY, (all) => {
+    delete all[tabId];
+  }).catch(() => {});
+});
+
+/**
+ * Main-frame navigation commits, newest per tab.
+ *
+ * Two consumers. `withDelta` reads it to catch a click whose navigation commits
+ * *after* the settle window: reading the tab's URL back too early reported real
+ * navigations as UNVERIFIED — the exact false negative the URL fallback exists
+ * to prevent, on the most common click there is. An event record has no such
+ * timing window. The redraw listener below uses the same event stream to put
+ * the driving frame and the live cursor back on the new document, which
+ * otherwise stay gone until the next tool call.
+ *
+ * In-memory is correct here: a withDelta spans one worker invocation, and the
+ * redraw is best-effort decoration. Optional-chained because the unit-test stub
+ * models only what the tests drive.
+ */
+const navCommits = new Map();
+
+chrome.webNavigation?.onCommitted?.addListener((details) => {
+  if (details.frameId !== 0) return;
+  navCommits.set(details.tabId, { url: details.url, at: Date.now() });
+});
+
+/** The newest main-frame commit for a tab at or after time `t`, or null. */
+function navSince(tabId, t) {
+  const nav = navCommits.get(tabId);
+  return nav && nav.at >= t ? nav : null;
+}
+
+/**
+ * Put the overlays back on a fresh document.
+ *
+ * A navigation throws the old document away along with the driving frame and
+ * the cursor, and the next tool call redraws them — but between the two the tab
+ * looks undriven and the pointer vanishes, which on a click-navigate-click loop
+ * is most of the run. `agentLabels` is in-memory best-effort, so after an MV3
+ * restart the redraw resumes on the next call rather than here; that is the
+ * accepted cost of not persisting a name that could go stale.
+ */
+chrome.webNavigation?.onDOMContentLoaded?.addListener(async (details) => {
+  if (details.frameId !== 0 || !agentLabels.has(details.tabId)) return;
+  const tabId = details.tabId;
+  try {
+    const settings = await getSettings();
+    if (settings.showAgentBadge !== false) {
+      frames
+        .sendToTab(tabId, 'agent_frame', { on: true, label: agentFrameLabel(tabId) })
+        .catch(() => {});
+    }
+    if (settings.showCursor !== false) {
+      const pos = ((await chrome.storage.session.get(CURSOR_POS_KEY))[CURSOR_POS_KEY] || {})[tabId];
+      // Reseed silently — no ripple, no pill. Nothing happened; the pointer is
+      // simply still where it was.
+      if (pos) frames.sendToTab(tabId, 'cursor', { x: pos.x, y: pos.y, action: '', click: false }).catch(() => {});
+    }
+  } catch {
+    // Decoration. Never let it surface anywhere.
+  }
 });
 
 /**
@@ -436,6 +500,13 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 function showCursor(tabId, settings, opts) {
   if (settings.showCursor === false) return;
   frames.sendToTab(tabId, 'cursor', opts).catch(() => {});
+  // Remember where the pointer is, so the post-navigation redraw can put it
+  // back on the new document instead of losing it until the next action.
+  if (typeof opts.x === 'number' && typeof opts.y === 'number') {
+    mutateStored(CURSOR_POS_KEY, (all) => {
+      all[tabId] = { x: Math.round(opts.x), y: Math.round(opts.y) };
+    }).catch(() => {});
+  }
 }
 
 /** A short human label for the cursor pill: the target's name, else the verb. */
@@ -456,6 +527,9 @@ const CREATED_TABS_KEY = 'createdTabs';
 
 /** Tabs each session last worked on, opened by it or not. Most recent first. */
 const RECENT_TABS_KEY = 'recentTabs';
+
+/** Last cursor position per tab, so the pointer survives a navigation. */
+const CURSOR_POS_KEY = 'cursorPos';
 
 /**
  * Serialised, one queue per storage key.
@@ -565,6 +639,12 @@ async function endSession(sessionId) {
   for (const tabId of new Set([...ids, ...recent])) {
     agentLabels.delete(tabId);
     frames.sendToTab(tabId, 'agent_frame', { on: false }).catch(() => {});
+    // The frame teardown also removes the cursor; forget its position too, or
+    // a tab that outlives the session redraws a ghost pointer on its next
+    // navigation while another session is driving it.
+    mutateStored(CURSOR_POS_KEY, (all) => {
+      delete all[tabId];
+    }).catch(() => {});
   }
 
   const settings = await getSettings();
@@ -720,6 +800,9 @@ async function pageMeta(tabId) {
 const DELTA_BUDGET_MS = 3000;
 
 async function withDelta(tabId, fn) {
+  // When the action began, so a navigation that commits during it — however
+  // late — is attributable to it via the `navCommits` record.
+  const startedAt = Date.now();
   // Tab ids before the action, so one that appears during it can be reported.
   // A click on a `target="_blank"` link otherwise looks like it did nothing:
   // no error, no delta, and the thing the agent wanted sitting in a tab it was
@@ -767,12 +850,20 @@ async function withDelta(tabId, fn) {
   // snapshot above runs before its content script is ready and throws, leaving
   // `changed` empty. Without this a click that navigated is reported as "no page
   // change detected" — the exact false negative the settling note exists to
-  // avoid, and worst on the most common click of all. The tab's own URL is the
-  // ground truth the diff could not reach.
+  // avoid, and worst on the most common click of all. The commit record is
+  // preferred over comparing the tab's URL: a URL read back here can still be
+  // the *old* one for a navigation that has started but not committed, which is
+  // how a verified-live fix regressed into the same false negative it fixed.
   if (!changed) {
-    const afterUrl = (await chrome.tabs.get(tabId).catch(() => null))?.url;
-    if (afterUrl && beforeUrl && afterUrl !== beforeUrl) {
-      changed = `navigated to ${fmt.shortUrl(afterUrl)}`;
+    const nav = navSince(tabId, startedAt);
+    if (nav) {
+      changed = `navigated to ${fmt.shortUrl(nav.url)}`;
+    } else {
+      const after = await chrome.tabs.get(tabId).catch(() => null);
+      const afterUrl = after?.pendingUrl || after?.url;
+      if (afterUrl && beforeUrl && afterUrl !== beforeUrl) {
+        changed = `navigated to ${fmt.shortUrl(afterUrl)}`;
+      }
     }
   }
   if (opened.length) {
@@ -781,7 +872,7 @@ async function withDelta(tabId, fn) {
     changed = changed ? `${note}\n${changed}` : note;
   }
 
-  return { result, changed };
+  return { result, changed, startedAt };
 }
 
 /**
@@ -1405,7 +1496,7 @@ const HANDLERS = {
       click: action !== 'hover',
     });
 
-    const { changed } = await withDelta(tabId, async () => {
+    const { changed, startedAt } = await withDelta(tabId, async () => {
       const { x, y } = target.point;
       const opts = { modifiers: args.modifiers || [] };
 
@@ -1458,7 +1549,16 @@ const HANDLERS = {
     // content-script call would hang forever instead of reporting anything.
     const dlg = cdp.pendingDialog(tabId);
     const nothingHappened = !changed || fmt.isFocusOnly(changed);
-    const note = nothingHappened && action !== 'hover' && !dlg ? await settlingNote(tabId) : null;
+    let note = nothingHappened && action !== 'hover' && !dlg ? await settlingNote(tabId) : null;
+
+    // The settling probe waits another 500ms, which is long enough for a slow
+    // navigation to commit — check once more before calling the click
+    // unverified, or a click that worked is reported as one that may have
+    // missed and the agent retries it on a page that already changed.
+    if (note && /^UNVERIFIED/.test(note)) {
+      const nav = navSince(tabId, startedAt);
+      if (nav) note = `navigated to ${fmt.shortUrl(nav.url)}`;
+    }
 
     let label2 = label;
     if (dlg) {

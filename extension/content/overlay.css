@@ -73,8 +73,34 @@
   padding: 0 !important;
   /* Driven by JS through --ob-x/--ob-y; transitioned, so deliberately soft. */
   transform: translate3d(var(--ob-x, -100px), var(--ob-y, -100px), 0);
-  transition: transform 0.24s cubic-bezier(0.22, 0.61, 0.36, 1) !important;
+  /*
+   * NOT `!important`, and the duration is only a fallback: an `!important`
+   * transition here outranks the inline `transition: none` the script uses to
+   * place a fresh document's pointer silently — so every navigation had the
+   * cursor visibly flying in from off-screen — and it equally outranks the
+   * per-move `transition-duration` that scales travel time to distance. Same
+   * cascade trap as the animated properties below, same rule: anything the
+   * script or a keyframe drives stays unforced.
+   */
+  transition: transform 0.24s cubic-bezier(0.22, 0.61, 0.36, 1);
   will-change: transform !important;
+}
+
+/*
+ * A soft halo behind the pointer. The arrow alone disappears against busy
+ * pages; a translucent disc in the accent colour keeps the pointer findable
+ * without shouting. Centred on the tip, i.e. the exact click point.
+ */
+.ob-cursor-halo {
+  position: absolute !important;
+  top: 0 !important;
+  left: 0 !important;
+  width: 30px !important;
+  height: 30px !important;
+  margin: -15px 0 0 -15px !important;
+  border-radius: 50% !important;
+  background: rgba(47, 111, 237, 0.16) !important;
+  box-shadow: 0 0 0 1px rgba(47, 111, 237, 0.28), 0 0 12px rgba(47, 111, 237, 0.35) !important;
 }
 
 /* The pointer graphic. Its SVG tip sits at (0,0), i.e. exactly the click point. */

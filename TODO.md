@@ -9,6 +9,31 @@ Ordered by how much pain it removes per unit of work.
 **Status legend:** 🔴 not started · 🟡 built, not yet verified against the real
 extension · ✅ verified live.
 
+## 0. The 1.1.0 visibility + UI rework 🟡 built, tested, needs an extension reload to verify live
+
+Four things shipped together (2026-08-31); unit tests (257), the browser a11y
+suite (73), and the overlay self-checks (12) all pass. Reload the extension at
+`chrome://extensions` to see any of it.
+
+- **Navigation clicks are no longer reported UNVERIFIED.** The URL read-back in
+  `withDelta` raced the navigation commit; verdicts now consult a
+  `webNavigation.onCommitted` record (`navSince`), checked both in the fallback
+  and again after the settling probe. See "A URL read back after a click can
+  still be the old one" in CLAUDE.md.
+- **The cursor and the driving frame survive navigation.** Position stored per
+  tab; both overlays are re-drawn on `onDOMContentLoaded`. Previously both
+  vanished between a navigation and the next call — most of a
+  click-navigate-click run.
+- **Cursor feel.** Distance-scaled travel, press/ripple on arrival, a soft halo
+  so the pointer is findable on busy pages — and a cascade bug fixed where the
+  `!important` stylesheet transition silently disabled the silent-first-placement
+  and per-move duration (`.ob-cursor` is also in `OWN_DECORATION` now, or every
+  travelled click polluted the settling signal).
+- **Side panel + settings redesigned.** Panel leads with an Agents view (which
+  session drives which tabs, from the ⚡ tab groups), then Activity and Tools;
+  settings page is a System Settings-style grouped list. Both share one token
+  set in `panel.css`, light and dark.
+
 ## 1. Native dialogs freeze everything ✅ fixed, verified live
 
 **What happened.** Reported from real use: leaving a page with unsaved changes

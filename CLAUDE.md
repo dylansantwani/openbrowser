@@ -576,10 +576,43 @@ lands on, rings on contact, and persists between actions — the only feedback a
 `coordinate` click gets, since it has no element to outline (`highlight` needs a
 ref). `showCursor` in `router.js` fires it fire-and-forget to the top frame from
 `browser_act` and the typing path; `agentFrame(false)` tears it down with the
-"driving" frame at session end. It obeys `overlay.css`'s cascade rule — the
-travel transform and the ripple/press/label are the properties left
-un-`!important`, because a forced value outranks the transition or keyframe and
-freezes it looking wired-up. Gated by the `showCursor` setting (default on).
+"driving" frame at session end. Four behaviors are deliberate:
+
+- **Travel time scales with distance** (clamped ~140–600ms), and the press +
+  ripple fire on *arrival*, not at send time — a ring played mid-flight lands
+  nowhere. A newer move supersedes a pending ring.
+- **It survives navigation.** `showCursor` records the position per tab
+  (`CURSOR_POS_KEY`, session storage), and the `webNavigation.onDOMContentLoaded`
+  listener in `router.js` reseeds the pointer — silently, no ripple, no pill —
+  and re-draws the driving frame on the new document. Without this both overlays
+  vanished between a navigation and the next tool call, which on a
+  click-navigate-click loop is most of the run.
+- **It is in `OWN_DECORATION`** (`a11y.js`). It animates *between* actions, and
+  its arrival-timed ripple lands inside the settling probe's window — unlisted,
+  every travelled click reported "the page is still changing".
+- **The cascade rule applies to the `transition` property itself.** The
+  stylesheet transition shipped `!important` once, which silently outranked both
+  the inline `transition: none` used for silent first placement (the cursor flew
+  in from off-screen on every fresh document) and the per-move
+  `transition-duration`. The travel transform, the transition, and the
+  ripple/press/label are the properties left un-`!important`.
+
+Gated by the `showCursor` setting (default on). `test/overlay-preview.html`
+self-checks all of it, including that scaling and arrival timing actually run.
+
+**A URL read back after a click can still be the old one.** The withDelta
+fallback compared the tab's URL before and after the action to catch
+navigations the snapshot diff missed — and a cross-origin navigation often has
+not *committed* by the time that read runs, so the most common click there is
+was reported `UNVERIFIED: no page change was detected` while the result header
+(rendered later) cheerfully showed the new URL. This regressed once even after
+being "fixed and verified live", because the fix was still a read-back with a
+smaller window. The verdict now consults an event record instead: a top-level
+`webNavigation.onCommitted` listener stamps `navCommits` per tab, `withDelta`
+checks it (`navSince`) with no timing window at all, and `browser_act` rechecks
+it once more after the settling probe's 500ms wait before calling anything
+unverified. If you touch outcome reporting, keep both checks; `test/run.mjs`
+asserts they exist.
 
 **`element.click()` is ignored by serious sites.** It produces `isTrusted:
 false`. Everything pointer-related goes through CDP's Input domain for this
@@ -602,8 +635,11 @@ extension/
     windows.js        which window a session works in; the in-browser chooser
     bridge.js         WebSocket client + reconnection + MV3 keepalive
   content/            injected into every frame
-  sidepanel/          the UI — calls the same dispatch() as MCP
-  options/            settings
+  sidepanel/          the UI — calls the same dispatch() as MCP. The Agents view
+                      is built from Chrome's own tab groups (the "⚡ " title
+                      prefix), so it needs no worker round-trip and stays right
+                      while the worker sleeps.
+  options/            settings — shares panel.css tokens; System Settings style
 
 mcp-server/src/
   ws.js               hand-rolled RFC 6455

@@ -480,7 +480,15 @@ var OB = globalThis.OB || (globalThis.OB = {});
    * about the agent, and an agent that could find its buttons in a snapshot
    * could answer on their behalf.
    */
-  const OWN_DECORATION = '.ob-highlight, .ob-agent-frame, .ob-window-pick';
+  /*
+   * `.ob-cursor` is the live pointer. It is the only overlay that persists and
+   * animates *between* actions — travel, press, ripple, and label are all class
+   * and style mutations on it — so leaving it out makes every cursor move count
+   * as page activity. The press/ripple deliberately fire on pointer *arrival*,
+   * which lands inside the settling probe's window: without this entry, every
+   * click with a travel distance reports "the page is still changing".
+   */
+  const OWN_DECORATION = '.ob-highlight, .ob-agent-frame, .ob-window-pick, .ob-cursor';
 
   function isDecoration(node) {
     const el = node?.nodeType === 1 ? node : node?.parentElement;

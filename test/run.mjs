@@ -1748,6 +1748,23 @@ async function testBackgroundInputInvariants() {
   check('focus emulation is diagnostic and default-off', /emulateFocus: false/.test(settings));
   check('model-controlled group never replaces stamped session identity', !/args\.group \|\| args\._session/.test(router));
 
+  // A click whose navigation commits after the settle window must not be
+  // reported UNVERIFIED — the URL read-back races the commit, so the verdict
+  // has to consult the webNavigation commit record, in both places a verdict
+  // is formed: the withDelta fallback and the post-settling-probe recheck.
+  check('withDelta consults the navigation-commit record',
+    /const nav = navSince\(tabId, startedAt\);/.test(router) && /onCommitted/.test(router));
+  check('an UNVERIFIED verdict is rechecked against late commits',
+    /\/\^UNVERIFIED\/\.test\(note\)/.test(router));
+  // The driving frame and the live cursor go down with every old document; the
+  // redraw listener puts them back so a tab does not look undriven (and the
+  // pointer does not vanish) between a navigation and the next tool call.
+  check('overlays are redrawn on the new document after a navigation',
+    /onDOMContentLoaded/.test(router) && /CURSOR_POS_KEY/.test(router));
+  check('the cursor position is remembered per tab and cleaned up with it',
+    /all\[tabId\] = \{ x: Math\.round\(opts\.x\), y: Math\.round\(opts\.y\) \}/.test(router) &&
+      (router.match(/delete all\[tabId\]/g) || []).length >= 2);
+
   const { serializeTabMutation } = await importFrom('extension', 'background', 'mutation-queue.js');
   const order = [];
   await Promise.all([

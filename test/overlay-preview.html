@@ -143,18 +143,33 @@
   let cursorEl = null;
   let cursorPos = null;
 
+  let cursorArrival = null;
+
   function moveCursor(x, y, label, click = true) {
     if (!cursorEl) {
       cursorEl = document.createElement('div');
       cursorEl.className = 'ob-cursor';
-      cursorEl.innerHTML = `${CURSOR_SVG}<span class="ob-cursor-ripple"></span><span class="ob-cursor-label"></span>`;
+      cursorEl.innerHTML =
+        `<span class="ob-cursor-halo"></span>${CURSOR_SVG}` +
+        '<span class="ob-cursor-ripple"></span><span class="ob-cursor-label"></span>';
       document.body.appendChild(cursorEl);
     }
     const first = !cursorPos;
-    if (first) cursorEl.style.transition = 'none';
-    cursorEl.style.setProperty('--ob-x', `${x}px`);
-    cursorEl.style.setProperty('--ob-y', `${y}px`);
-    if (first) { void cursorEl.offsetWidth; cursorEl.style.transition = ''; }
+    let travelMs = 0;
+    if (first) {
+      cursorEl.style.transition = 'none';
+      cursorEl.style.setProperty('--ob-x', `${x}px`);
+      cursorEl.style.setProperty('--ob-y', `${y}px`);
+      void cursorEl.offsetWidth;
+      cursorEl.style.transition = '';
+    } else {
+      // Travel time scales with distance, exactly as in actions.js.
+      const dist = Math.hypot(x - cursorPos.x, y - cursorPos.y);
+      travelMs = dist < 2 ? 0 : Math.round(Math.min(600, 120 + dist * 0.45));
+      cursorEl.style.transitionDuration = `${travelMs}ms`;
+      cursorEl.style.setProperty('--ob-x', `${x}px`);
+      cursorEl.style.setProperty('--ob-y', `${y}px`);
+    }
     cursorPos = { x, y };
 
     const pill = cursorEl.querySelector('.ob-cursor-label');
@@ -163,15 +178,22 @@
     void pill.offsetWidth;
     pill.classList.add('ob-cursor-label-show');
 
+    if (cursorArrival) { clearTimeout(cursorArrival); cursorArrival = null; }
     if (click) {
-      cursorEl.classList.remove('ob-cursor-press');
-      void cursorEl.offsetWidth;
-      cursorEl.classList.add('ob-cursor-press');
-      const ripple = cursorEl.querySelector('.ob-cursor-ripple');
-      ripple.classList.remove('ob-cursor-ripple-go');
-      void ripple.offsetWidth;
-      ripple.classList.add('ob-cursor-ripple-go');
+      const mark = () => {
+        cursorArrival = null;
+        cursorEl.classList.remove('ob-cursor-press');
+        void cursorEl.offsetWidth;
+        cursorEl.classList.add('ob-cursor-press');
+        const ripple = cursorEl.querySelector('.ob-cursor-ripple');
+        ripple.classList.remove('ob-cursor-ripple-go');
+        void ripple.offsetWidth;
+        ripple.classList.add('ob-cursor-ripple-go');
+      };
+      if (travelMs > 0) cursorArrival = setTimeout(mark, travelMs);
+      else mark();
     }
+    return travelMs;
   }
 
   const log = (m) => { document.getElementById('log').textContent = m; };
@@ -205,7 +227,7 @@
    * genuinely there. The only proof is that the computed value changes across
    * the cycle, so that is what this samples.
    */
-  function selfCheck() {
+  async function selfCheck() {
     const results = [];
     const el = document.querySelector('.ob-agent-frame');
     const anim = el.getAnimations()[0];
@@ -262,8 +284,8 @@
      * up. So this proves the pointer actually moves, rings, and never eats a
      * click — by reading computed values, not by trusting the markup.
      */
-    moveCursor(120, 140, 'first', false); // seed without travel
-    moveCursor(360, 260, 'click');        // this move should animate
+    moveCursor(120, 140, 'first', false);        // seed without travel
+    const travelMs = moveCursor(360, 260, 'click'); // this move should animate
     const cur = document.querySelector('.ob-cursor');
     const cs = getComputedStyle(cur);
     results.push([
@@ -274,15 +296,35 @@
       cs.transitionDuration !== '0s' ? 'ok' : 'FAIL',
       `travel is a transition, not a jump (${cs.transitionDuration})`,
     ]);
+    // The inline per-move duration must actually win. This is the cascade trap
+    // again from the other side: while the stylesheet's transition carried
+    // `!important`, both the silent first placement and this scaling were
+    // silently inert — everything looked wired up and nothing obeyed the script.
+    results.push([
+      travelMs > 0 && cs.transitionDuration === `${travelMs / 1000}s` ? 'ok' : 'FAIL',
+      `travel time scales with distance (${travelMs}ms for this move)`,
+    ]);
     const travelling = cur.getAnimations().some((a) => a instanceof CSSTransition && a.transitionProperty === 'transform');
     results.push([
       travelling ? 'ok' : 'FAIL',
       'the move animates transform rather than snapping',
     ]);
+    const halo = document.querySelector('.ob-cursor-halo');
+    results.push([
+      halo && getComputedStyle(halo).backgroundColor.startsWith('rgba(47, 111, 237') ? 'ok' : 'FAIL',
+      'the halo keeps the pointer findable on busy pages',
+    ]);
+    // The press and ripple mark contact, so they must NOT fire while the
+    // pointer is still travelling — and must fire once it lands.
     const ripple = document.querySelector('.ob-cursor-ripple');
     results.push([
+      ripple.getAnimations().length === 0 ? 'ok' : 'FAIL',
+      'the ripple holds until the pointer arrives',
+    ]);
+    await new Promise((r) => setTimeout(r, travelMs + 80));
+    results.push([
       ripple.getAnimations().length > 0 ? 'ok' : 'FAIL',
-      'the click rings a ripple at the tip',
+      'the click rings a ripple on contact',
     ]);
     // Jump the travel to its end, then confirm the pointer landed on the point:
     // the SVG's tip is authored at (0,0), so the arrow's top-left is the click.

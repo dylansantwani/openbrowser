@@ -1,6 +1,6 @@
 {
   "name": "openbrowser",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Open-source browser automation for AI agents: a Chrome extension with a side-panel UI, plus a zero-dependency MCP server.",
   "type": "module",
   "license": "MIT",

@@ -135,7 +135,9 @@ function flashSaved() {
 }
 
 (async function init() {
-  $('#version').textContent = `v${chrome.runtime.getManifest().version}`;
+  // Optional-chained so the page also renders under `npm run preview`, where
+  // Chrome defines a bare `window.chrome` with none of the extension APIs.
+  $('#version').textContent = `v${chrome.runtime?.getManifest?.().version ?? '—'}`;
 
   try {
     const status = await call('get_status');
@@ -185,7 +187,7 @@ function flashSaved() {
     }
   });
 
-  chrome.runtime.onMessage.addListener((msg) => {
+  chrome.runtime?.onMessage?.addListener((msg) => {
     if (msg?.type === 'bridge_status') renderStatus(msg.status);
   });
 })();

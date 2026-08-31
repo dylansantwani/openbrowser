@@ -74,60 +74,132 @@ function renderStatus() {
   $('#stat-errors').textContent = stats?.errors ?? 0;
 }
 
-async function renderTabs() {
-  const tabs = await chrome.tabs.query({});
-  const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-  const list = $('#tab-list');
+/**
+ * The Agents view: which sessions are driving which tabs, live.
+ *
+ * Built from Chrome's own tab groups rather than a new message to the worker —
+ * every agent workstream is a group titled with the `⚡ ` prefix (groups.js),
+ * so the panel can answer "what is happening in my browser" from the tab strip
+ * the agent already maintains, and stays correct even while the worker sleeps.
+ */
+const AGENT_PREFIX = '⚡ ';
 
-  if (!tabs.length) {
-    list.innerHTML = '<li class="empty">No tabs open.</li>';
-    return;
+/** Chrome tab-group colors → swatches that read on both themes. */
+const GROUP_COLORS = {
+  grey: '#8e8e93',
+  blue: '#2f6fed',
+  red: '#ff453a',
+  yellow: '#ffd60a',
+  green: '#30d158',
+  pink: '#ff6482',
+  purple: '#bf5af2',
+  cyan: '#64d2ff',
+  orange: '#ff9f0a',
+};
+
+async function renderAgents() {
+  const list = $('#agents-list');
+  const empty = $('#agents-empty');
+
+  let groups = [];
+  try {
+    groups = (await chrome.tabGroups.query({})).filter((g) => g.title?.startsWith(AGENT_PREFIX));
+  } catch {
+    /* tabGroups can be briefly unavailable during startup */
   }
 
-  list.replaceChildren(
-    ...tabs.map((tab) => {
-      const li = document.createElement('li');
-      li.className = `tab-item${tab.id === active?.id ? ' is-active' : ''}`;
-      li.title = tab.url || '';
+  if (!groups.length) {
+    empty.hidden = false;
+    list.replaceChildren();
+    return;
+  }
+  empty.hidden = true;
 
-      const body = document.createElement('div');
-      body.className = 'tab-item-body';
+  const cards = await Promise.all(
+    groups.map(async (group) => {
+      const tabs = await chrome.tabs.query({ groupId: group.id }).catch(() => []);
 
-      const title = document.createElement('div');
-      title.className = 'tab-item-title';
-      title.textContent = tab.title || '(untitled)';
+      const card = document.createElement('div');
+      card.className = 'agent-card';
 
-      const url = document.createElement('div');
-      url.className = 'tab-item-url';
-      url.textContent = shortUrl(tab.url || tab.pendingUrl || '');
+      const head = document.createElement('div');
+      head.className = 'agent-head';
 
-      body.append(title, url);
+      const dot = document.createElement('span');
+      dot.className = 'agent-dot';
+      dot.style.background = GROUP_COLORS[group.color] || GROUP_COLORS.grey;
 
-      const id = document.createElement('span');
-      id.className = 'tab-item-id';
-      id.textContent = tab.id;
+      const name = document.createElement('span');
+      name.className = 'agent-name';
+      name.textContent = group.title.slice(AGENT_PREFIX.length);
 
-      const close = document.createElement('button');
-      close.className = 'tab-close';
-      close.type = 'button';
-      close.textContent = '✕';
-      close.title = 'Close tab';
-      close.addEventListener('click', async (event) => {
-        event.stopPropagation();
-        await chrome.tabs.remove(tab.id);
-        renderTabs();
-      });
+      const count = document.createElement('span');
+      count.className = 'agent-count';
+      count.textContent = `${tabs.length} tab${tabs.length === 1 ? '' : 's'}`;
 
-      li.append(id, body, close);
-      li.addEventListener('click', async () => {
-        await chrome.tabs.update(tab.id, { active: true });
-        await chrome.windows.update(tab.windowId, { focused: true });
-        renderTabs();
-      });
+      head.append(dot, name, count);
 
-      return li;
+      const ul = document.createElement('ul');
+      ul.className = 'agent-tabs';
+
+      for (const tab of tabs) {
+        const li = document.createElement('li');
+        li.className = 'agent-tab';
+        li.title = tab.url || '';
+
+        const host = shortUrl(tab.url || tab.pendingUrl || '');
+        let fav;
+        if (tab.favIconUrl && /^https?:/.test(tab.favIconUrl)) {
+          fav = document.createElement('img');
+          fav.className = 'tab-fav';
+          fav.src = tab.favIconUrl;
+          fav.alt = '';
+        } else {
+          fav = document.createElement('span');
+          fav.className = 'tab-fav tab-fav--letter';
+          fav.textContent = (host[0] || '?').toUpperCase();
+        }
+
+        const text = document.createElement('div');
+        text.className = 'tab-text';
+
+        const title = document.createElement('div');
+        title.className = 'tab-title';
+        title.textContent = tab.title || '(untitled)';
+
+        const url = document.createElement('div');
+        url.className = 'tab-host';
+        url.textContent = host;
+
+        text.append(title, url);
+        li.append(fav, text);
+
+        // A human clicking a row is the deliberate "show me" — the one case
+        // where bringing an agent's window forward is the point.
+        li.addEventListener('click', async () => {
+          await chrome.tabs.update(tab.id, { active: true }).catch(() => {});
+          await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
+        });
+
+        ul.appendChild(li);
+      }
+
+      card.append(head, ul);
+      return card;
     })
   );
+
+  list.replaceChildren(...cards);
+}
+
+/** Coalesce the burst of tab events an agent produces into one re-render. */
+let agentsTimer = null;
+function scheduleAgents() {
+  if (agentsTimer) return;
+  agentsTimer = setTimeout(() => {
+    agentsTimer = null;
+    renderAgents();
+  }, 250);
 }
 
 function renderActivity() {
@@ -135,7 +207,7 @@ function renderActivity() {
   const entries = state.activity.slice().reverse();
 
   if (!entries.length) {
-    list.innerHTML = '<li class="empty">Nothing yet. Tool calls will appear here as they run.</li>';
+    list.innerHTML = '<li class="empty-row">Tool calls appear here as they run.</li>';
     return;
   }
 
@@ -175,7 +247,7 @@ function renderMacros() {
   const list = $('#macro-list');
 
   if (!state.macros.length) {
-    list.innerHTML = '<li class="empty">No macros saved yet.</li>';
+    list.innerHTML = '<li class="empty-row">No macros saved yet.</li>';
     return;
   }
 
@@ -198,7 +270,7 @@ function renderMacros() {
       body.append(name, desc);
 
       const run = document.createElement('button');
-      run.className = 'btn btn--sm';
+      run.className = 'btn';
       run.type = 'button';
       run.textContent = 'Run';
       run.addEventListener('click', () =>
@@ -206,7 +278,7 @@ function renderMacros() {
       );
 
       const del = document.createElement('button');
-      del.className = 'btn btn--ghost btn--sm';
+      del.className = 'link-btn';
       del.type = 'button';
       del.textContent = 'Delete';
       del.addEventListener('click', async () => {
@@ -282,14 +354,14 @@ async function withOutput(title, fn) {
 
 function wire() {
   // View switching.
-  $$('.tab').forEach((tab) => {
-    tab.addEventListener('click', () => {
-      $$('.tab').forEach((t) => {
-        const on = t === tab;
-        t.classList.toggle('is-active', on);
-        t.setAttribute('aria-selected', String(on));
+  $$('.seg').forEach((seg) => {
+    seg.addEventListener('click', () => {
+      $$('.seg').forEach((s) => {
+        const on = s === seg;
+        s.classList.toggle('is-active', on);
+        s.setAttribute('aria-selected', String(on));
       });
-      $$('.view').forEach((v) => v.classList.toggle('is-active', v.id === `view-${tab.dataset.view}`));
+      $$('.view').forEach((v) => v.classList.toggle('is-active', v.id === `view-${seg.dataset.view}`));
     });
   });
 
@@ -299,8 +371,6 @@ function wire() {
     renderStatus();
   });
 
-  $('#refresh-tabs').addEventListener('click', renderTabs);
-
   $('#open-tab-form').addEventListener('submit', async (event) => {
     event.preventDefault();
     const input = $('#new-tab-url');
@@ -308,7 +378,6 @@ function wire() {
     if (!url) return;
     await withOutput('Open tab', () => runTool('browser_tabs', { action: 'new', url }));
     input.value = '';
-    renderTabs();
   });
 
   $('#find-form').addEventListener('submit', (event) => {
@@ -379,10 +448,12 @@ function wire() {
     $('#stat-attached').textContent = '0 tabs';
   });
 
-  $('#open-options').addEventListener('click', () => chrome.runtime.openOptionsPage());
+  $('#open-options').addEventListener('click', () => chrome.runtime?.openOptionsPage?.());
 
-  // Live updates pushed from the service worker.
-  chrome.runtime.onMessage.addListener((msg) => {
+  // Live updates pushed from the service worker. Optional-chained (as are the
+  // tab events below) so the page also renders under `npm run preview`, where
+  // Chrome defines a bare `window.chrome` with none of the extension APIs.
+  chrome.runtime?.onMessage?.addListener((msg) => {
     if (msg?.type === 'bridge_status') {
       state.bridge = msg.status;
       renderStatus();
@@ -393,11 +464,14 @@ function wire() {
     }
   });
 
-  chrome.tabs.onCreated.addListener(renderTabs);
-  chrome.tabs.onRemoved.addListener(renderTabs);
-  chrome.tabs.onUpdated.addListener((_id, info) => {
-    if (info.status === 'complete' || info.title) renderTabs();
+  chrome.tabs?.onCreated?.addListener(scheduleAgents);
+  chrome.tabs?.onRemoved?.addListener(scheduleAgents);
+  chrome.tabs?.onUpdated?.addListener((_id, info) => {
+    if (info.status === 'complete' || info.title || info.groupId != null) scheduleAgents();
   });
+  chrome.tabGroups?.onCreated?.addListener(scheduleAgents);
+  chrome.tabGroups?.onUpdated?.addListener(scheduleAgents);
+  chrome.tabGroups?.onRemoved?.addListener(scheduleAgents);
 }
 
 // -----------------------------------------------------------------------------
@@ -429,7 +503,7 @@ function summarizeArgs(args = {}) {
 (async function init() {
   wire();
   renderToolPicker();
-  $('#version').textContent = `v${chrome.runtime.getManifest().version}`;
+  $('#version').textContent = `v${chrome.runtime?.getManifest?.().version ?? '—'}`;
 
   try {
     state = { ...state, ...(await call('get_status')) };
@@ -445,7 +519,7 @@ function summarizeArgs(args = {}) {
   renderStatus();
   renderActivity();
   renderMacros();
-  renderTabs();
+  renderAgents();
 
   $('#stat-attached').textContent = `${state.attachedTabs?.length ?? 0} tabs`;
 })();

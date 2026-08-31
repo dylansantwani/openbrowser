@@ -10,174 +10,176 @@
     <header class="topbar">
       <div class="brand">
         <span class="logo" aria-hidden="true"></span>
-        <span class="brand-name">OpenBrowser</span>
+        <h1 class="brand-name">OpenBrowser</h1>
       </div>
-      <button
-        id="connection"
-        class="status status--disconnected"
-        type="button"
-        title="Click to connect or disconnect"
-      >
-        <span class="status-dot" aria-hidden="true"></span>
-        <span id="status-text">Disconnected</span>
-      </button>
+      <div class="topbar-actions">
+        <button
+          id="connection"
+          class="status status--disconnected"
+          type="button"
+          title="Click to connect or disconnect"
+        >
+          <span class="status-dot" aria-hidden="true"></span>
+          <span id="status-text">Disconnected</span>
+        </button>
+        <button id="open-options" class="icon-btn" type="button" aria-label="Settings" title="Settings">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path
+              d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Zm7.43-2.53c.04-.32.07-.64.07-.97s-.03-.66-.07-.97l2.11-1.65a.5.5 0 0 0 .12-.64l-2-3.46a.5.5 0 0 0-.61-.22l-2.49 1a7.3 7.3 0 0 0-1.69-.98l-.38-2.65A.49.49 0 0 0 14 2h-4a.49.49 0 0 0-.49.42l-.38 2.65c-.61.25-1.17.59-1.69.98l-2.49-1a.5.5 0 0 0-.61.22l-2 3.46a.5.5 0 0 0 .12.64l2.11 1.65c-.04.31-.07.64-.07.97s.03.65.07.97l-2.11 1.65a.5.5 0 0 0-.12.64l2 3.46c.14.24.42.34.61.22l2.49-1c.52.4 1.08.73 1.69.98l.38 2.65c.04.24.24.42.49.42h4c.25 0 .46-.18.49-.42l.38-2.65a7.1 7.1 0 0 0 1.69-.98l2.49 1c.23.09.47 0 .61-.22l2-3.46a.5.5 0 0 0-.12-.64l-2.11-1.65Z"
+              fill="currentColor"
+            />
+          </svg>
+        </button>
+      </div>
     </header>
 
-    <nav class="tabs" role="tablist">
-      <button class="tab is-active" role="tab" data-view="control" aria-selected="true">Control</button>
-      <button class="tab" role="tab" data-view="tools" aria-selected="false">Tools</button>
-      <button class="tab" role="tab" data-view="macros" aria-selected="false">Macros</button>
-      <button class="tab" role="tab" data-view="activity" aria-selected="false">Activity</button>
+    <div id="connection-help" class="callout" hidden>
+      <p><strong>No MCP server on port <span data-port>8848</span>.</strong></p>
+      <p>Point your MCP client at the project, or start it yourself:</p>
+      <code class="snippet">node mcp-server/src/index.js</code>
+      <p class="muted">The extension reconnects on its own once the server is up.</p>
+    </div>
+
+    <nav class="segmented" role="tablist" aria-label="Panel views">
+      <button class="seg is-active" role="tab" data-view="agents" aria-selected="true">Agents</button>
+      <button class="seg" role="tab" data-view="activity" aria-selected="false">Activity</button>
+      <button class="seg" role="tab" data-view="tools" aria-selected="false">Tools</button>
     </nav>
 
     <main>
-      <!-- ─────────────────────────── Control ─────────────────────────── -->
-      <section class="view is-active" id="view-control" role="tabpanel">
-        <div id="connection-help" class="callout callout--warn" hidden>
-          <p><strong>No MCP server found on port <span data-port>8848</span>.</strong></p>
-          <p>
-            Start it from the project directory, or let your MCP client launch it:
+      <!-- ─────────────────────────── Agents ─────────────────────────── -->
+      <section class="view is-active" id="view-agents" role="tabpanel">
+        <div id="agents-empty" class="empty-state" hidden>
+          <div class="empty-icon" aria-hidden="true">
+            <svg width="34" height="34" viewBox="0 0 24 24" fill="none">
+              <path
+                d="M4 5.5A2.5 2.5 0 0 1 6.5 3h11A2.5 2.5 0 0 1 20 5.5v9a2.5 2.5 0 0 1-2.5 2.5H13l-3.6 3.15c-.5.44-1.4.1-1.4-.6V17H6.5A2.5 2.5 0 0 1 4 14.5v-9Z"
+                stroke="currentColor"
+                stroke-width="1.6"
+                stroke-linejoin="round"
+              />
+            </svg>
+          </div>
+          <p class="empty-title">No agents are driving this browser</p>
+          <p class="empty-sub">
+            When an MCP client — Claude Code, opencode, anything that speaks MCP —
+            starts working, its sessions and tabs appear here.
           </p>
-          <code class="snippet">node mcp-server/src/index.js</code>
-          <p class="muted">The extension reconnects on its own once the server is up.</p>
         </div>
+        <div id="agents-list"></div>
+      </section>
 
-        <div class="panel">
-          <div class="panel-head">
-            <h2>Open tabs</h2>
-            <button class="btn btn--ghost btn--sm" id="refresh-tabs" type="button">Refresh</button>
+      <!-- ────────────────────────── Activity ────────────────────────── -->
+      <section class="view" id="view-activity" role="tabpanel">
+        <div class="card">
+          <div class="card-head">
+            <h2>Recent calls</h2>
+            <button class="link-btn" id="clear-activity" type="button">Clear</button>
           </div>
-          <ul class="tab-list" id="tab-list">
-            <li class="empty">Loading…</li>
+          <ul class="rows" id="activity-list">
+            <li class="empty-row">Tool calls appear here as they run.</li>
           </ul>
-          <form class="inline-form" id="open-tab-form">
-            <input
-              type="text"
-              id="new-tab-url"
-              placeholder="Open a URL in a new background tab…"
-              autocomplete="off"
-              spellcheck="false"
-            />
-            <button class="btn btn--primary btn--sm" type="submit">Open</button>
-          </form>
         </div>
 
-        <div class="panel">
-          <div class="panel-head">
-            <h2>Quick actions</h2>
-          </div>
+        <div class="card">
+          <div class="card-head"><h2>Session</h2></div>
+          <dl class="stats">
+            <div><dt>Calls</dt><dd id="stat-calls">0</dd></div>
+            <div><dt>Errors</dt><dd id="stat-errors">0</dd></div>
+            <div><dt>Debugger</dt><dd id="stat-attached">0 tabs</dd></div>
+          </dl>
+          <button class="row-btn row-btn--last" id="detach-all" type="button">
+            Detach debugger from all tabs
+          </button>
+        </div>
+      </section>
+
+      <!-- ─────────────────────────── Tools ──────────────────────────── -->
+      <section class="view" id="view-tools" role="tabpanel">
+        <div class="card">
+          <div class="card-head"><h2>Quick actions</h2></div>
           <div class="quick-grid">
-            <button class="btn" data-quick="snapshot" type="button">Snapshot page</button>
-            <button class="btn" data-quick="screenshot" type="button">Screenshot</button>
-            <button class="btn" data-quick="page_info" type="button">Page info</button>
-            <button class="btn" data-quick="console" type="button">Console</button>
-            <button class="btn" data-quick="network" type="button">Network</button>
-            <button class="btn" data-quick="frames" type="button">Frames</button>
+            <button class="quick" data-quick="snapshot" type="button">Snapshot</button>
+            <button class="quick" data-quick="screenshot" type="button">Screenshot</button>
+            <button class="quick" data-quick="page_info" type="button">Page info</button>
+            <button class="quick" data-quick="console" type="button">Console</button>
+            <button class="quick" data-quick="network" type="button">Network</button>
+            <button class="quick" data-quick="frames" type="button">Frames</button>
           </div>
           <form class="inline-form" id="find-form">
             <input
               type="text"
               id="find-query"
-              placeholder="Find an element — e.g. “sign in button”"
+              placeholder="Find an element — “sign in button”"
               autocomplete="off"
             />
-            <button class="btn btn--primary btn--sm" type="submit">Find</button>
+            <button class="btn btn--primary" type="submit">Find</button>
+          </form>
+          <form class="inline-form" id="open-tab-form">
+            <input
+              type="text"
+              id="new-tab-url"
+              placeholder="Open a URL in a background tab"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <button class="btn btn--primary" type="submit">Open</button>
           </form>
         </div>
 
-        <div class="panel panel--output" id="output-panel" hidden>
-          <div class="panel-head">
-            <h2 id="output-title">Result</h2>
-            <div class="panel-actions">
-              <span class="badge" id="output-meta"></span>
-              <button class="btn btn--ghost btn--sm" id="copy-output" type="button">Copy</button>
-              <button class="btn btn--ghost btn--sm" id="close-output" type="button" aria-label="Close">✕</button>
-            </div>
-          </div>
-          <img id="output-image" alt="" hidden />
-          <pre id="output"></pre>
-        </div>
-      </section>
-
-      <!-- ──────────────────────────── Tools ──────────────────────────── -->
-      <section class="view" id="view-tools" role="tabpanel">
-        <div class="panel">
-          <div class="panel-head">
+        <div class="card">
+          <div class="card-head">
             <h2>Run a tool</h2>
-            <span class="badge">14 available</span>
+            <span class="badge">the same dispatch agents use</span>
           </div>
-          <p class="muted">
-            The same dispatcher your agent uses. Useful for checking what a tool
-            returns before wiring it into a prompt.
-          </p>
-
           <label class="field">
             <span>Tool</span>
             <select id="tool-select"></select>
           </label>
-
           <p class="muted tool-desc" id="tool-desc"></p>
-
           <label class="field">
             <span>Arguments (JSON)</span>
-            <textarea id="tool-args" rows="7" spellcheck="false">{}</textarea>
+            <textarea id="tool-args" rows="6" spellcheck="false">{}</textarea>
           </label>
-
-          <div class="row">
+          <div class="row-gap">
             <button class="btn btn--primary" id="run-tool" type="button">Run</button>
-            <button class="btn btn--ghost" id="insert-tab-id" type="button">Insert active tabId</button>
+            <button class="btn" id="insert-tab-id" type="button">Insert active tabId</button>
           </div>
         </div>
-      </section>
 
-      <!-- ─────────────────────────── Macros ──────────────────────────── -->
-      <section class="view" id="view-macros" role="tabpanel">
-        <div class="panel">
-          <div class="panel-head">
-            <h2>Saved macros</h2>
-          </div>
-          <p class="muted">
-            Replay a saved sequence in one call. Agents create these with
-            <code>browser_macro</code>; you can run and delete them here.
+        <div class="card">
+          <div class="card-head"><h2>Macros</h2></div>
+          <p class="muted card-note">
+            Saved step sequences. Agents create them with <code>browser_macro</code>;
+            run or delete them here.
           </p>
-          <ul class="macro-list" id="macro-list">
-            <li class="empty">No macros saved yet.</li>
+          <ul class="rows" id="macro-list">
+            <li class="empty-row">No macros saved yet.</li>
           </ul>
         </div>
       </section>
 
-      <!-- ────────────────────────── Activity ─────────────────────────── -->
-      <section class="view" id="view-activity" role="tabpanel">
-        <div class="panel">
-          <div class="panel-head">
-            <h2>Recent calls</h2>
-            <button class="btn btn--ghost btn--sm" id="clear-activity" type="button">Clear</button>
+      <!-- ─────────────────────────── Output ─────────────────────────── -->
+      <section class="card output" id="output-panel" hidden>
+        <div class="card-head">
+          <h2 id="output-title">Result</h2>
+          <div class="card-actions">
+            <span class="badge" id="output-meta"></span>
+            <button class="link-btn" id="copy-output" type="button">Copy</button>
+            <button class="icon-btn icon-btn--sm" id="close-output" type="button" aria-label="Close">
+              <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
+                <path d="M2 2l8 8M10 2l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+              </svg>
+            </button>
           </div>
-          <ul class="activity-list" id="activity-list">
-            <li class="empty">Nothing yet. Tool calls will appear here as they run.</li>
-          </ul>
         </div>
-
-        <div class="panel">
-          <div class="panel-head">
-            <h2>Session</h2>
-          </div>
-          <dl class="stats">
-            <div><dt>Calls</dt><dd id="stat-calls">0</dd></div>
-            <div><dt>Errors</dt><dd id="stat-errors">0</dd></div>
-            <div><dt>Debugger attached</dt><dd id="stat-attached">0 tabs</dd></div>
-          </dl>
-          <button class="btn btn--ghost btn--sm" id="detach-all" type="button">
-            Detach debugger from all tabs
-          </button>
-        </div>
+        <img id="output-image" alt="" hidden />
+        <pre id="output"></pre>
       </section>
     </main>
 
     <footer class="footer">
-      <button class="link" id="open-options" type="button">Settings</button>
-      <span class="sep">·</span>
-      <span class="muted" id="version">v1.0.0</span>
+      <span class="muted" id="version"></span>
     </footer>
 
     <script src="panel.js" type="module"></script>
