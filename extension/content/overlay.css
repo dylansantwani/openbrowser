@@ -6,15 +6,23 @@
  * able to make the overlay invisible or, worse, make it intercept clicks.
  */
 
+/*
+ * Two colours carry one meaning each, everywhere the agent draws on a page:
+ *   #2f6fed (action blue) — "the agent is acting *here*, now": the cursor, its
+ *      ripple, and the target highlight. It matches the extension's own UI
+ *      accent, so the on-page marks and the side panel read as one product.
+ *   #f97316 (driving orange) — the ambient "this whole tab is being driven"
+ *      frame. A different job, so a different colour; never mixed with the blue.
+ */
 .ob-highlight {
   position: fixed !important;
-  z-index: 2147483647 !important;
+  z-index: 2147483646 !important;
   pointer-events: none !important;
   box-sizing: border-box !important;
-  border: 2px solid #4f8cff !important;
-  border-radius: 3px !important;
-  background: rgba(79, 140, 255, 0.12) !important;
-  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.7) !important;
+  border: 2px solid #2f6fed !important;
+  border-radius: 6px !important;
+  background: rgba(47, 111, 237, 0.1) !important;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.75), 0 2px 10px rgba(47, 111, 237, 0.25) !important;
   margin: 0 !important;
   padding: 0 !important;
   animation: ob-highlight-fade 0.9s ease-out forwards !important;
@@ -25,13 +33,116 @@
   position: absolute;
   bottom: 100%;
   left: 0;
-  transform: translateY(-2px);
-  background: #4f8cff;
+  transform: translateY(-3px);
+  background: #2f6fed;
   color: #fff;
-  font: 500 11px/1.4 ui-sans-serif, system-ui, -apple-system, sans-serif;
-  padding: 2px 6px;
-  border-radius: 3px;
+  font: 600 11px/1.45 ui-sans-serif, system-ui, -apple-system, sans-serif;
+  letter-spacing: 0.01em;
+  padding: 2px 7px;
+  border-radius: 6px;
   white-space: nowrap;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.22);
+}
+
+/*
+ * The live cursor.
+ *
+ * Every other overlay marks *where* an action landed; this shows the pointer
+ * travelling there, so a run reads as one hand moving rather than boxes
+ * blinking on unrelated corners of the page. Two things make it different from
+ * the rest of this file: it persists between actions — you can always find
+ * where the agent last was — and it is positioned in top-level viewport pixels,
+ * like a real pointer, so it lives only in the top frame.
+ *
+ * The cascade rule the agent frame documents below applies here in force: the
+ * translate that drives travel, and the opacity/scale the ripple, press, and
+ * label animate, are the ONE set of properties left un-`!important`, because a
+ * forced value outranks a transition or a keyframe and freezes it silently.
+ * Everything static stays forced, so a page's own reset cannot blank the
+ * pointer or, worse, leave it frozen in a corner looking broken.
+ */
+.ob-cursor {
+  position: fixed !important;
+  top: 0 !important;
+  left: 0 !important;
+  z-index: 2147483647 !important;
+  pointer-events: none !important;
+  width: 0 !important;
+  height: 0 !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  /* Driven by JS through --ob-x/--ob-y; transitioned, so deliberately soft. */
+  transform: translate3d(var(--ob-x, -100px), var(--ob-y, -100px), 0);
+  transition: transform 0.24s cubic-bezier(0.22, 0.61, 0.36, 1) !important;
+  will-change: transform !important;
+}
+
+/* The pointer graphic. Its SVG tip sits at (0,0), i.e. exactly the click point. */
+.ob-cursor-arrow {
+  position: absolute !important;
+  top: 0 !important;
+  left: 0 !important;
+  display: block !important;
+  transform-origin: 1px 1px !important; /* press scales toward the tip */
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.35)) !important;
+}
+
+/* A short squeeze on click, so a press is legible even without the ripple. */
+.ob-cursor-press .ob-cursor-arrow {
+  animation: ob-cursor-press 0.32s ease-out;
+}
+@keyframes ob-cursor-press {
+  0% { transform: scale(1); }
+  35% { transform: scale(0.78); }
+  100% { transform: scale(1); }
+}
+
+/* An expanding ring at the tip, restarted on each click. */
+.ob-cursor-ripple {
+  position: absolute !important;
+  top: 0 !important;
+  left: 0 !important;
+  width: 12px !important;
+  height: 12px !important;
+  margin: -6px 0 0 -6px !important; /* centred on the tip */
+  border-radius: 50% !important;
+  border: 2px solid #2f6fed !important;
+  background: transparent !important;
+  opacity: 0;
+}
+.ob-cursor-ripple-go {
+  animation: ob-cursor-ripple 0.5s ease-out;
+}
+@keyframes ob-cursor-ripple {
+  0% { opacity: 0.55; transform: scale(0.4); }
+  100% { opacity: 0; transform: scale(4.2); }
+}
+
+/* A small pill naming the action, so a coordinate click — which has no target
+ * box — still says what just happened. Fades on the same ~0.9s beat as the
+ * highlight, so the two never disagree about how long an action is "showing". */
+.ob-cursor-label {
+  position: absolute !important;
+  top: 18px !important;
+  left: 20px !important;
+  padding: 2px 7px !important;
+  border-radius: 6px !important;
+  background: #2f6fed !important;
+  color: #fff !important;
+  font: 600 11px/1.45 ui-sans-serif, system-ui, -apple-system, sans-serif !important;
+  letter-spacing: 0.01em !important;
+  white-space: nowrap !important;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25) !important;
+  opacity: 0;
+}
+.ob-cursor-label-show {
+  animation: ob-cursor-label 0.95s ease-out;
+}
+@keyframes ob-cursor-label {
+  0% { opacity: 0; }
+  14% { opacity: 1; }
+  70% { opacity: 1; }
+  100% { opacity: 0; }
 }
 
 /*
@@ -261,5 +372,29 @@
 
   .ob-window-pick-card {
     animation: none !important;
+  }
+
+  /* The cursor still moves — a pointer that does not track the action is
+     useless — but it jumps instead of gliding, and the click marks flash rather
+     than expand. The information is kept; only the motion is removed. */
+  .ob-cursor {
+    transition: none !important;
+  }
+  .ob-cursor-press .ob-cursor-arrow {
+    animation: none !important;
+  }
+  .ob-cursor-ripple-go {
+    animation: ob-cursor-ripple-hold 0.3s steps(1, end);
+  }
+  @keyframes ob-cursor-ripple-hold {
+    0% { opacity: 0.5; transform: scale(2.2); }
+    100% { opacity: 0; transform: scale(2.2); }
+  }
+  .ob-cursor-label-show {
+    animation: ob-cursor-label-hold 0.95s steps(1, end);
+  }
+  @keyframes ob-cursor-label-hold {
+    0%, 80% { opacity: 1; }
+    100% { opacity: 0; }
   }
 }

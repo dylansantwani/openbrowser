@@ -169,6 +169,11 @@ export const TOOLS = [
         },
         ref: REF,
         coordinate: COORD,
+        space: {
+          type: 'string',
+          enum: ['css', 'image'],
+          description: '"image": coords read off the last browser_screenshot (auto-converted to viewport px). Default "css".',
+        },
         direction: {
           type: 'string',
           enum: ['down', 'up', 'left', 'right'],
@@ -484,6 +489,8 @@ Reliability:
 - browser_act uses real trusted input events, so it works where JS-dispatched clicks are rejected.
 - After anything that triggers a load, browser_wait rather than assuming.
 - If a ref is stale, re-snapshot; refs are invalidated when the DOM changes materially.
+
+Clicking by sight: prefer a ref. When only a screenshot shows the target (canvas, maps, PDF, a game), read the pixel off the image and click it with browser_act coordinate:[imageX,imageY] space:"image" — the extension converts image pixels to the page for you, so you never do the scale math. Plain coordinate:[x,y] (no space) is viewport CSS pixels.
 
 Parallelism: every tool takes a tabId. Open tabs with browser_tabs action:"new" (background by default) and fan work across them with the browser_batch "parallel" param. You never need a tab in the foreground to act on it — clicks, typing, navigation, snapshots and uploads all work on a background tab. Don't call browser_tabs action:"select" or browser_window focus just to interact: those raise the user's Chrome window and interrupt them. Reserve them for when a human genuinely needs to look at the tab.
 

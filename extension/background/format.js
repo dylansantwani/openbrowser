@@ -346,8 +346,20 @@ function formatBytes(n) {
  * @param {object} p.meta page metadata (viewport, scroll)
  * @param {{width:number,height:number}} p.image the image actually returned
  */
-export function captureGeometry({ mode, clip, meta = {}, image }) {
-  const line = `${mode} screenshot, ${image.width}x${image.height}`;
+/**
+ * The numeric CSS↔image mapping behind `captureGeometry`, factored out so the
+ * screenshot's advice and the click-time inversion (`space:"image"` in
+ * router.js) can never drift apart — the whole point is that a coordinate read
+ * off the image lands where the model expects.
+ *
+ * `covered` is the CSS-pixel region the image spans; `scale = image / covered`
+ * is the factor a caller divides image coords by. Rounding matches the text
+ * output exactly, so the two functions agree to the byte and to the pixel.
+ *
+ * @returns {{scale:number, originX:number, originY:number, coveredW:number,
+ *   coveredH:number, mode:string} | null} null when the viewport is unknown.
+ */
+export function captureMapping({ mode, clip, meta = {}, image }) {
   const viewport = meta.viewport || {};
 
   let covered;
@@ -364,11 +376,33 @@ export function captureGeometry({ mode, clip, meta = {}, image }) {
     covered = { x: 0, y: 0, w: viewport.w, h: viewport.h };
   }
 
+  if (!covered.w || !covered.h || !image?.width) return null;
+
+  // One scale for both axes, derived from width. This is correct only while
+  // `downscale()` (router.js) rescales by a single width-derived factor and
+  // never independently clamps height. If it ever grows a maxHeight cap, the
+  // y-axis factor would diverge and this must return {scaleX, scaleY} instead —
+  // the round-trip tests in test/run.mjs only exercise the uniform case.
+  return {
+    scale: image.width / covered.w,
+    originX: covered.x,
+    originY: covered.y,
+    coveredW: covered.w,
+    coveredH: covered.h,
+    mode,
+  };
+}
+
+export function captureGeometry({ mode, clip, meta = {}, image }) {
+  const line = `${mode} screenshot, ${image.width}x${image.height}`;
+
+  const m = captureMapping({ mode, clip, meta, image });
   // With no viewport the mapping cannot be stated honestly, and a guessed one
   // is worse than saying nothing.
-  if (!covered.w || !covered.h) return line;
+  if (!m) return line;
 
-  const scale = image.width / covered.w;
+  const covered = { x: m.originX, y: m.originY, w: m.coveredW, h: m.coveredH };
+  const scale = m.scale;
   const at = covered.x || covered.y ? ` at (${covered.x},${covered.y})` : '';
   const sized = `${line} — ${scale.toFixed(2)}x of ${covered.w}x${covered.h} CSS px${at}`;
 

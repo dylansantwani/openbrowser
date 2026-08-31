@@ -199,6 +199,20 @@ var OB = globalThis.OB || (globalThis.OB = {});
       return { ok: true };
     },
 
+    /**
+     * Move the live cursor to a top-level viewport point. Driven from the
+     * background so it tracks the real trusted click, and addressed to the top
+     * frame because the point is already in top-level coordinates — a click deep
+     * in an iframe still shows the pointer at the right pixel on screen.
+     */
+    cursor({ x, y, action, label, click, hide }) {
+      if (hide) {
+        actions.hideCursor();
+        return { ok: true };
+      }
+      return { ok: actions.cursor({ x, y, action, label, click }) };
+    },
+
     fill({ fields }) {
       const results = fields.map((f) => actions.fillField(f.ref, f.value, { clear: f.clear !== false }));
       // The tree cache's event listeners would catch this anyway, but a fill is

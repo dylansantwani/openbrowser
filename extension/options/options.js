@@ -9,20 +9,34 @@
 const $ = (sel) => document.querySelector(sel);
 
 /** Fields that map straight to a settings key, by input type. */
-const NUMBER_FIELDS = ['port', 'maxSnapshotChars'];
+const NUMBER_FIELDS = ['port', 'maxSnapshotChars', 'consoleBufferSize', 'networkBufferSize'];
 const BOOLEAN_FIELDS = [
   'autoConnect',
   'useDebugger',
+  'showCursor',
   'highlightActions',
   'showAgentBadge',
   'soloWindow',
   'chooseWindow',
+  'groupTabs',
+  'closeTabsOnSessionEnd',
   'autoConfirmLeave',
   'captureBodies',
+  'agentWindowPool',
+  'emulateFocus',
+  'logActivity',
 ];
 const LIST_FIELDS = ['allowlist', 'blocklist'];
 /** Plain text fields. Empty is meaningful — it means "generate a name for me". */
 const TEXT_FIELDS = ['browserName'];
+
+/** Per-field bounds, so an out-of-range value is caught before it is saved. */
+const NUMBER_BOUNDS = {
+  port: { min: 1024, max: 65535 },
+  maxSnapshotChars: { min: 1000, max: 200000 },
+  consoleBufferSize: { min: 50, max: 5000 },
+  networkBufferSize: { min: 50, max: 5000 },
+};
 
 function call(type, payload = {}) {
   return new Promise((resolve, reject) => {
@@ -39,14 +53,56 @@ function populate(settings) {
   for (const key of TEXT_FIELDS) $(`#${key}`).value = settings[key] ?? '';
   for (const key of BOOLEAN_FIELDS) $(`#${key}`).checked = !!settings[key];
   for (const key of LIST_FIELDS) $(`#${key}`).value = (settings[key] || []).join('\n');
+  syncDependencies();
+}
+
+/**
+ * Show the relationship the prose used to only describe: "Ask which window"
+ * does nothing while agents get their own background window, so it is dimmed and
+ * made inert then. A dependency you can see beats one buried three lines into a
+ * help paragraph nobody reads.
+ */
+function syncDependencies() {
+  const soloOn = $('#soloWindow').checked;
+  const row = $('#chooseWindow-row');
+  const control = $('#chooseWindow');
+  row.classList.toggle('is-disabled', soloOn);
+  control.disabled = soloOn;
+}
+
+/**
+ * Check number fields against their bounds. Returns a human message for the
+ * first problem, or null. Catching this before save is the point: the input's
+ * min/max are advisory, and a positive-but-out-of-range port (70000) was being
+ * saved silently and then failing to bind with nothing naming why.
+ */
+function validate() {
+  for (const key of NUMBER_FIELDS) {
+    const raw = $(`#${key}`).value.trim();
+    if (raw === '') continue; // empty keeps the current value; not an error
+    const value = Number(raw);
+    const { min, max } = NUMBER_BOUNDS[key] || {};
+    if (!Number.isFinite(value) || (min != null && value < min) || (max != null && value > max)) {
+      const label = $(`label[for="${key}"] strong`)?.textContent || key;
+      return `${label} must be between ${min?.toLocaleString()} and ${max?.toLocaleString()}.`;
+    }
+  }
+  return null;
 }
 
 function collect() {
   const patch = {};
 
   for (const key of NUMBER_FIELDS) {
-    const value = Number($(`#${key}`).value);
-    if (Number.isFinite(value) && value > 0) patch[key] = value;
+    const raw = $(`#${key}`).value.trim();
+    if (raw === '') continue;
+    const value = Number(raw);
+    const { min, max } = NUMBER_BOUNDS[key] || {};
+    // validate() has already run on the save path; clamp defensively so a
+    // reset-then-save or an edge case can never persist a nonsense value.
+    if (Number.isFinite(value) && (min == null || value >= min) && (max == null || value <= max)) {
+      patch[key] = value;
+    }
   }
   // Trimmed, because " work" and "work" would be two different browsers to
   // anyone reading a chooser and the same one to the person who typed it.
@@ -89,7 +145,20 @@ function flashSaved() {
     $('#live-status-text').textContent = `unavailable (${err.message})`;
   }
 
+  $('#soloWindow').addEventListener('change', syncDependencies);
+
+  const portError = $('#port-error');
+  const clearError = () => { portError.hidden = true; portError.textContent = ''; };
+  for (const key of NUMBER_FIELDS) $(`#${key}`).addEventListener('input', clearError);
+
   $('#save').addEventListener('click', async () => {
+    const problem = validate();
+    if (problem) {
+      portError.textContent = problem;
+      portError.hidden = false;
+      return;
+    }
+    clearError();
     await call('update_settings', { patch: collect() });
     flashSaved();
     // The port may have changed; show the resulting connection state.
@@ -103,6 +172,7 @@ function flashSaved() {
   });
 
   $('#reset').addEventListener('click', async () => {
+    clearError();
     populate(await call('reset_settings'));
     flashSaved();
   });

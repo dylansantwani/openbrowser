@@ -42,6 +42,17 @@ const DEFAULTS = {
   highlightActions: true,
 
   /**
+   * Show a live pointer that travels to each click and ripples on contact.
+   *
+   * The trusted click happens off-screen in the background, so without this
+   * there is no way to see where the agent is reaching — only boxes blinking on
+   * elements after the fact. The cursor is what makes a run legible to a human
+   * watching, and it is the one feedback that also covers coordinate clicks,
+   * which have no element to outline.
+   */
+  showCursor: true,
+
+  /**
    * Collect agent-opened tabs into labelled Chrome tab groups, so it is obvious
    * at a glance which tabs belong to which job.
    */

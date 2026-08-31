@@ -249,8 +249,29 @@ async function main() {
   // scheme as the variable. Trimmed to 2 bytes under the old ceiling first,
   // which is no headroom at all — the next edit would have had to cut guidance
   // to fit rather than raise this deliberately.
+  //
+  // Raised to 14.7KB for `browser_act` `space:"image"`. A screenshot handed to
+  // a model is rescaled twice (device pixel ratio, then the maxWidth downscale),
+  // so a coordinate read off the image is in neither the viewport nor the
+  // document space every coordinate argument otherwise uses. Without a way to
+  // say "these pixels came off the picture", a vision model — local ones above
+  // all — clicks at a fraction of the intended offset and gets no error, because
+  // there is always *something* under the wrong point. The enum is the syntax
+  // for the conversion the extension then does for it; a capability the model
+  // cannot name is one it cannot use, and this is the exact silent-wrong-click
+  // the coordinate documentation exists to prevent. Trimmed once (150→130 bytes)
+  // before raising.
   const schemaBytes = JSON.stringify(tools).length;
-  check('tool schemas stay under 14.5KB', schemaBytes < 14_500, `${schemaBytes} bytes`);
+  check('tool schemas stay under 14.7KB', schemaBytes < 14_700, `${schemaBytes} bytes`);
+
+  // A screenshot's pixels are in neither coordinate space every other argument
+  // uses; `space:"image"` is the only syntax for converting them back, so it has
+  // to stay advertised — a model cannot pass an enum value it has never seen.
+  check(
+    'browser_act accepts image-space coordinates',
+    tools.find((t) => t.name === 'browser_act')?.inputSchema?.properties?.space?.enum?.includes('image'),
+    JSON.stringify(tools.find((t) => t.name === 'browser_act')?.inputSchema?.properties?.space)
+  );
 
   // Exactly one blank line between paragraphs was unreachable in rich editors
   // until `newline` existed, so the option has to stay advertised — a model
@@ -1066,6 +1087,33 @@ async function testFormatting() {
     1
   );
   check('header reports scroll position when scrolled', scrolled.includes('scrolled 50%'));
+
+  // captureMapping is the single source both the screenshot's advice and the
+  // `space:"image"` click inversion read from — so it is tested as a round trip:
+  // a point known in CSS space, projected into image pixels, must invert back.
+  const invert = (m, imgX, imgY) => ({ x: m.originX + imgX / m.scale, y: m.originY + imgY / m.scale });
+
+  // A viewport shot downscaled from 2560 CSS px to a 1280px image: factor 0.5,
+  // so image (600,400) is the CSS point (1200,800).
+  const vp = fmt.captureMapping({ mode: 'viewport', meta: { viewport: { w: 2560, h: 1440 } }, image: { width: 1280, height: 720 } });
+  check('viewport mapping halves a 2x-downscaled image', Math.abs(vp.scale - 0.5) < 1e-9, vp.scale);
+  const vpPoint = invert(vp, 600, 400);
+  check('viewport image point inverts to CSS px', Math.round(vpPoint.x) === 1200 && Math.round(vpPoint.y) === 800, JSON.stringify(vpPoint));
+
+  // A region shot carries its own origin: the image's (0,0) is the region's
+  // top-left in the page, so the offset has to survive the inversion.
+  const rg = fmt.captureMapping({ mode: 'region', clip: { x: 830, y: 190, width: 460, height: 410 }, meta: { viewport: { w: 2560, h: 1440 } }, image: { width: 690, height: 615 } });
+  check('region mapping keeps its factor', Math.abs(rg.scale - 1.5) < 1e-9, rg.scale);
+  const rgPoint = invert(rg, 345, 0);
+  check('region image point inverts through its origin', Math.round(rgPoint.x) === 1060 && Math.round(rgPoint.y) === 190, JSON.stringify(rgPoint));
+
+  // full_page spans past the viewport, so its mapping is flagged for the caller
+  // (router subtracts the live scroll offset before clicking).
+  const fp = fmt.captureMapping({ mode: 'full_page', meta: { viewport: { w: 1000, h: 800 }, scroll: { maxY: 3000 } }, image: { width: 500 } });
+  check('full_page mapping covers the whole document height', fp.mode === 'full_page' && Math.abs(fp.scale - 0.5) < 1e-9, JSON.stringify(fp));
+
+  // No viewport, no honest mapping — better than a guessed one.
+  check('mapping is null without a viewport', fmt.captureMapping({ mode: 'viewport', meta: {}, image: { width: 500 } }) === null);
 }
 
 async function testMacros() {

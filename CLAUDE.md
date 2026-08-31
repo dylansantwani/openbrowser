@@ -547,6 +547,40 @@ converts for you, so a `getBoundingClientRect()` value passed straight through
 is wrong there by exactly the factor above. Neither convention is wrong; a
 capture that does not state which one it is using is.
 
+**`browser_act coordinate space:"image"` is the Claude-in-Chrome side of that
+trade, offered as an opt-in.** A vision model — a local one above all — has only
+the picture, and making it invert `captureGeometry`'s factor by hand before
+every click is where those clicks go wrong. So `space:"image"` says "these
+pixels came off the last screenshot" and the extension inverts them: each
+capture's mapping (`fmt.captureMapping` — the single source `captureGeometry`'s
+advice also reads, so the two can never disagree) is saved to
+`chrome.storage.session` keyed by tab, and `imageToViewport` (`router.js`)
+reverses it — `origin + image/scale`, minus the *current* scroll for a
+`full_page` capture, which is document-space. Default stays `css` (viewport CSS
+px) so nothing that already passes coordinates breaks, and every screenshot
+result ends with the one-line call that lands correctly. Session storage rather
+than a variable for the same reason everything else here uses it: the worker
+dies between the capture and the click. The mapping is stamped with the URL and
+viewport it was taken against and cleared on navigation and tab close, and
+`imageToViewport` refuses if the page navigated or resized since — so no recent
+capture, a stale one, or a page that has moved on all raise an *error*, not a
+guess. A silent wrong click is the whole failure this avoids, and freshness is
+as much a part of it as presence: a null mapping (no viewport, no honest factor)
+therefore *clears* the record rather than leaving the previous one to be read
+against a different image.
+
+**The live cursor is the one overlay driven by the click point, not a ref.** A
+trusted click happens off-screen in the background, so `content/actions.js`
+`cursor()` draws a pointer that travels to the same top-level point the CDP click
+lands on, rings on contact, and persists between actions — the only feedback a
+`coordinate` click gets, since it has no element to outline (`highlight` needs a
+ref). `showCursor` in `router.js` fires it fire-and-forget to the top frame from
+`browser_act` and the typing path; `agentFrame(false)` tears it down with the
+"driving" frame at session end. It obeys `overlay.css`'s cascade rule — the
+travel transform and the ripple/press/label are the properties left
+un-`!important`, because a forced value outranks the transition or keyframe and
+freezes it looking wired-up. Gated by the `showCursor` setting (default on).
+
 **`element.click()` is ignored by serious sites.** It produces `isTrusted:
 false`. Everything pointer-related goes through CDP's Input domain for this
 reason. If you are tempted to "simplify" by using `.click()`, don't.

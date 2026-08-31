@@ -418,7 +418,31 @@ function agentFrameLabel(tabId) {
   return label ? `OpenBrowser · ${label}` : 'OpenBrowser agent';
 }
 
-chrome.tabs.onRemoved.addListener((tabId) => agentLabels.delete(tabId));
+chrome.tabs.onRemoved.addListener((tabId) => {
+  agentLabels.delete(tabId);
+  // The saved screenshot mapping dies with the tab; without this its
+  // session-storage entry would leak for the life of the browser.
+  clearCaptureGeometry(tabId);
+});
+
+/**
+ * Send the live pointer to a top-level viewport point, if the setting is on.
+ *
+ * Fire-and-forget and always to the top frame: the point is already in
+ * top-level coordinates, and a click three iframes deep should still show the
+ * pointer at the right pixel on the screen. Never awaited — the visual must not
+ * add latency to, or fail, the action it is illustrating.
+ */
+function showCursor(tabId, settings, opts) {
+  if (settings.showCursor === false) return;
+  frames.sendToTab(tabId, 'cursor', opts).catch(() => {});
+}
+
+/** A short human label for the cursor pill: the target's name, else the verb. */
+function cursorLabel(action, name) {
+  if (name) return fmt.truncate(name, 32);
+  return action.replace(/_/g, ' ');
+}
 
 /**
  * Tabs each workstream opened for itself.
@@ -1153,6 +1177,10 @@ const HANDLERS = {
     }
 
     fmt.clearSnapshot(tabId);
+    // The screenshot mapping belonged to the page we are leaving; drop it so a
+    // stray space:"image" click cannot convert against the old page. The
+    // freshness check in imageToViewport is the backstop, this is the tidy path.
+    clearCaptureGeometry(tabId);
 
     const waitUntil = args.waitUntil || 'load';
     if (waitUntil !== 'none') {
@@ -1365,6 +1393,18 @@ const HANDLERS = {
       frames.sendToFrame(tabId, route.frameId, 'highlight', { ref: route.localRef, label: action }).catch(() => {});
     }
 
+    // Send the pointer to the same top-level point the trusted click will land
+    // on. Hover leaves no mark of its own, so it moves the cursor without a
+    // ripple; every other pointer action rings on contact. This is the only
+    // feedback a coordinate click gets, since there is no element to outline.
+    showCursor(tabId, settings, {
+      x: target.point.x,
+      y: target.point.y,
+      action,
+      label: cursorLabel(action, target.name),
+      click: action !== 'hover',
+    });
+
     const { changed } = await withDelta(tabId, async () => {
       const { x, y } = target.point;
       const opts = { modifiers: args.modifiers || [] };
@@ -1388,8 +1428,12 @@ const HANDLERS = {
         case 'drag': {
           const dest = args.toRef
             ? (await locateTarget(tabId, { ref: args.toRef })).point
-            : { x: args.to?.[0], y: args.to?.[1] };
+            : args.space === 'image' && args.to
+              ? await imageToViewport(tabId, args.to)
+              : { x: args.to?.[0], y: args.to?.[1] };
           if (dest.x == null) throw new Error('drag needs a destination: pass `to` [x,y] or `toRef`.');
+          // Carry the pointer to where it is being dropped, then ring there.
+          showCursor(tabId, settings, { x: dest.x, y: dest.y, action: 'drop', label: 'drop', click: true });
           await cdp.drag(tabId, { x, y }, dest, opts);
           break;
         }
@@ -1477,6 +1521,7 @@ const HANDLERS = {
           if (settings.highlightActions) {
             frames.sendToFrame(tabId, route.frameId, 'highlight', { ref: route.localRef, label: 'type' }).catch(() => {});
           }
+          showCursor(tabId, settings, { x: target.point.x, y: target.point.y, action: 'type', label: 'type', click: true });
         }
         await cdp.typeText(tabId, args.text, { delay: args.delay ?? 0, newline: args.newline });
 
@@ -1594,15 +1639,26 @@ const HANDLERS = {
     // nothing about the CSS-pixel space that `region` and every coordinate
     // argument use. captureGeometry derives the factor from the image against
     // what it covered, and says so when the mapping is not 1:1.
-    const line = fmt.captureGeometry({
+    const geometry = {
       mode: args.mode || 'viewport',
       clip,
       meta,
       image: { width: resized.width, height: resized.height },
-    });
+    };
+    const line = fmt.captureGeometry(geometry);
+
+    // Remember how this image maps to the page, and tell the model the one call
+    // that clicks a point it reads off the image — the extension does the factor
+    // math so a vision model does not have to. This is what makes coordinate
+    // clicking reliable for local models that only have the picture to go on.
+    const mapping = fmt.captureMapping(geometry);
+    await saveCaptureGeometry(tabId, mapping, meta);
+    const hint = mapping
+      ? '\n→ to click a spot in this image: browser_act action:"click" coordinate:[imageX,imageY] space:"image"'
+      : '';
 
     return {
-      text: `${fmt.pageHeader(meta, tabId)}\n${line}`,
+      text: `${fmt.pageHeader(meta, tabId)}\n${line}${hint}`,
       images: [{ data: resized.data, mimeType: format === 'png' ? 'image/png' : 'image/jpeg' }],
     };
   },
@@ -2175,11 +2231,131 @@ async function runSteps(steps, { stopOnError = true, returnEach = false, ...batc
 }
 
 /**
+ * Per-tab record of the last screenshot's coordinate mapping, so a later
+ * `browser_act coordinate:[…] space:"image"` can convert image pixels back to
+ * the viewport. Lives in session storage because the service worker is torn
+ * down between the capture and the click, and is keyed by tab because two tabs
+ * captured at different scales must not share a factor.
+ */
+function captureKey(tabId) {
+  return `ob_capture_${tabId}`;
+}
+
+async function clearCaptureGeometry(tabId) {
+  try {
+    await chrome.storage.session.remove(captureKey(tabId));
+  } catch {
+    /* nothing to clear, or session storage gone with the worker — either way
+       a load below returns null and image-space clicks report "take one first" */
+  }
+}
+
+/**
+ * Remember how the just-captured image maps to the page, stamped with the URL
+ * and viewport it was taken against so a later click can tell whether the image
+ * still describes the page.
+ *
+ * A null mapping (no viewport, so no honest factor) must *clear* the record, not
+ * leave the previous one in place — otherwise a click that reads pixels off the
+ * unmapped image would be converted with a stale factor from an earlier,
+ * differently-sized shot, and land somewhere plausible but wrong with no error.
+ */
+async function saveCaptureGeometry(tabId, mapping, meta) {
+  if (!mapping) {
+    await clearCaptureGeometry(tabId);
+    return;
+  }
+  try {
+    await chrome.storage.session.set({
+      [captureKey(tabId)]: {
+        ...mapping,
+        url: meta?.url || '',
+        vw: meta?.viewport?.w || 0,
+        vh: meta?.viewport?.h || 0,
+        ts: Date.now(),
+      },
+    });
+  } catch {
+    /* session storage unavailable (rare); image-space clicks will just report
+       "take a screenshot first" until the next capture succeeds */
+  }
+}
+
+async function loadCaptureGeometry(tabId) {
+  try {
+    const key = captureKey(tabId);
+    const got = await chrome.storage.session.get(key);
+    return got[key] || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Invert an image-pixel coordinate to a viewport CSS-pixel click point using
+ * the mapping saved by the last screenshot of this tab.
+ *
+ * `originX/Y` place the captured region within the page (a `region` shot starts
+ * at its own offset), and `scale` undoes both rescalings at once. A full_page
+ * capture is document-space, so its inverted point is shifted by the *current*
+ * scroll — read now, not at capture time, since the page may have moved.
+ *
+ * The mapping describes one specific image. If the page navigated or the window
+ * resized since it was taken, image pixels no longer correspond to anything, so
+ * this refuses rather than clicking somewhere plausible — the same "an error
+ * beats a silent wrong click" stance the whole coordinate story rests on.
+ */
+async function imageToViewport(tabId, [imgX, imgY]) {
+  const g = await loadCaptureGeometry(tabId);
+  if (!g) {
+    throw new Error(
+      'space:"image" needs a recent browser_screenshot of this tab to convert from — ' +
+        'take one first, or drop space:"image" to pass viewport CSS pixels directly.'
+    );
+  }
+
+  const meta = await pageMeta(tabId).catch(() => null);
+  if (meta) {
+    const vw = meta.viewport?.w;
+    const vh = meta.viewport?.h;
+    const navigated = g.url && meta.url && g.url !== meta.url;
+    const resized = g.vw && vw && (g.vw !== vw || g.vh !== vh);
+    if (navigated || resized) {
+      await clearCaptureGeometry(tabId);
+      throw new Error(
+        `the page ${navigated ? 'navigated' : 'was resized'} since that screenshot, so its ` +
+          'pixels no longer map to it — take a fresh browser_screenshot before clicking with space:"image".'
+      );
+    }
+  }
+
+  let x = g.originX + imgX / g.scale;
+  let y = g.originY + imgY / g.scale;
+
+  if (g.mode === 'full_page') {
+    x -= meta?.scroll?.x || 0;
+    y -= meta?.scroll?.y || 0;
+  }
+
+  return { x, y };
+}
+
+/**
  * Work out where to click, from either a ref or explicit coordinates.
  * Refreshes iframe offsets first so refs inside frames resolve correctly.
  */
 async function locateTarget(tabId, args) {
   if (args.coordinate) {
+    // Coordinates read straight off a screenshot are in *image* pixels, which
+    // the two rescalings (device pixel ratio, then the maxWidth downscale) put
+    // in neither the viewport nor the document coordinate space browser_act
+    // otherwise speaks. `space:"image"` says "these came off the last capture"
+    // and inverts them here, so a vision model — local ones especially — can
+    // click what it sees without doing the factor math itself and landing at
+    // half the intended offset, silently. Default stays CSS px.
+    if (args.space === 'image') {
+      return { point: await imageToViewport(tabId, args.coordinate), rect: null };
+    }
     return { point: { x: args.coordinate[0], y: args.coordinate[1] }, rect: null };
   }
   if (!args.ref) {

@@ -32,6 +32,13 @@
 
   --radius: 7px;
   --radius-sm: 5px;
+  --radius-lg: 13px;
+
+  /* A soft, Apple-flavoured card lift — barely there in light, invisible in
+     dark (a shadow on a dark surface reads as grime, so dark leans on borders). */
+  --shadow-card: 0 1px 2px rgba(16, 24, 40, 0.04), 0 4px 12px rgba(16, 24, 40, 0.05);
+  /* The off state of a switch track: a neutral grey that reads as "empty". */
+  --switch-off: #d6dbe2;
 
   --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
   --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
@@ -58,6 +65,9 @@
     --error: #f87171;
     --error-soft: #2a1a1a;
     --warn-soft: #2a2418;
+
+    --shadow-card: none;
+    --switch-off: #3a414a;
   }
 }
 
@@ -115,24 +125,25 @@ body {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 4px 9px;
+  padding: 5px 11px;
   font-size: 12px;
-  font-weight: 500;
+  font-weight: 550;
   border: 1px solid var(--border);
   border-radius: 999px;
   background: var(--bg-sunken);
   color: var(--text-muted);
   cursor: pointer;
-  transition: border-color 0.15s, color 0.15s;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
 }
 
 .status:hover {
   border-color: var(--border-strong);
+  background: var(--bg);
 }
 
 .status-dot {
-  width: 6px;
-  height: 6px;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   background: var(--text-faint);
   flex-shrink: 0;
@@ -140,10 +151,29 @@ body {
 
 .status--connected {
   color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 10%, transparent);
   border-color: color-mix(in srgb, var(--ok) 35%, transparent);
 }
 .status--connected .status-dot {
   background: var(--ok);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent);
+}
+.status--connected:hover {
+  background: color-mix(in srgb, var(--ok) 16%, transparent);
+}
+
+/* Disconnected is an invitation to click, not just a state: tint it with the
+   accent so it reads as the one thing to do when nothing is connected. */
+.status--disconnected {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 32%, transparent);
+  background: var(--accent-soft);
+}
+.status--disconnected .status-dot {
+  background: var(--accent);
+}
+.status--disconnected:hover {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
 }
 
 .status--connecting .status-dot {
@@ -209,8 +239,9 @@ main {
 .panel {
   background: var(--bg-raised);
   border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 11px;
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+  padding: 13px;
 }
 
 .panel-head {
@@ -658,6 +689,215 @@ code {
   padding: 1px 4px;
   background: var(--bg-sunken);
   border-radius: 3px;
+}
+
+/* ── Toggle switch ───────────────────────────────────────────────────────
+ *
+ * A styled checkbox, so the markup stays a plain <input type="checkbox"> and
+ * the options controller keeps reading `.checked` with no special-casing. A
+ * switch reads as "on/off, now" far better than a tick box reads as "a setting
+ * that is currently true" — which is the whole difference between a control
+ * panel and a form. */
+.switch {
+  appearance: none;
+  -webkit-appearance: none;
+  position: relative;
+  flex-shrink: 0;
+  width: 38px;
+  height: 22px;
+  margin: 0;
+  border: none;
+  border-radius: 999px;
+  background: var(--switch-off);
+  cursor: pointer;
+  transition: background 0.2s ease;
+}
+
+.switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+  transition: transform 0.2s ease;
+}
+
+.switch:checked {
+  background: var(--accent);
+}
+
+.switch:checked::after {
+  transform: translateX(16px);
+}
+
+.switch:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+.switch:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+/* ── Grouped inset list ──────────────────────────────────────────────────
+ *
+ * The iOS-Settings pattern: a titled group of rows collected into one rounded
+ * card with hairline dividers. It makes a long settings page scannable — the
+ * eye lands on the group it wants instead of reading every row — and it is the
+ * shape both this panel and the options page now share. */
+.group {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+  overflow: hidden;
+}
+
+.group-title {
+  margin: 0 0 7px 15px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.group-note {
+  margin: 8px 4px 0 15px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.group-note code {
+  font-size: 11px;
+}
+
+/* One row: a label (with optional help) on the left, a control on the right. */
+.setting {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 15px;
+}
+
+.setting + .setting {
+  border-top: 1px solid var(--border);
+}
+
+.setting-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.setting-text strong {
+  display: block;
+  font-size: 13.5px;
+  font-weight: 550;
+  color: var(--text);
+}
+
+.setting-text small {
+  display: block;
+  margin-top: 3px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.setting-control {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+}
+
+/* A value input sitting on the right of a row (port, snapshot budget). */
+.setting-control input[type="number"],
+.setting-control input[type="text"] {
+  width: 130px;
+  text-align: right;
+}
+
+/* A row whose control needs the full width sits stacked instead. */
+.setting--stacked {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.setting--stacked .setting-control input,
+.setting--stacked .setting-control {
+  width: 100%;
+  text-align: left;
+}
+
+/* A dependent row, indented under the one that governs it. Dimmed and inert
+ * when its governing toggle turns it off, so the relationship is visible
+ * instead of buried in prose. */
+.setting--nested {
+  padding-left: 30px;
+}
+
+.setting.is-disabled .setting-text strong {
+  color: var(--text-muted);
+}
+
+.setting.is-disabled .setting-text small {
+  color: var(--text-faint);
+}
+
+/* ── Disclosure (Advanced) ───────────────────────────────────────────────*/
+.disclosure {
+  border: none;
+  background: none;
+  padding: 0;
+}
+
+.disclosure > summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 2px;
+  font-size: 12.5px;
+  font-weight: 550;
+  color: var(--text-muted);
+  user-select: none;
+}
+
+.disclosure > summary::-webkit-details-marker {
+  display: none;
+}
+
+.disclosure > summary::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform 0.15s ease;
+}
+
+.disclosure[open] > summary::before {
+  transform: rotate(45deg);
+}
+
+.disclosure > summary:hover {
+  color: var(--text);
+}
+
+.disclosure-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 10px;
 }
 
 /* Scrollbars that do not shout. */
