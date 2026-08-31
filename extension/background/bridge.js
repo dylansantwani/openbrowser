@@ -15,6 +15,9 @@
 
 import { getSettings } from './settings.js';
 
+/** Increment when server/extension routing or ownership semantics must match. */
+const PROTOCOL_REVISION = 2;
+
 const HEARTBEAT_MS = 20_000;   // comfortably under the 30s idle timeout
 const BACKOFF_MIN_MS = 1_000;
 const BACKOFF_MAX_MS = 30_000;
@@ -140,6 +143,7 @@ export class Bridge {
           type: 'hello',
           role: 'extension',
           version: chrome.runtime.getManifest().version,
+          protocolRevision: PROTOCOL_REVISION,
           browser: navigatorBrand(),
           // What lets the hub tell "this browser reconnecting" from "a second
           // browser arriving". Without it the two are indistinguishable, and
@@ -192,6 +196,21 @@ export class Bridge {
 
     if (msg.type === 'hello') return; // hub acknowledging us
     if (msg.type !== 'call') return;
+
+    if (msg.args?._protocolRevision !== PROTOCOL_REVISION) {
+      this._send({
+        type: 'result',
+        id: msg.id,
+        ok: false,
+        error: {
+          message:
+            `OpenBrowser server/extension revision mismatch (extension ${PROTOCOL_REVISION}, ` +
+            `server ${msg.args?._protocolRevision ?? 'legacy'}). Restart every OpenBrowser MCP server from the same checkout, ` +
+            'then reload the extension; the call was not run.',
+        },
+      });
+      return;
+    }
 
     // Every call is addressed to a specific browser, and this is where the
     // address is checked.

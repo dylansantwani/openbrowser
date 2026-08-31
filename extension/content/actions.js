@@ -395,6 +395,119 @@ var OB = globalThis.OB || (globalThis.OB = {});
     setTimeout(() => box.remove(), 900);
   }
 
+  // ---------------------------------------------------------------------------
+  // Live cursor
+  // ---------------------------------------------------------------------------
+
+  // The cursor is the one overlay that outlives a single action, so its element
+  // and last position are held here rather than rebuilt each call. Position
+  // survives in module scope so travel is smooth across a run; a navigation
+  // reloads this script and resets it, which is exactly right — the old
+  // document's pointer is gone, so the next one places without a fly-in.
+  let cursorEl = null;
+  let cursorPos = null;
+
+  const CURSOR_SVG =
+    '<svg class="ob-cursor-arrow" width="26" height="26" viewBox="0 0 24 24" aria-hidden="true">' +
+    '<path d="M0.7 0.7 L0.7 18.6 L5.3 14.3 L8.2 21.0 L11.0 19.8 L8.1 13.3 L14.6 12.9 Z" ' +
+    'fill="#2f6fed" stroke="#ffffff" stroke-width="1.4" stroke-linejoin="round"/></svg>';
+
+  function buildCursor() {
+    const el = document.createElement('div');
+    el.className = 'ob-cursor';
+    el.innerHTML = `${CURSOR_SVG}<span class="ob-cursor-ripple"></span><span class="ob-cursor-label"></span>`;
+    return el;
+  }
+
+  /**
+   * Get the cursor element, seeded at its last known position so a re-created
+   * one (a page that cleared body children) does not glide in from the corner.
+   */
+  function ensureCursor() {
+    if (window.top !== window) return null; // one pointer, in the top frame
+    const root = document.body || document.documentElement;
+    if (!root) return null;
+
+    if (cursorEl && cursorEl.isConnected) {
+      if (cursorEl.parentElement !== root) root.appendChild(cursorEl);
+      return cursorEl;
+    }
+
+    const el = buildCursor();
+    if (cursorPos) {
+      // Place silently at the remembered spot, then re-enable travel so the
+      // move that follows animates from there rather than from (0,0).
+      el.style.transition = 'none';
+      el.style.setProperty('--ob-x', `${cursorPos.x}px`);
+      el.style.setProperty('--ob-y', `${cursorPos.y}px`);
+    }
+    root.appendChild(el);
+    if (cursorPos) {
+      void el.offsetWidth; // flush the silent placement before restoring travel
+      el.style.transition = '';
+    }
+    cursorEl = el;
+    return el;
+  }
+
+  /**
+   * Move the cursor to a top-level viewport point and, for a real click, play
+   * the press + ripple. `label` names the action so a coordinate click — which
+   * draws no target box — still says what happened.
+   */
+  function cursor({ x, y, action = 'click', label, click = true } = {}) {
+    if (window.top !== window) return false;
+    if (typeof x !== 'number' || typeof y !== 'number') return false;
+
+    const first = !cursorPos;
+    const el = ensureCursor();
+    if (!el) return false;
+
+    if (first) {
+      // Nothing to travel from on the very first placement of a fresh document.
+      el.style.transition = 'none';
+      el.style.setProperty('--ob-x', `${x}px`);
+      el.style.setProperty('--ob-y', `${y}px`);
+      void el.offsetWidth;
+      el.style.transition = '';
+    } else {
+      el.style.setProperty('--ob-x', `${x}px`);
+      el.style.setProperty('--ob-y', `${y}px`);
+    }
+    cursorPos = { x, y };
+    if (action) el.dataset.obAction = action;
+
+    const pill = el.querySelector('.ob-cursor-label');
+    const text = label || action;
+    if (pill && text) {
+      pill.textContent = text;
+      pill.classList.remove('ob-cursor-label-show');
+      void pill.offsetWidth; // restart the fade even on a repeated action
+      pill.classList.add('ob-cursor-label-show');
+    }
+
+    if (click) {
+      el.classList.remove('ob-cursor-press');
+      void el.offsetWidth;
+      el.classList.add('ob-cursor-press');
+
+      const ripple = el.querySelector('.ob-cursor-ripple');
+      if (ripple) {
+        ripple.classList.remove('ob-cursor-ripple-go');
+        void ripple.offsetWidth;
+        ripple.classList.add('ob-cursor-ripple-go');
+      }
+    }
+    return true;
+  }
+
+  /** Remove the cursor — the session that was driving this tab has stopped. */
+  function hideCursor() {
+    cursorEl?.remove();
+    cursorEl = null;
+    cursorPos = null;
+  }
+
   /**
    * Show or hide the persistent "an agent is driving this tab" frame.
    *
@@ -413,6 +526,9 @@ var OB = globalThis.OB || (globalThis.OB = {});
     let box = document.querySelector('.ob-agent-frame');
     if (!on) {
       box?.remove();
+      // "Stop driving" clears both markers: a lingering pointer on a tab nothing
+      // is driving is the same stale-marker problem the frame removal solves.
+      hideCursor();
       return false;
     }
     if (!box) {
@@ -554,6 +670,8 @@ var OB = globalThis.OB || (globalThis.OB = {});
     waitFor,
     textPresent,
     highlight,
+    cursor,
+    hideCursor,
     agentFrame,
     windowPick,
     setFrameOffset,

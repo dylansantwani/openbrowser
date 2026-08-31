@@ -62,11 +62,23 @@
     told which one to work in. Only the card takes clicks; the page behind it
     stays usable.
   </p>
+  <p>
+    Click <b>Move cursor</b> to send the live pointer somewhere on the page: it
+    glides to the point, squeezes, and rings on contact — the same feedback a
+    real trusted click produces during a run. It is the one marker that persists
+    between actions, so you can always see where the agent last was.
+  </p>
+  <p style="display:flex; gap:10px; flex-wrap:wrap;">
+    <button class="demo-target">Sign in</button>
+    <button class="demo-target">Add to cart</button>
+    <button class="demo-target">Continue</button>
+  </p>
 </div>
 
 <div class="controls">
   <button id="toggle-frame">Toggle agent frame</button>
   <button id="toggle-pick">Toggle window prompt</button>
+  <button id="move-cursor">Move cursor</button>
 </div>
 <div id="log"></div>
 
@@ -123,12 +135,61 @@
     document.body.appendChild(box);
   }
 
+  // Mirrors actions.js: the live cursor (buildCursor + cursor()).
+  const CURSOR_SVG =
+    '<svg class="ob-cursor-arrow" width="26" height="26" viewBox="0 0 24 24" aria-hidden="true">' +
+    '<path d="M0.7 0.7 L0.7 18.6 L5.3 14.3 L8.2 21.0 L11.0 19.8 L8.1 13.3 L14.6 12.9 Z" ' +
+    'fill="#2f6fed" stroke="#ffffff" stroke-width="1.4" stroke-linejoin="round"/></svg>';
+  let cursorEl = null;
+  let cursorPos = null;
+
+  function moveCursor(x, y, label, click = true) {
+    if (!cursorEl) {
+      cursorEl = document.createElement('div');
+      cursorEl.className = 'ob-cursor';
+      cursorEl.innerHTML = `${CURSOR_SVG}<span class="ob-cursor-ripple"></span><span class="ob-cursor-label"></span>`;
+      document.body.appendChild(cursorEl);
+    }
+    const first = !cursorPos;
+    if (first) cursorEl.style.transition = 'none';
+    cursorEl.style.setProperty('--ob-x', `${x}px`);
+    cursorEl.style.setProperty('--ob-y', `${y}px`);
+    if (first) { void cursorEl.offsetWidth; cursorEl.style.transition = ''; }
+    cursorPos = { x, y };
+
+    const pill = cursorEl.querySelector('.ob-cursor-label');
+    pill.textContent = label || 'click';
+    pill.classList.remove('ob-cursor-label-show');
+    void pill.offsetWidth;
+    pill.classList.add('ob-cursor-label-show');
+
+    if (click) {
+      cursorEl.classList.remove('ob-cursor-press');
+      void cursorEl.offsetWidth;
+      cursorEl.classList.add('ob-cursor-press');
+      const ripple = cursorEl.querySelector('.ob-cursor-ripple');
+      ripple.classList.remove('ob-cursor-ripple-go');
+      void ripple.offsetWidth;
+      ripple.classList.add('ob-cursor-ripple-go');
+    }
+  }
+
   const log = (m) => { document.getElementById('log').textContent = m; };
 
   document.getElementById('toggle-frame').addEventListener('click', () =>
     agentFrame(!document.querySelector('.ob-agent-frame')));
   document.getElementById('toggle-pick').addEventListener('click', () =>
     windowPick(!document.querySelector('.ob-window-pick')));
+
+  // Walk the demo buttons in turn, so travel and ripple are both visible.
+  const targets = [...document.querySelectorAll('.demo-target')];
+  let nextTarget = 0;
+  document.getElementById('move-cursor').addEventListener('click', () => {
+    const t = targets[nextTarget % targets.length];
+    nextTarget++;
+    const r = t.getBoundingClientRect();
+    moveCursor(r.left + r.width / 2, r.top + r.height / 2, t.textContent);
+  });
 
   agentFrame(true);
   windowPick(true);
@@ -172,16 +233,70 @@
       ]);
     }
 
+    // Hit-testing needs a real viewport. A zero-sized or not-yet-laid-out
+    // window (a backgrounded automation tab is exactly this) returns null from
+    // elementFromPoint and nonsense rects — the harness, not a regression, as
+    // the testing note in CLAUDE.md records. Skip those checks rather than cry
+    // wolf; the computed-style ones below hold at any size.
+    const laidOut = innerWidth > 0 && innerHeight > 0;
+
     const card = document.querySelector('.ob-window-pick-card');
     const r = card.getBoundingClientRect();
-    results.push([
-      document.elementFromPoint(r.left + r.width / 2, r.top + 8) === card ? 'ok' : 'FAIL',
-      'the prompt card takes clicks',
-    ]);
+    results.push(
+      !laidOut
+        ? ['skip', 'the prompt card takes clicks — needs a real viewport']
+        : [
+            document.elementFromPoint(r.left + r.width / 2, r.top + 8) === card ? 'ok' : 'FAIL',
+            'the prompt card takes clicks',
+          ]
+    );
     results.push([
       getComputedStyle(document.querySelector('.ob-window-pick')).pointerEvents === 'none' ? 'ok' : 'FAIL',
       'the backdrop stays inert, so the page behind it still works',
     ]);
+
+    /*
+     * The cursor breaks the same invisible way the frame does: `transform` is
+     * the property travel rides on, and a forced value would outrank the
+     * transition and pin the pointer in a corner while everything looked wired
+     * up. So this proves the pointer actually moves, rings, and never eats a
+     * click — by reading computed values, not by trusting the markup.
+     */
+    moveCursor(120, 140, 'first', false); // seed without travel
+    moveCursor(360, 260, 'click');        // this move should animate
+    const cur = document.querySelector('.ob-cursor');
+    const cs = getComputedStyle(cur);
+    results.push([
+      cs.pointerEvents === 'none' ? 'ok' : 'FAIL',
+      'the cursor never intercepts a click',
+    ]);
+    results.push([
+      cs.transitionDuration !== '0s' ? 'ok' : 'FAIL',
+      `travel is a transition, not a jump (${cs.transitionDuration})`,
+    ]);
+    const travelling = cur.getAnimations().some((a) => a instanceof CSSTransition && a.transitionProperty === 'transform');
+    results.push([
+      travelling ? 'ok' : 'FAIL',
+      'the move animates transform rather than snapping',
+    ]);
+    const ripple = document.querySelector('.ob-cursor-ripple');
+    results.push([
+      ripple.getAnimations().length > 0 ? 'ok' : 'FAIL',
+      'the click rings a ripple at the tip',
+    ]);
+    // Jump the travel to its end, then confirm the pointer landed on the point:
+    // the SVG's tip is authored at (0,0), so the arrow's top-left is the click.
+    // Also viewport-dependent — a 0×0 window renders the arrow at the origin.
+    cur.getAnimations().forEach((a) => { if (a instanceof CSSTransition) a.finish(); });
+    const ar = document.querySelector('.ob-cursor-arrow').getBoundingClientRect();
+    results.push(
+      !laidOut
+        ? ['skip', 'the arrow tip sits on the target point — needs a real viewport']
+        : [
+            Math.abs(ar.left - 360) < 3 && Math.abs(ar.top - 260) < 3 ? 'ok' : 'FAIL',
+            `the arrow tip sits on the target point (${Math.round(ar.left)},${Math.round(ar.top)})`,
+          ]
+    );
 
     const failed = results.filter(([s]) => s === 'FAIL');
     log(results.map(([s, m]) => `${s}  ${m}`).join('\n'));

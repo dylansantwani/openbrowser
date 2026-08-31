@@ -20,6 +20,7 @@ import * as groups from './groups.js';
 import * as windows from './windows.js';
 import { encodeGif } from './gif.js';
 import { getSettings, checkUrlAllowed } from './settings.js';
+import { serializeTabMutation, clearTabMutation } from './mutation-queue.js';
 
 /** Emitted for the side panel's activity log. */
 const activityListeners = new Set();
@@ -49,21 +50,20 @@ export async function dispatch(tool, args = {}) {
   if (!handler) throw new Error(`unknown tool: ${tool}`);
 
   try {
-    const result = await handler(args);
+    let result;
+    if (TAB_MUTATIONS.has(tool) && !args._mutationLockHeld) {
+      const tabId = await resolveTab(args);
+      result = await serializeTabMutation(tabId, () =>
+        handler({ ...args, _resolvedTabId: tabId, _mutationLockHeld: true })
+      );
+    } else {
+      result = await handler(args);
+    }
     logActivity({ tool, args, ok: true, ms: Date.now() - started });
     return normalize(result);
   } catch (err) {
     logActivity({ tool, args, ok: false, error: err.message, ms: Date.now() - started });
     throw err;
-  } finally {
-    // One place rather than every input path: this runs whichever way the call
-    // left, including the error paths, and a call that never borrowed focus
-    // costs nothing here. `browser_tabs`/`browser_window` are excluded because
-    // being asked to focus a tab is the whole point of those two — handing it
-    // straight back would undo what was requested.
-    if (tool !== 'browser_tabs' && tool !== 'browser_window' && borrowedFocus.size) {
-      for (const windowId of [...borrowedFocus.keys()]) releaseForeground(windowId);
-    }
   }
 }
 
@@ -72,6 +72,21 @@ function normalize(result) {
   if (typeof result === 'string') return { text: result };
   return result;
 }
+
+/** A model-controlled group label is display metadata, never identity. */
+const sessionIdOf = (args) => args?._session || null;
+const workstreamOf = (args) => args?.group || args?._session || 'agent';
+const recentScopeKey = (args) => JSON.stringify([sessionIdOf(args), workstreamOf(args)]);
+
+/**
+ * Mutating sequences on one tab are atomic with respect to other agents.
+ * Reads can still fan out freely, and mutations on different tabs remain fully
+ * parallel. The lock covers locate -> dispatch -> verify, not just the final
+ * CDP command; serialising only the command leaves both callers acting on
+ * geometry captured before either page change.
+ */
+const TAB_MUTATIONS = new Set(['browser_navigate', 'browser_act', 'browser_input', 'browser_eval', 'browser_upload']);
+chrome.tabs.onRemoved.addListener(clearTabMutation);
 
 // -----------------------------------------------------------------------------
 // Shared helpers
@@ -115,10 +130,12 @@ async function activeTabId() {
  *   and the error that replaces it says the one thing that helps.
  */
 async function resolveTab(args, { create = true } = {}) {
-  const label = args.group || args._session;
+  const sessionId = sessionIdOf(args);
   let tabId;
 
-  if (args.tabId != null) {
+  if (args._resolvedTabId != null) {
+    tabId = args._resolvedTabId;
+  } else if (args.tabId != null) {
     try {
       await chrome.tabs.get(args.tabId);
       tabId = args.tabId;
@@ -128,13 +145,13 @@ async function resolveTab(args, { create = true } = {}) {
     // Naming a tab explicitly is how you hand one of your own pages to an
     // agent, and from that point it is part of the session's work — so it joins
     // the session's group like everything else it touches. See `claimTab`.
-    await claimTab(tabId, label);
+    await claimTab(tabId, sessionId, workstreamOf(args));
   } else {
     tabId = await sessionTabId(args);
     if (tabId == null) {
-      if (!create && label) {
+      if (!create && sessionId) {
         throw new Error(
-          `"${label}" has no open tab, so there is nothing to act on — pass tabId, ` +
+          `"${sessionId}" has no open tab in workstream "${workstreamOf(args)}", so there is nothing to act on — pass tabId, ` +
             'or see what is open with browser_tabs action:"list".'
         );
       }
@@ -142,8 +159,8 @@ async function resolveTab(args, { create = true } = {}) {
     }
   }
 
-  await rememberSessionTab(label, tabId);
-  noteAgentLabel(tabId, label);
+  await rememberSessionTab(args, tabId);
+  noteAgentLabel(tabId, workstreamOf(args));
   return tabId;
 }
 
@@ -166,18 +183,19 @@ async function resolveTab(args, { create = true } = {}) {
  * Cosmetic, so it never fails a call — a tab that could not be grouped still
  * works perfectly.
  */
-async function claimTab(tabId, label) {
-  if (!label) return; // the side panel is a human driving their own tabs
+async function claimTab(tabId, sessionId, workstream) {
+  if (!sessionId) return; // the side panel is a human driving their own tabs
 
   // Naming a tab used to be the documented way to *override* this check, back
   // when the alternative was an agent stuck with no tab at all. It is not any
   // more — a session that wants a tab opens one — so the override has become
   // nothing but the one thing the hard rule forbids: two agents on one tab,
   // where a navigate for a fresh page wipes out another session's work mid-task.
-  const owner = await groups.workstreamFor(tabId);
-  if (owner && owner !== label) {
+  const owner = await groups.ownerFor(tabId);
+  if (owner?.sessionId && owner.sessionId !== sessionId) {
     throw new Error(
-      `tab ${tabId} belongs to workstream "${owner}", not "${label}" — refusing to take over another session's tab. ` +
+      `tab ${tabId} belongs to session "${owner.sessionId}" (workstream "${owner.workstream}"), not "${sessionId}" — ` +
+        'refusing to take over another session\'s tab. ' +
         'Open your own with browser_tabs action:"new".'
     );
   }
@@ -191,7 +209,7 @@ async function claimTab(tabId, label) {
   const settings = await getSettings();
   const tab = await chrome.tabs.get(tabId).catch(() => null);
   if (tab) {
-    let bound = await windows.boundWindowId(label);
+    let bound = await windows.boundWindowId(sessionId);
 
     if (bound == null) {
       // This branch used to bind the session to the tab's own window — "drive
@@ -206,8 +224,8 @@ async function claimTab(tabId, label) {
       // window.
       bound =
         settings.soloWindow === false
-          ? await windows.bind(label, tab.windowId)
-          : await windows.createFor(label);
+          ? await windows.bind(sessionId, tab.windowId)
+          : await windows.ensureWindow(sessionId, settings);
     }
 
     if (tab.windowId !== bound) {
@@ -222,7 +240,7 @@ async function claimTab(tabId, label) {
 
 
   if (settings.groupTabs === false) return;
-  await groups.assign(tabId, label).catch(() => {});
+  await groups.assign(tabId, sessionId, workstream).catch(() => {});
 }
 
 /**
@@ -241,15 +259,15 @@ async function claimTab(tabId, label) {
  * nothing and left no mess.
  */
 async function openSessionTab(args) {
-  const label = args.group || args._session;
-  if (!label) return activeTabId(); // side panel: the window the human is in
+  const sessionId = sessionIdOf(args);
+  if (!sessionId) return activeTabId(); // side panel: the window the human is in
 
   const settings = await getSettings();
-  const windowId = await windows.ensureWindow(label, settings);
+  const windowId = await windows.ensureWindow(sessionId, settings);
 
   const tab = await openInWindow({ url: 'about:blank', active: false }, windowId);
-  await claimTab(tab.id, label);
-  await rememberCreatedTab(args._session || label, tab.id);
+  await claimTab(tab.id, sessionId, workstreamOf(args));
+  await rememberCreatedTab(sessionId, tab.id);
   return tab.id;
 }
 
@@ -267,11 +285,11 @@ async function openSessionTab(args) {
  * solves the inconsistency by forbidding the thing people actually want. Moving
  * is what "this session works here now" means.
  */
-async function rehomeSession(label, windowId) {
-  if (!label || windowId == null) return 0;
+async function rehomeSession(sessionId, windowId) {
+  if (!sessionId || windowId == null) return 0;
   const settings = await getSettings();
   if (settings.groupTabs === false) return 0;
-  return groups.moveTo(label, windowId).catch(() => 0);
+  return groups.moveTo(sessionId, windowId).catch(() => 0);
 }
 
 /**
@@ -400,7 +418,31 @@ function agentFrameLabel(tabId) {
   return label ? `OpenBrowser · ${label}` : 'OpenBrowser agent';
 }
 
-chrome.tabs.onRemoved.addListener((tabId) => agentLabels.delete(tabId));
+chrome.tabs.onRemoved.addListener((tabId) => {
+  agentLabels.delete(tabId);
+  // The saved screenshot mapping dies with the tab; without this its
+  // session-storage entry would leak for the life of the browser.
+  clearCaptureGeometry(tabId);
+});
+
+/**
+ * Send the live pointer to a top-level viewport point, if the setting is on.
+ *
+ * Fire-and-forget and always to the top frame: the point is already in
+ * top-level coordinates, and a click three iframes deep should still show the
+ * pointer at the right pixel on the screen. Never awaited — the visual must not
+ * add latency to, or fail, the action it is illustrating.
+ */
+function showCursor(tabId, settings, opts) {
+  if (settings.showCursor === false) return;
+  frames.sendToTab(tabId, 'cursor', opts).catch(() => {});
+}
+
+/** A short human label for the cursor pill: the target's name, else the verb. */
+function cursorLabel(action, name) {
+  if (name) return fmt.truncate(name, 32);
+  return action.replace(/_/g, ' ');
+}
 
 /**
  * Tabs each workstream opened for itself.
@@ -454,8 +496,8 @@ async function remember(key, label, tabId, limit) {
   }
 }
 
-const rememberCreatedTab = (label, tabId) => remember(CREATED_TABS_KEY, label, tabId, 64);
-const rememberSessionTab = (label, tabId) => remember(RECENT_TABS_KEY, label, tabId, 16);
+const rememberCreatedTab = (sessionId, tabId) => remember(CREATED_TABS_KEY, sessionId, tabId, 64);
+const rememberSessionTab = (args, tabId) => remember(RECENT_TABS_KEY, recentScopeKey(args), tabId, 16);
 
 async function recallTabs(key, label) {
   if (!label) return [];
@@ -474,8 +516,8 @@ async function recallTabs(key, label) {
  * adopted from the user, and closing someone's own tab because a background job
  * finished is unforgivable. Only what the session created is cleaned up.
  */
-async function endSession(label) {
-  if (!label) return 'no session label';
+async function endSession(sessionId) {
+  if (!sessionId) return 'no session label';
 
   // Forget the session either way. Its bookkeeping must not outlive it even
   // when auto-close is off, or a later session inherits stale tab ids.
@@ -485,8 +527,21 @@ async function endSession(label) {
       // are opening tabs is the ordinary case, and an unguarded read-modify-write
       // here would erase their bookkeeping on the way out.
       return await mutateStored(key, (all) => {
-        const ids = all[label] || [];
-        delete all[label];
+        if (key === RECENT_TABS_KEY) {
+          const ids = [];
+          for (const [scope, tabs] of Object.entries(all)) {
+            try {
+              if (JSON.parse(scope)[0] !== sessionId) continue;
+              ids.push(...tabs);
+              delete all[scope];
+            } catch {
+              /* legacy key; handled by the created-tab record instead */
+            }
+          }
+          return ids;
+        }
+        const ids = all[sessionId] || [];
+        delete all[sessionId];
         return ids;
       });
     } catch {
@@ -500,7 +555,7 @@ async function endSession(label) {
   // The window choice was made for this session and dies with it. Leaving it
   // behind would drop the next session carrying the same name straight into a
   // window nobody chose for it.
-  await windows.unbind(label);
+  await windows.unbind(sessionId);
 
   // Take the border off every tab this session touched. Tabs it merely adopted
   // are the ones that matter — those are the user's own, they outlive the
@@ -516,7 +571,7 @@ async function endSession(label) {
   if (settings.closeTabsOnSessionEnd === false) {
     // Ungroup instead, so a finished session leaves no label behind to block
     // whoever comes next.
-    await groups.release(label).catch(() => {});
+    await groups.release(sessionId).catch(() => {});
     return 'auto-close disabled';
   }
 
@@ -529,7 +584,7 @@ async function endSession(label) {
   for (const tabId of ids) {
     try {
       await chrome.tabs.get(tabId);
-      if (await groups.workstreamFor(tabId)) closable.push(tabId);
+      if ((await groups.ownerFor(tabId))?.sessionId === sessionId) closable.push(tabId);
     } catch {
       /* already gone */
     }
@@ -540,11 +595,11 @@ async function endSession(label) {
   // Anything still carrying this session's label — a tab dragged out and back,
   // or one whose close failed — is released rather than left owned by a session
   // that no longer exists.
-  await groups.release(label).catch(() => {});
+  await groups.release(sessionId).catch(() => {});
 
   return closable.length
-    ? `session "${label}" ended; closed ${closable.length} tab(s) it opened`
-    : `session "${label}" ended; nothing to close`;
+    ? `session "${sessionId}" ended; closed ${closable.length} tab(s) it opened`
+    : `session "${sessionId}" ended; nothing to close`;
 }
 
 /**
@@ -561,8 +616,8 @@ async function endSession(label) {
  * Both are checked for existence, because either can be closed underneath us.
  */
 async function sessionTabId(args) {
-  const label = args.group || args._session;
-  if (!label) return null; // the side panel drives the active tab, as a human expects
+  const sessionId = sessionIdOf(args);
+  if (!sessionId) return null; // the side panel drives the active tab, as a human expects
 
   // The window the session was told to work in. Everything below is filtered
   // against it, because a candidate in another window is the wrong-window bug:
@@ -574,11 +629,11 @@ async function sessionTabId(args) {
   // Read rather than ensured: this must never ask "which window?" as a side
   // effect of resolving a tab. A session with no binding yet has no constraint
   // to apply, and `openSessionTab` is where the question belongs.
-  const boundWindow = await windows.boundWindowId(label);
+  const boundWindow = await windows.boundWindowId(sessionId);
 
   const candidates = [
-    ...(await groups.tabsFor(label, boundWindow ?? undefined)),
-    ...(await recallTabs(RECENT_TABS_KEY, label)),
+    ...(await groups.tabsFor(sessionId, workstreamOf(args), boundWindow ?? undefined)),
+    ...(await recallTabs(RECENT_TABS_KEY, recentScopeKey(args))),
   ];
 
   for (const tabId of candidates) {
@@ -670,6 +725,10 @@ async function withDelta(tabId, fn) {
   // no error, no delta, and the thing the agent wanted sitting in a tab it was
   // never told about. That is most of commerce and search results.
   const before = await tabIdSet();
+  // The tab's own URL before the action, so a same-tab navigation counts as a
+  // change even when the diff below cannot see it (see the fallback near the
+  // return).
+  const beforeUrl = (await chrome.tabs.get(tabId).catch(() => null))?.url;
 
   const result = await fn();
   let changed;
@@ -703,6 +762,19 @@ async function withDelta(tabId, fn) {
       changed = 'page too large to diff quickly — call browser_snapshot if you need to see the result';
     }
   }
+  // A same-tab navigation is a real change even when the diff missed it: a
+  // cross-origin click lands the new document after the settle window, so the
+  // snapshot above runs before its content script is ready and throws, leaving
+  // `changed` empty. Without this a click that navigated is reported as "no page
+  // change detected" — the exact false negative the settling note exists to
+  // avoid, and worst on the most common click of all. The tab's own URL is the
+  // ground truth the diff could not reach.
+  if (!changed) {
+    const afterUrl = (await chrome.tabs.get(tabId).catch(() => null))?.url;
+    if (afterUrl && beforeUrl && afterUrl !== beforeUrl) {
+      changed = `navigated to ${fmt.shortUrl(afterUrl)}`;
+    }
+  }
   if (opened.length) {
     const list = opened.map((t) => `tab ${t.id} (${fmt.shortUrl(t.url || t.pendingUrl || '')})`).join(', ');
     const note = `opened ${list} — the click targeted a new tab; pass that tabId to act on it`;
@@ -710,138 +782,6 @@ async function withDelta(tabId, fn) {
   }
 
   return { result, changed };
-}
-
-/**
- * Make a tab foreground before dispatching trusted input at it.
- *
- * A backgrounded tab silently drops `Input.dispatchMouseEvent` and
- * `Input.dispatchKeyEvent`: the compositor is not processing input for a hidden
- * tab, so the events land nowhere. Nothing errors. The click reports success,
- * the page never sees it, and the agent carries on believing it clicked —
- * which is the single worst failure this project can produce, in its most-used
- * tool.
- *
- * Reproduced with `document.visibilityState === 'hidden'`: a click on a planted
- * button left it untouched for seven seconds, then fired instantly once the tab
- * was activated.
- *
- * Screenshots and the accessibility tree work fine on hidden tabs, so only the
- * input paths need this. The cost is real — parallel work cannot type into
- * several tabs at once, because only one tab per window can be foreground — but
- * serialising input is strictly better than dropping it.
- *
- * `active` is necessary and not sufficient, which is the part that took longest
- * to see. A tab is `active` in a window that is minimized, and `active` in a
- * window another window completely covers, and Chrome calls the document hidden
- * in both — so the check that matters is the page's own `visibilityState`, and
- * the only thing that can answer it is the page. Without that round trip the
- * minimized case is not merely unhandled, it is *advertised*: `browser_window
- * state:"minimized"` says automation keeps running, and every click after it
- * silently lands nowhere.
- *
- * @param {number} tabId
- * @param {string} [label] the session, for the shared-window advice
- * @returns {Promise<string|null>} something the caller should tell the model
- */
-async function ensureForeground(tabId, label) {
-  let note = null;
-  try {
-    let tab = await chrome.tabs.get(tabId);
-
-    // Activating a tab is invisible inside a window that holds nothing but this
-    // session's work, and is somebody's view being taken anywhere else. So the
-    // tab comes home before it is activated, rather than the window being
-    // switched around whoever is in it. `ownWindowId` is the only thing that
-    // can tell the two cases apart — a window id says nothing about who else is
-    // in it — and it answers null for a window the session merely landed in,
-    // including a binding written before this distinction existed.
-    const relocated = await relocateToOwnWindow(tab, label);
-    if (relocated) tab = relocated;
-
-    // Relocation is best-effort; this is not. If the tab could not be brought
-    // home, the call stops here rather than switching tabs under whoever is in
-    // that window.
-    await assertOwnWindow(tab.id, label, 'foreground');
-
-    const win = await chrome.windows.get(tab.windowId).catch(() => null);
-
-    // Restoring a minimized window is not focus theft — a minimized window is
-    // one nobody is looking at, and leaving it minimized means the action does
-    // nothing at all.
-    if (win?.state === 'minimized') {
-      await chrome.windows.update(tab.windowId, { state: 'normal' }).catch(() => {});
-      await settle(150);
-    }
-
-    if (!tab.active) {
-      // Sharing a window with the person using the browser. Activating is still
-      // the only way to make the click land, so this is said rather than
-      // avoided — once per session per window, because it is advice, and advice
-      // repeated on every click is just cost.
-      if (win?.focused && label) note = sharedWindowNote(label, tab.windowId);
-
-      // Remember what the human was looking at, so it can be put back. Only the
-      // first steal in a burst is recorded: a run of twenty clicks should return
-      // to the tab you were on before the first one, not to tab nineteen.
-      if (!borrowedFocus.has(tab.windowId)) {
-        const [wasActive] = await chrome.tabs.query({ active: true, windowId: tab.windowId });
-        if (wasActive && wasActive.id !== tabId) {
-          borrowedFocus.set(tab.windowId, { previousTabId: wasActive.id, agentTabId: tabId });
-        }
-      }
-
-      await chrome.tabs.update(tabId, { active: true });
-      // The compositor needs a moment before it will accept input.
-      await settle(120);
-    }
-
-    return (await hiddenTabWarning(tabId, tab.windowId)) || note;
-  } catch (err) {
-    // The refusal is the one error here that must reach the caller. Everything
-    // else is best-effort: if the tab cannot be activated the input may still
-    // land, and failing the action would turn a maybe into a definite no.
-    if (err?.obRefuse) throw err;
-    return note;
-  }
-}
-
-/**
- * Bring a tab into the window this session owns, so activating it disturbs
- * nobody.
- *
- * Only ever moves *to* a window opened for the session, never into one someone
- * else is in, and does nothing at all when the tab is already home — which is
- * the common case, so the common case costs one storage read.
- *
- * The whole workstream travels, not just this tab. Moving one tab and leaving
- * its siblings is the drift that reads, from inside an agent, as being told it
- * works in one window while demonstrably acting in another.
- *
- * `soloWindow: false` opts out of all of it: someone who deliberately keeps an
- * agent in their own window to watch it has asked for the tab switching too.
- */
-async function relocateToOwnWindow(tab, label) {
-  if (!label || tab.active) return null;
-
-  const settings = await getSettings();
-  if (settings.soloWindow === false) return null;
-
-  let own = await windows.ownWindowId(label);
-  if (own === tab.windowId) return null;
-  if (own == null) own = await windows.createFor(label);
-  if (own == null || own === tab.windowId) return null;
-
-  try {
-    await rehomeSession(label, own);
-    const now = await chrome.tabs.get(tab.id);
-    if (now.windowId !== own) await chrome.tabs.move(tab.id, { windowId: own, index: -1 });
-    await tidyBlankTabs(own, tab.id);
-    return await chrome.tabs.get(tab.id);
-  } catch {
-    // Better to click in the wrong window than not to click at all.
-    return null;
-  }
 }
 
 /**
@@ -879,100 +819,6 @@ async function assertOwnWindow(tabId, label, what) {
   throw err;
 }
 
-/** `${label}:${windowId}` already told. In-memory: a repeat costs one line. */
-const sharedWindowTold = new Set();
-
-function sharedWindowNote(label, windowId) {
-  const key = `${label}:${windowId}`;
-  if (sharedWindowTold.has(key)) return null;
-  sharedWindowTold.add(key);
-  return (
-    `NOTE: this session shares window ${windowId} with the user, so every click has to pull ` +
-    'their view to its tab. browser_window action:"new" gives it a window of its own.'
-  );
-}
-
-/**
- * Ask the page whether it is actually visible, after everything above has tried
- * to make it so.
- *
- * Best-effort by design: a tab with no content script cannot answer, and that
- * has always been a case where the input may still land. Silence is read as
- * "probably fine" rather than escalated, because the alternative — raising the
- * window — is the exact interruption the caller is trying to avoid, and this
- * would do it on every page the scripts have not reached yet.
- *
- * A confirmed hidden tab is reported instead of fixed, for the same reason. The
- * fix is a human uncovering a window; saying which window, and that the input
- * probably went nowhere, is worth more than a click that lies about landing.
- */
-async function hiddenTabWarning(tabId, windowId) {
-  // A native JS dialog pauses the renderer, so the content script cannot answer
-  // and `sendToTab` has no timeout — asking here would hang the call outright.
-  // `pageMeta` guards the same way for the same reason.
-  if (cdp.pendingDialog(tabId)) return null;
-
-  let state;
-  try {
-    state = (await frames.sendToTab(tabId, 'visibility', {}))?.visibility;
-  } catch {
-    return null;
-  }
-  if (state !== 'hidden') return null;
-  return (
-    `WARNING: tab ${tabId} is hidden — window ${windowId} is covered by another window or off-screen, ` +
-    'and Chrome drops trusted input into hidden tabs, so this action probably did not reach the page. ' +
-    'Ask the user to uncover that window, or move this session with browser_window action:"new".'
-  );
-}
-
-/** windowId -> {previousTabId, agentTabId} while the agent has focus on loan. */
-const borrowedFocus = new Map();
-const focusTimers = new Map();
-
-/**
- * Give the tab back.
- *
- * Input has to be dispatched at a foreground tab — a hidden one drops mouse and
- * key events on the floor, which is why `ensureForeground` exists at all. But
- * *keeping* the foreground afterwards is not part of that requirement, and a
- * background job stealing the tab you are reading, in the window you are
- * working in, is the tool interrupting you to do something you asked it to do
- * quietly.
- *
- * Debounced, because a burst of clicks would otherwise flip the view back and
- * forth on every one. Restored only if the agent's tab is still the active one:
- * if you switched tabs yourself in the meantime, that is your decision and this
- * must not overrule it.
- */
-function releaseForeground(windowId, delay = 700) {
-  clearTimeout(focusTimers.get(windowId));
-  focusTimers.set(
-    windowId,
-    setTimeout(async () => {
-      focusTimers.delete(windowId);
-      const borrowed = borrowedFocus.get(windowId);
-      if (!borrowed) return;
-      const settings = await getSettings();
-      if (settings.restoreFocusAfterInput === false) {
-        borrowedFocus.delete(windowId);
-        return;
-      }
-      borrowedFocus.delete(windowId);
-      try {
-        const [nowActive] = await chrome.tabs.query({ active: true, windowId });
-        // Moved on already, or the human took over — either way, leave it.
-        if (!nowActive || nowActive.id !== borrowed.agentTabId) return;
-        await chrome.tabs.get(borrowed.previousTabId);
-        await chrome.tabs.update(borrowed.previousTabId, { active: true });
-      } catch {
-        /* the tab or window went away; nothing to put back */
-      }
-    }, delay)
-  );
-}
-
-
 /**
  * Tell "the app has not reacted yet" from "the click went nowhere".
  *
@@ -986,7 +832,7 @@ async function settlingNote(tabId) {
   if (!result) return null;
   return result.mutated
     ? 'no diff yet, but the page is still changing — browser_wait or snapshot again in a moment'
-    : 'no change detected — the click may have missed, or this control does nothing on its own';
+    : 'UNVERIFIED: no page change was detected — the input was dispatched, but it may have missed or this control may do nothing on its own. Verify the expected state before continuing.';
 }
 
 /** Ids of every open tab, for spotting ones an action creates. */
@@ -1082,7 +928,7 @@ const HANDLERS = {
    * the server rejects names it does not publish, so this cannot be invoked by
    * a model, only by the hub that observed the socket close.
    */
-  __session_end: (args) => endSession(args._session || args.group),
+  __session_end: (args) => endSession(args._session),
 
   /**
    * Internal: this browser's windows, for the hub's cross-browser chooser.
@@ -1126,8 +972,8 @@ const HANDLERS = {
    * still spoken for.
    */
   async __session_list() {
-    const names = new Set((await groups.list()).map((g) => g.name));
-    for (const key of [CREATED_TABS_KEY, RECENT_TABS_KEY]) {
+    const names = new Set((await groups.list()).map((g) => g.sessionId).filter(Boolean));
+    for (const key of [CREATED_TABS_KEY]) {
       try {
         for (const label of Object.keys((await chrome.storage.session.get(key))[key] || {})) {
           names.add(label);
@@ -1148,34 +994,36 @@ const HANDLERS = {
         // `windowId` used to be accepted here and silently dropped, so two
         // different windows returned byte-identical listings — an agent
         // checking where it was got the same answer whatever it asked.
-        const label = args.group || args._session;
+        const sessionId = sessionIdOf(args);
         const tabs = await chrome.tabs.query(args.windowId != null ? { windowId: args.windowId } : {});
         const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
         const workstreams = await groups.list();
-        const bound = label ? await windows.boundWindowId(label) : null;
+        const bound = sessionId ? await windows.boundWindowId(sessionId) : null;
 
         const scope = args.windowId != null ? ` in window ${args.windowId}` : '';
         const lines = [
           `${tabs.length} tab(s)${scope}:`,
-          fmt.renderTabs(tabs, active?.id, workstreams, { boundWindowId: bound, label }),
+          fmt.renderTabs(tabs, active?.id, workstreams, { boundWindowId: bound, sessionId }),
         ];
         if (workstreams.length) {
           lines.push(
             '',
             'workstreams:',
             ...workstreams.map(
-              (w) => `  ${w.name} (${w.color}) — window ${w.windowId}, ${w.tabIds.length} tab(s): ${w.tabIds.join(', ')}`
+              (w) =>
+                `  ${w.name}${w.sessionId && w.sessionId !== w.name ? ` · ${w.sessionId}` : ''} (${w.color}) — ` +
+                `window ${w.windowId}, ${w.tabIds.length} tab(s): ${w.tabIds.join(', ')}`
             )
           );
         }
         // Said once, plainly, rather than left to be inferred from the tags: a
         // workstream group can sit in a window the session no longer works in.
-        if (label) {
+        if (sessionId) {
           lines.push(
             '',
             bound == null
-              ? `"${label}" has no window bound yet — the next tab it opens will settle it, or bind one now with browser_window action:"use" windowId:<id>.`
-              : `"${label}" works in window ${bound}; tabs it opens go there.`
+              ? `"${sessionId}" has no window bound yet — the next tab it opens will settle it, or bind one now with browser_window action:"use" windowId:<id>.`
+              : `"${sessionId}" works in window ${bound}; tabs it opens go there.`
           );
         }
         return lines.join('\n');
@@ -1192,8 +1040,8 @@ const HANDLERS = {
         // is the whole point of binding one. Asking here — before the tab
         // exists — is what stops a "which window?" question from arriving after
         // a tab has already been opened in the wrong one.
-        const sessionLabel = args.group || args._session;
-        const windowId = args.windowId ?? (await windows.ensureWindow(sessionLabel, settings)) ?? undefined;
+        const sessionId = sessionIdOf(args);
+        const windowId = args.windowId ?? (await windows.ensureWindow(sessionId, settings)) ?? undefined;
 
         // Background by default: opening ten tabs should not yank focus ten times.
         // Placement is verified rather than assumed — see `openInWindow`, which
@@ -1207,7 +1055,7 @@ const HANDLERS = {
         let active = args.background === false;
         let downgraded = '';
         if (active && settings.soloWindow !== false) {
-          if ((await windows.ownWindowId(sessionLabel)) !== windowId) {
+          if ((await windows.ownWindowId(sessionId)) !== windowId) {
             active = false;
             downgraded = ` (opened in the background: window ${windowId} is not this session's)`;
           }
@@ -1219,16 +1067,17 @@ const HANDLERS = {
         // `group` wins over the session label, letting an agent split its own
         // work into named sub-workstreams.
         let grouped = '';
-        const label = args.group || args._session;
-        if (label && settings.groupTabs !== false) {
-          const ok = await groups.assign(tab.id, label).catch(() => null);
-          if (ok) grouped = ` in "${label}"`;
+        const workstream = workstreamOf(args);
+        if (sessionId && settings.groupTabs !== false) {
+          const ok = await groups.assign(tab.id, sessionId, workstream).catch(() => null);
+          if (ok) grouped = ` in "${workstream}"`;
         }
         // Recorded against the *session*, not the group. An agent is told to
         // use one group per task, so a session routinely spreads its tabs
         // across several named groups — keying this on the group would mean
         // cleanup almost never matched anything.
-        await rememberCreatedTab(args._session || label, tab.id);
+        await rememberCreatedTab(sessionId, tab.id);
+        await rememberSessionTab(args, tab.id);
 
         if (url !== 'about:blank') await waitForLoad(tab.id, 15000).catch(() => {});
         const meta = await pageMeta(tab.id).catch(() => ({ url }));
@@ -1239,19 +1088,22 @@ const HANDLERS = {
         if (!args.group) throw new Error('pass `group` — the workstream label to put these tabs under.');
         if (!groups.isSupported()) throw new Error('this Chrome build does not support tab groups');
         const ids = args.tabIds?.length ? args.tabIds : [await resolveTab(args)];
-        const done = await groups.assignMany(ids, args.group);
+        const sessionId = sessionIdOf(args);
+        if (!sessionId) throw new Error('grouping tabs through MCP requires a session identity.');
+        for (const id of ids) await claimTab(id, sessionId, args.group);
+        const done = await groups.assignMany(ids, sessionId, args.group);
         return `grouped ${done.length} tab(s) into "${args.group}"`;
       }
 
       case 'ungroup': {
         if (!args.group) throw new Error('pass `group` — the workstream to release.');
-        const ok = await groups.release(args.group);
+        const ok = await groups.release(sessionIdOf(args), args.group);
         return ok ? `released workstream "${args.group}" (tabs stay open)` : `no workstream named "${args.group}"`;
       }
 
       case 'close_group': {
         if (!args.group) throw new Error('pass `group` — the workstream to close.');
-        const n = await groups.closeWorkstream(args.group);
+        const n = await groups.closeWorkstream(sessionIdOf(args), args.group);
         return n ? `closed ${n} tab(s) in workstream "${args.group}"` : `no workstream named "${args.group}"`;
       }
 
@@ -1268,7 +1120,7 @@ const HANDLERS = {
         // *window* forward that belongs to somebody else. `resolveTab` will
         // normally have moved this tab home already, so this only bites when
         // that failed.
-        await assertOwnWindow(tabId, args.group || args._session, 'select');
+        await assertOwnWindow(tabId, sessionIdOf(args), 'select');
         const tab = await chrome.tabs.update(tabId, { active: true });
         await chrome.windows.update(tab.windowId, { focused: true });
         return `tab ${tabId} is now active\n${fmt.pageHeader(await pageMeta(tabId), tabId)}`;
@@ -1325,6 +1177,10 @@ const HANDLERS = {
     }
 
     fmt.clearSnapshot(tabId);
+    // The screenshot mapping belonged to the page we are leaving; drop it so a
+    // stray space:"image" click cannot convert against the old page. The
+    // freshness check in imageToViewport is the backstop, this is the tidy path.
+    clearCaptureGeometry(tabId);
 
     const waitUntil = args.waitUntil || 'load';
     if (waitUntil !== 'none') {
@@ -1515,11 +1371,11 @@ const HANDLERS = {
       return scrollAction(tabId, args);
     }
 
-    // Everything below needs a real pointer event at a real coordinate — and a
-    // hidden tab drops those on the floor. Foreground it before locating the
-    // target, since becoming visible can change layout.
-    const fgNote = await ensureForeground(tabId, args.group || args._session);
-
+    // CDP input is addressed to a render target, not to the globally focused
+    // Chrome window. Do not activate the tab or raise its window here: doing so
+    // interrupts the person using the browser and is unnecessary for the same
+    // direct Input.dispatch* path used by Claude-in-Chrome. Outcome reporting
+    // below says when the page did not produce a verifiable change.
     const target = await locateTarget(tabId, args);
 
     if (target.obstructed && !args.force) {
@@ -1536,6 +1392,18 @@ const HANDLERS = {
       const route = await frames.routeRef(tabId, args.ref);
       frames.sendToFrame(tabId, route.frameId, 'highlight', { ref: route.localRef, label: action }).catch(() => {});
     }
+
+    // Send the pointer to the same top-level point the trusted click will land
+    // on. Hover leaves no mark of its own, so it moves the cursor without a
+    // ripple; every other pointer action rings on contact. This is the only
+    // feedback a coordinate click gets, since there is no element to outline.
+    showCursor(tabId, settings, {
+      x: target.point.x,
+      y: target.point.y,
+      action,
+      label: cursorLabel(action, target.name),
+      click: action !== 'hover',
+    });
 
     const { changed } = await withDelta(tabId, async () => {
       const { x, y } = target.point;
@@ -1560,8 +1428,12 @@ const HANDLERS = {
         case 'drag': {
           const dest = args.toRef
             ? (await locateTarget(tabId, { ref: args.toRef })).point
-            : { x: args.to?.[0], y: args.to?.[1] };
+            : args.space === 'image' && args.to
+              ? await imageToViewport(tabId, args.to)
+              : { x: args.to?.[0], y: args.to?.[1] };
           if (dest.x == null) throw new Error('drag needs a destination: pass `to` [x,y] or `toRef`.');
+          // Carry the pointer to where it is being dropped, then ring there.
+          showCursor(tabId, settings, { x: dest.x, y: dest.y, action: 'drop', label: 'drop', click: true });
           await cdp.drag(tabId, { x, y }, dest, opts);
           break;
         }
@@ -1572,7 +1444,9 @@ const HANDLERS = {
       await settle(action === 'hover' ? 120 : 350);
     });
 
-    const label = args.ref ? `${action} ${args.ref}${target.name ? ` ("${fmt.truncate(target.name, 40)}")` : ''}` : `${action} at ${Math.round(target.point.x)},${Math.round(target.point.y)}`;
+    const label = args.ref
+      ? `dispatched ${action} ${args.ref}${target.name ? ` ("${fmt.truncate(target.name, 40)}")` : ''}`
+      : `dispatched ${action} at ${Math.round(target.point.x)},${Math.round(target.point.y)}`;
 
     // A click that changed nothing is ambiguous, and the two possibilities need
     // opposite responses: wait, or try something else. "Nothing" includes a
@@ -1586,7 +1460,7 @@ const HANDLERS = {
     const nothingHappened = !changed || fmt.isFocusOnly(changed);
     const note = nothingHappened && action !== 'hover' && !dlg ? await settlingNote(tabId) : null;
 
-    let label2 = fgNote ? `${label}\n${fgNote}` : label;
+    let label2 = label;
     if (dlg) {
       // The action itself opened a native dialog. The renderer is paused now;
       // say what it is and how to answer it instead of leaving the next call
@@ -1605,25 +1479,6 @@ const HANDLERS = {
   async browser_input(args) {
     const tabId = await resolveTab(args);
     const { settings } = await prepareTab(tabId);
-    // Keystrokes are dropped by a hidden tab exactly as clicks are — but only
-    // keystrokes. Filling fields goes through the content script, which writes
-    // the DOM directly and works perfectly on a tab nobody can see. Measured,
-    // not assumed: a field set on a tab reporting `visibilityState: "hidden"`
-    // reads back correctly, while a trusted click on the same tab is dropped
-    // without an error.
-    //
-    // So this is deferred to the moment something actually needs the tab in
-    // front, rather than paid on the way in. A form fill — the most common
-    // thing this tool does — now disturbs nothing at all. Memoised, because
-    // several branches below can each be the first to need it, and lazy rather
-    // than a precomputed flag so a future CDP path cannot forget to ask.
-    let fgNote = null;
-    let foregrounded = false;
-    const foreground = async () => {
-      if (foregrounded) return;
-      foregrounded = true;
-      fgNote = await ensureForeground(tabId, args.group || args._session);
-    };
 
     const summary = [];
 
@@ -1655,7 +1510,6 @@ const HANDLERS = {
 
       // 2. Free-text typing, as trusted keystrokes.
       if (args.text != null) {
-        await foreground();
         if (args.ref) {
           const route = await frames.routeRef(tabId, args.ref);
           const target = await frames.sendToFrame(tabId, route.frameId, 'resolve', { ref: route.localRef });
@@ -1667,6 +1521,7 @@ const HANDLERS = {
           if (settings.highlightActions) {
             frames.sendToFrame(tabId, route.frameId, 'highlight', { ref: route.localRef, label: 'type' }).catch(() => {});
           }
+          showCursor(tabId, settings, { x: target.point.x, y: target.point.y, action: 'type', label: 'type', click: true });
         }
         await cdp.typeText(tabId, args.text, { delay: args.delay ?? 0, newline: args.newline });
 
@@ -1694,7 +1549,6 @@ const HANDLERS = {
 
       // 3. Explicit key presses.
       if (args.keys?.length) {
-        await foreground();
         if (args.ref && args.text == null) {
           // `text` clicks its ref to focus; keys have to as well, or a chord
           // goes wherever focus happened to already be.
@@ -1721,14 +1575,13 @@ const HANDLERS = {
         for (const key of args.keys) {
           await cdp.pressKey(tabId, key);
           await settle(40);
-          summary.push(`pressed ${key}`);
+          summary.push(`dispatched ${key}`);
         }
       }
 
       if (args.submit) {
-        await foreground();
         await cdp.pressKey(tabId, 'Enter');
-        summary.push('pressed Enter');
+        summary.push('dispatched Enter');
       }
 
       await settle(300);
@@ -1738,9 +1591,11 @@ const HANDLERS = {
       throw new Error('nothing to do — pass `fields`, `text`, or `keys`.');
     }
 
-    // Appended after the "did anything happen at all?" check below, so a note
-    // can never stand in for work and turn an empty call into a successful one.
-    const done = fgNote ? `${summary.join('\n')}\n${fgNote}` : summary.join('\n');
+    let done = summary.join('\n');
+    if (!changed && ((args.text != null && !args.ref) || args.keys?.length || args.submit)) {
+      done += '\nUNVERIFIED: the keystrokes were dispatched, but no target value or page change could be read back. ' +
+        'Pass ref when typing, or verify the expected result with browser_wait/snapshot.';
+    }
     return fmt.actionResult(done, { changed, meta: await pageMeta(tabId), tabId });
   },
 
@@ -1784,15 +1639,26 @@ const HANDLERS = {
     // nothing about the CSS-pixel space that `region` and every coordinate
     // argument use. captureGeometry derives the factor from the image against
     // what it covered, and says so when the mapping is not 1:1.
-    const line = fmt.captureGeometry({
+    const geometry = {
       mode: args.mode || 'viewport',
       clip,
       meta,
       image: { width: resized.width, height: resized.height },
-    });
+    };
+    const line = fmt.captureGeometry(geometry);
+
+    // Remember how this image maps to the page, and tell the model the one call
+    // that clicks a point it reads off the image — the extension does the factor
+    // math so a vision model does not have to. This is what makes coordinate
+    // clicking reliable for local models that only have the picture to go on.
+    const mapping = fmt.captureMapping(geometry);
+    await saveCaptureGeometry(tabId, mapping, meta);
+    const hint = mapping
+      ? '\n→ to click a spot in this image: browser_act action:"click" coordinate:[imageX,imageY] space:"image"'
+      : '';
 
     return {
-      text: `${fmt.pageHeader(meta, tabId)}\n${line}`,
+      text: `${fmt.pageHeader(meta, tabId)}\n${line}${hint}`,
       images: [{ data: resized.data, mimeType: format === 'png' ? 'image/png' : 'image/jpeg' }],
     };
   },
@@ -2009,7 +1875,14 @@ const HANDLERS = {
     // Fan the same steps across several tabs, concurrently.
     if (args.parallel?.length) {
       const runs = await Promise.allSettled(
-        args.parallel.map((tabId) => runSteps(steps.map((s) => ({ ...s, args: { ...s.args, tabId } })), args))
+        args.parallel.map((tabId) =>
+          serializeTabMutation(tabId, () =>
+            runSteps(
+              steps.map((s) => ({ ...s, args: { ...s.args, tabId } })),
+              { ...args, _mutationLockHeld: true }
+            )
+          )
+        )
       );
       return runs
         .map((run, i) => {
@@ -2020,6 +1893,19 @@ const HANDLERS = {
         .join('\n\n');
     }
 
+    // When every mutating step names the same tab, hold its queue for the whole
+    // batch. Locking each step separately lets another agent navigate or type
+    // between "open composer" and "fill composer", which is still a race even
+    // though each individual click is serialized correctly.
+    const mutationTabs = steps
+      .filter((step) => TAB_MUTATIONS.has(step.tool))
+      .map((step) => step.args?.tabId ?? args.tabId);
+    const explicitTabs = [...new Set(mutationTabs.filter((id) => id != null))];
+    if (mutationTabs.length && explicitTabs.length === 1 && mutationTabs.every((id) => id === explicitTabs[0])) {
+      const tabId = explicitTabs[0];
+      return serializeTabMutation(tabId, () => runSteps(steps, { ...args, _mutationLockHeld: true }));
+    }
+
     return runSteps(steps, args);
   },
 
@@ -2027,13 +1913,6 @@ const HANDLERS = {
   async browser_upload(args) {
     const tabId = await resolveTab(args);
     await prepareTab(tabId);
-    // Only one of the two paths below needs a visible tab, and which one it is
-    // is not known until the page has been asked whether a file input exists.
-    // Foregrounding up front paid that cost every time for the sake of the
-    // branch that is taken less often — `setFileInput` writes the input through
-    // CDP without a pointer event anywhere near it.
-    let fgNote = null;
-
     const route = args.ref ? await frames.routeRef(tabId, args.ref) : { frameId: 0, localRef: undefined };
     const target = await frames.sendToFrame(tabId, route.frameId, 'uploadTarget', { ref: route.localRef });
 
@@ -2055,9 +1934,6 @@ const HANDLERS = {
         );
       }
 
-      // This branch clicks the trigger, so now the tab has to be in front.
-      fgNote = await ensureForeground(tabId, args.group || args._session);
-
       // Re-locate on every attempt rather than closing over one point: the
       // retry exists because the page was still settling, and a settling page
       // is exactly the one whose buttons have moved by the second try.
@@ -2075,12 +1951,12 @@ const HANDLERS = {
     await settle(600);
     const meta = await pageMeta(tabId);
     const attached = `attached ${args.paths.length} file(s) (${how})`;
-    return fmt.actionResult(fgNote ? `${attached}\n${fgNote}` : attached, { meta, tabId });
+    return fmt.actionResult(attached, { meta, tabId });
   },
 
   // -------------------------------------------------------------- window ----
   async browser_window(args) {
-    const label = args.group || args._session;
+    const label = sessionIdOf(args);
 
     // Window selection is handled before anything touches a tab. It has to be:
     // this is the call an agent makes *because* it has no window yet, and
@@ -2198,7 +2074,7 @@ const HANDLERS = {
       done.push(`network ${args.throttle}`);
     }
     if (args.focus) {
-      await assertOwnWindow(tabId, args.group || args._session, 'focus');
+      await assertOwnWindow(tabId, sessionIdOf(args), 'focus');
       const tab = await chrome.tabs.update(tabId, { active: true });
       await chrome.windows.update(tab.windowId, { focused: true });
       done.push('focused');
@@ -2207,19 +2083,10 @@ const HANDLERS = {
     if (args.state) {
       const { windowId } = await chrome.tabs.get(tabId);
       await chrome.windows.update(windowId, { state: args.state });
-      // This used to claim a minimized window "still accepts debugger input, so
-      // nothing about the run changes". Half of that is true and the half that
-      // is not is the expensive half: snapshots and screenshots do keep working,
-      // but every tab in a minimized window is `hidden`, and Chrome drops
-      // trusted input into hidden tabs. So the tool was recommending a state in
-      // which every subsequent click silently landed nowhere.
-      //
-      // `ensureForeground` now un-minimizes before dispatching input, which
-      // makes the recommendation safe and also makes it partly self-cancelling
-      // — worth saying, since "minimized" that quietly un-minimizes on the next
-      // click is otherwise a surprise.
       done.push(
-        args.state === 'minimized' ? 'minimized (reads continue; input un-minimizes it)' : args.state
+        args.state === 'minimized'
+          ? 'minimized (OpenBrowser will not raise it automatically; verify state-changing input because sites may throttle minimized pages)'
+          : args.state
       );
     }
 
@@ -2329,6 +2196,7 @@ async function runSteps(steps, { stopOnError = true, returnEach = false, ...batc
   if (batchArgs.tabId != null) defaults.tabId = batchArgs.tabId;
   if (batchArgs.group) defaults.group = batchArgs.group;
   if (batchArgs._session) defaults._session = batchArgs._session;
+  if (batchArgs._mutationLockHeld) defaults._mutationLockHeld = true;
 
   for (const [i, step] of steps.entries()) {
     if (step.tool === 'browser_batch') {
@@ -2363,11 +2231,131 @@ async function runSteps(steps, { stopOnError = true, returnEach = false, ...batc
 }
 
 /**
+ * Per-tab record of the last screenshot's coordinate mapping, so a later
+ * `browser_act coordinate:[…] space:"image"` can convert image pixels back to
+ * the viewport. Lives in session storage because the service worker is torn
+ * down between the capture and the click, and is keyed by tab because two tabs
+ * captured at different scales must not share a factor.
+ */
+function captureKey(tabId) {
+  return `ob_capture_${tabId}`;
+}
+
+async function clearCaptureGeometry(tabId) {
+  try {
+    await chrome.storage.session.remove(captureKey(tabId));
+  } catch {
+    /* nothing to clear, or session storage gone with the worker — either way
+       a load below returns null and image-space clicks report "take one first" */
+  }
+}
+
+/**
+ * Remember how the just-captured image maps to the page, stamped with the URL
+ * and viewport it was taken against so a later click can tell whether the image
+ * still describes the page.
+ *
+ * A null mapping (no viewport, so no honest factor) must *clear* the record, not
+ * leave the previous one in place — otherwise a click that reads pixels off the
+ * unmapped image would be converted with a stale factor from an earlier,
+ * differently-sized shot, and land somewhere plausible but wrong with no error.
+ */
+async function saveCaptureGeometry(tabId, mapping, meta) {
+  if (!mapping) {
+    await clearCaptureGeometry(tabId);
+    return;
+  }
+  try {
+    await chrome.storage.session.set({
+      [captureKey(tabId)]: {
+        ...mapping,
+        url: meta?.url || '',
+        vw: meta?.viewport?.w || 0,
+        vh: meta?.viewport?.h || 0,
+        ts: Date.now(),
+      },
+    });
+  } catch {
+    /* session storage unavailable (rare); image-space clicks will just report
+       "take a screenshot first" until the next capture succeeds */
+  }
+}
+
+async function loadCaptureGeometry(tabId) {
+  try {
+    const key = captureKey(tabId);
+    const got = await chrome.storage.session.get(key);
+    return got[key] || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Invert an image-pixel coordinate to a viewport CSS-pixel click point using
+ * the mapping saved by the last screenshot of this tab.
+ *
+ * `originX/Y` place the captured region within the page (a `region` shot starts
+ * at its own offset), and `scale` undoes both rescalings at once. A full_page
+ * capture is document-space, so its inverted point is shifted by the *current*
+ * scroll — read now, not at capture time, since the page may have moved.
+ *
+ * The mapping describes one specific image. If the page navigated or the window
+ * resized since it was taken, image pixels no longer correspond to anything, so
+ * this refuses rather than clicking somewhere plausible — the same "an error
+ * beats a silent wrong click" stance the whole coordinate story rests on.
+ */
+async function imageToViewport(tabId, [imgX, imgY]) {
+  const g = await loadCaptureGeometry(tabId);
+  if (!g) {
+    throw new Error(
+      'space:"image" needs a recent browser_screenshot of this tab to convert from — ' +
+        'take one first, or drop space:"image" to pass viewport CSS pixels directly.'
+    );
+  }
+
+  const meta = await pageMeta(tabId).catch(() => null);
+  if (meta) {
+    const vw = meta.viewport?.w;
+    const vh = meta.viewport?.h;
+    const navigated = g.url && meta.url && g.url !== meta.url;
+    const resized = g.vw && vw && (g.vw !== vw || g.vh !== vh);
+    if (navigated || resized) {
+      await clearCaptureGeometry(tabId);
+      throw new Error(
+        `the page ${navigated ? 'navigated' : 'was resized'} since that screenshot, so its ` +
+          'pixels no longer map to it — take a fresh browser_screenshot before clicking with space:"image".'
+      );
+    }
+  }
+
+  let x = g.originX + imgX / g.scale;
+  let y = g.originY + imgY / g.scale;
+
+  if (g.mode === 'full_page') {
+    x -= meta?.scroll?.x || 0;
+    y -= meta?.scroll?.y || 0;
+  }
+
+  return { x, y };
+}
+
+/**
  * Work out where to click, from either a ref or explicit coordinates.
  * Refreshes iframe offsets first so refs inside frames resolve correctly.
  */
 async function locateTarget(tabId, args) {
   if (args.coordinate) {
+    // Coordinates read straight off a screenshot are in *image* pixels, which
+    // the two rescalings (device pixel ratio, then the maxWidth downscale) put
+    // in neither the viewport nor the document coordinate space browser_act
+    // otherwise speaks. `space:"image"` says "these came off the last capture"
+    // and inverts them here, so a vision model — local ones especially — can
+    // click what it sees without doing the factor math itself and landing at
+    // half the intended offset, silently. Default stays CSS px.
+    if (args.space === 'image') {
+      return { point: await imageToViewport(tabId, args.coordinate), rect: null };
+    }
     return { point: { x: args.coordinate[0], y: args.coordinate[1] }, rect: null };
   }
   if (!args.ref) {

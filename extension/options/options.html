@@ -12,214 +12,330 @@
       <header class="page-head">
         <div class="brand">
           <span class="logo" aria-hidden="true"></span>
-          <h1>OpenBrowser</h1>
+          <div>
+            <h1>OpenBrowser</h1>
+            <p class="page-status">
+              <span id="live-status" class="status status--disconnected">
+                <span class="status-dot" aria-hidden="true"></span>
+                <span id="live-status-text">checking…</span>
+              </span>
+            </p>
+          </div>
         </div>
-        <p class="muted">
+        <p class="muted lede">
           Open-source browser automation for AI agents. Everything the extension
-          can do is also available over MCP.
+          can do is also available over MCP — and nothing here leaves your
+          machine except the pages you ask it to visit.
         </p>
       </header>
 
       <!-- ── Getting started ───────────────────────────────────────────── -->
-      <section class="panel" id="setup">
-        <div class="panel-head"><h2>Getting started</h2></div>
-
-        <ol class="steps">
-          <li>
-            <strong>Start the MCP server.</strong> Point your MCP client at it, or
-            run it yourself from the project directory:
+      <section class="block">
+        <div class="group">
+          <div class="setting setting--stacked">
+            <div class="setting-text">
+              <strong>1 · Start the MCP server</strong>
+              <small>Point your MCP client at it, or run it yourself from the project directory:</small>
+            </div>
             <code class="snippet">node mcp-server/src/index.js</code>
-          </li>
-          <li>
-            <strong>Check the connection.</strong> The badge on the toolbar icon
-            clears when the extension is connected. Current status:
-            <span id="live-status" class="status status--disconnected">
-              <span class="status-dot"></span><span id="live-status-text">checking…</span>
-            </span>
-          </li>
-          <li>
-            <strong>Try it.</strong> Open the side panel (toolbar icon, or
-            <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>U</kbd>) and hit
-            <em>Snapshot page</em>.
-          </li>
-        </ol>
+          </div>
+          <div class="setting setting--stacked">
+            <div class="setting-text">
+              <strong>2 · Open the side panel</strong>
+              <small>
+                Click the toolbar icon (or press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>U</kbd>)
+                and hit <em>Snapshot page</em> to check it works.
+              </small>
+            </div>
+          </div>
+        </div>
       </section>
 
       <!-- ── Connection ────────────────────────────────────────────────── -->
-      <section class="panel">
-        <div class="panel-head"><h2>Connection</h2></div>
+      <section class="block">
+        <h2 class="group-title">Connection</h2>
+        <div class="group">
+          <label class="setting" for="port">
+            <div class="setting-text">
+              <strong>Hub port</strong>
+              <small>Must match the MCP server's <code>--port</code>. Saving reconnects.</small>
+            </div>
+            <div class="setting-control">
+              <input type="number" id="port" min="1024" max="65535" step="1" />
+            </div>
+          </label>
 
-        <label class="field">
-          <span>Hub port</span>
-          <input type="number" id="port" min="1024" max="65535" />
-          <small class="muted">
-            Must match the MCP server. Change it with <code>--port</code> or the
-            <code>OPENBROWSER_PORT</code> environment variable.
-          </small>
-        </label>
+          <label class="setting setting--stacked" for="browserName">
+            <div class="setting-text">
+              <strong>Browser name</strong>
+              <small>
+                What agents call this browser when several share one hub, so you can
+                say &ldquo;use the work browser&rdquo;. Leave empty for a generated name.
+              </small>
+            </div>
+            <div class="setting-control">
+              <input type="text" id="browserName" maxlength="24" placeholder="e.g. work" spellcheck="false" />
+            </div>
+          </label>
 
-        <label class="field">
-          <span>Browser name</span>
-          <input type="text" id="browserName" maxlength="24" placeholder="work" spellcheck="false" />
-          <small class="muted">
-            What agents call this browser when several share one hub — you can then say
-            &ldquo;use the work browser&rdquo;. A session is bound to one browser, because tab
-            ids are not unique across them. Leave empty for a generated name.
-          </small>
-        </label>
-
-        <label class="check">
-          <input type="checkbox" id="autoConnect" />
-          <span>
-            <strong>Connect automatically</strong>
-            <small class="muted">Reconnect on browser start and after the service worker restarts.</small>
-          </span>
-        </label>
+          <label class="setting" for="autoConnect">
+            <div class="setting-text">
+              <strong>Connect automatically</strong>
+              <small>Reconnect on browser start and after the service worker restarts.</small>
+            </div>
+            <div class="setting-control">
+              <input type="checkbox" class="switch" id="autoConnect" />
+            </div>
+          </label>
+        </div>
+        <p class="group-note" id="port-error" hidden></p>
       </section>
 
-      <!-- ── Automation ────────────────────────────────────────────────── -->
-      <section class="panel">
-        <div class="panel-head"><h2>Automation</h2></div>
+      <!-- ── On the page ───────────────────────────────────────────────── -->
+      <section class="block">
+        <h2 class="group-title">On the page</h2>
+        <div class="group">
+          <label class="setting" for="useDebugger">
+            <div class="setting-text">
+              <strong>Trusted input events</strong>
+              <small>
+                Attaches Chrome's debugger so clicks and keystrokes look like a real
+                user's — required for payments, logins, and most drag-and-drop. Chrome
+                shows a &ldquo;being debugged&rdquo; banner while attached. Off makes many
+                sites silently ignore the agent.
+              </small>
+            </div>
+            <div class="setting-control">
+              <input type="checkbox" class="switch" id="useDebugger" />
+            </div>
+          </label>
 
-        <label class="check">
-          <input type="checkbox" id="useDebugger" />
-          <span>
-            <strong>Use trusted input events</strong>
-            <small class="muted">
-              Attaches Chrome's debugger so clicks and keystrokes are
-              indistinguishable from a real user's. Required for payment forms,
-              login pages, and most drag-and-drop. Chrome shows a "being
-              debugged" banner while it is attached. Turning this off will make
-              many sites silently ignore the agent.
-            </small>
-          </span>
-        </label>
+          <label class="setting" for="showCursor">
+            <div class="setting-text">
+              <strong>Live cursor</strong>
+              <small>
+                Show a pointer that travels to each click and ripples on contact, so
+                you can see where the agent is reaching — the trusted click itself
+                happens off-screen otherwise.
+              </small>
+            </div>
+            <div class="setting-control">
+              <input type="checkbox" class="switch" id="showCursor" />
+            </div>
+          </label>
 
-        <label class="check">
-          <input type="checkbox" id="highlightActions" />
-          <span>
-            <strong>Highlight elements as they are used</strong>
-            <small class="muted">Draws a brief outline so you can follow along.</small>
-          </span>
-        </label>
+          <label class="setting" for="highlightActions">
+            <div class="setting-text">
+              <strong>Highlight elements as they are used</strong>
+              <small>Draws a brief outline on each acted-on element so you can follow along.</small>
+            </div>
+            <div class="setting-control">
+              <input type="checkbox" class="switch" id="highlightActions" />
+            </div>
+          </label>
 
-        <label class="check">
-          <input type="checkbox" id="showAgentBadge" />
-          <span>
-            <strong>Mark pages an agent is driving</strong>
-            <small class="muted">
-              Draws a slowly pulsing orange border and a caption naming the
-              workstream, so a page being driven is obvious from the page itself
-              and not only from the tab strip.
-            </small>
-          </span>
-        </label>
+          <label class="setting" for="showAgentBadge">
+            <div class="setting-text">
+              <strong>Mark pages an agent is driving</strong>
+              <small>
+                A slowly pulsing orange border and a caption naming the workstream, so a
+                driven page is obvious from the page itself, not only the tab strip.
+              </small>
+            </div>
+            <div class="setting-control">
+              <input type="checkbox" class="switch" id="showAgentBadge" />
+            </div>
+          </label>
+        </div>
+      </section>
 
-        <label class="check">
-          <input type="checkbox" id="soloWindow" />
-          <span>
-            <strong>Give each agent its own window</strong>
-            <small class="muted">
-              Clicks and keystrokes only land on a <em>foreground</em> tab, and
-              only one tab per window is foreground — so an agent sharing your
-              window has to take your view every time it acts, several times a
-              second during a run. A window of its own removes the conflict
-              instead of managing it: a tab that is foreground in a window you
-              are not looking at is still visible, so the agent can work while
-              you carry on in yours. Turn this off if the reason you keep an
-              agent in your window is to watch it.
-            </small>
-          </span>
-        </label>
+      <!-- ── Windows & tabs ────────────────────────────────────────────── -->
+      <section class="block">
+        <h2 class="group-title">Windows &amp; tabs</h2>
+        <div class="group">
+          <label class="setting" for="soloWindow">
+            <div class="setting-text">
+              <strong>Keep agent tabs in a background window</strong>
+              <small>
+                Sessions share one background window while their tabs, ownership, and
+                input stay isolated — so an agent never pulls focus from the window you
+                are working in. Turn off only to watch agents inside a window you chose.
+              </small>
+            </div>
+            <div class="setting-control">
+              <input type="checkbox" class="switch" id="soloWindow" />
+            </div>
+          </label>
 
-        <label class="check">
-          <input type="checkbox" id="chooseWindow" />
-          <span>
-            <strong>Ask which window an agent should work in</strong>
-            <small class="muted">
-              Only applies when the setting above is off. A tab group only
-              organises tabs within one window, so with several windows open an
-              agent's tabs land in whichever one Chrome considers current —
-              usually the one you are reading. When this is on and more than one
-              window is open, a session has to be told which window to use
-              before it can open anything, either by you in chat or by clicking
-              the prompt it puts in each window. With one window open you are
-              never asked.
-            </small>
-          </span>
-        </label>
+          <label class="setting setting--nested" id="chooseWindow-row" for="chooseWindow">
+            <div class="setting-text">
+              <strong>Ask which window to work in</strong>
+              <small>
+                Only applies while the background window above is off. With several
+                windows open, a session is asked which to use before it opens anything —
+                otherwise its tabs land in whichever window you were last reading.
+              </small>
+            </div>
+            <div class="setting-control">
+              <input type="checkbox" class="switch" id="chooseWindow" />
+            </div>
+          </label>
 
-        <label class="check">
-          <input type="checkbox" id="restoreFocusAfterInput" />
-          <span>
-            <strong>Give the tab back after clicking or typing</strong>
-            <small class="muted">
-              Clicks and keystrokes only land on a foreground tab, so the agent
-              has to switch to its own to act — which pulls you out of whatever
-              you were reading, tab groups included, since a group shares your
-              window. This switches back once it is done. If you changed tabs
-              yourself in the meantime, you are left where you are.
-            </small>
-          </span>
-        </label>
+          <label class="setting" for="groupTabs">
+            <div class="setting-text">
+              <strong>Group agent tabs</strong>
+              <small>Collect each job's tabs into a labelled Chrome tab group.</small>
+            </div>
+            <div class="setting-control">
+              <input type="checkbox" class="switch" id="groupTabs" />
+            </div>
+          </label>
 
-        <label class="check">
-          <input type="checkbox" id="autoConfirmLeave" />
-          <span>
-            <strong>Answer "Leave site?" prompts automatically</strong>
-            <small class="muted">
-              These only appear because something is already trying to leave, so
-              the agent answers its own navigation rather than stalling behind a
-              box it cannot click. Unsaved changes on the old page are discarded,
-              and the navigation result says when it happened. Only affects tabs
-              the agent drives. <strong>alert(), confirm() and prompt() are
-              never answered for you</strong> — those are real questions and
-              still wait for you.
-            </small>
-          </span>
-        </label>
+          <label class="setting" for="closeTabsOnSessionEnd">
+            <div class="setting-text">
+              <strong>Close agent tabs when a session ends</strong>
+              <small>
+                Closes only the tabs a session opened for itself — never one it adopted
+                from you. Off leaves them open and just ungroups them.
+              </small>
+            </div>
+            <div class="setting-control">
+              <input type="checkbox" class="switch" id="closeTabsOnSessionEnd" />
+            </div>
+          </label>
+        </div>
+      </section>
 
-        <label class="check">
-          <input type="checkbox" id="captureBodies" />
-          <span>
-            <strong>Capture request and response bodies</strong>
-            <small class="muted">
-              Useful for debugging APIs. Off by default — bodies are large and
-              often contain credentials or personal data.
-            </small>
-          </span>
-        </label>
+      <!-- ── Prompts & capture ─────────────────────────────────────────── -->
+      <section class="block">
+        <h2 class="group-title">Prompts &amp; capture</h2>
+        <div class="group">
+          <label class="setting" for="autoConfirmLeave">
+            <div class="setting-text">
+              <strong>Answer &ldquo;Leave site?&rdquo; prompts automatically</strong>
+              <small>
+                These appear only because a navigation is already underway, so the agent
+                carries out its own move instead of stalling. Only on tabs it drives.
+                <strong>alert(), confirm() and prompt() are never answered for you.</strong>
+              </small>
+            </div>
+            <div class="setting-control">
+              <input type="checkbox" class="switch" id="autoConfirmLeave" />
+            </div>
+          </label>
 
-        <label class="field">
-          <span>Snapshot size budget (characters)</span>
-          <input type="number" id="maxSnapshotChars" min="1000" max="200000" step="1000" />
-          <small class="muted">Larger reads cost proportionally more tokens. 20,000 suits most pages.</small>
-        </label>
+          <label class="setting" for="captureBodies">
+            <div class="setting-text">
+              <strong>Capture request &amp; response bodies</strong>
+              <small>Useful for debugging APIs. Off by default — bodies are large and often hold credentials.</small>
+            </div>
+            <div class="setting-control">
+              <input type="checkbox" class="switch" id="captureBodies" />
+            </div>
+          </label>
+
+          <label class="setting" for="maxSnapshotChars">
+            <div class="setting-text">
+              <strong>Snapshot size budget</strong>
+              <small>Characters per read. Larger costs proportionally more tokens; 20,000 suits most pages.</small>
+            </div>
+            <div class="setting-control">
+              <input type="number" id="maxSnapshotChars" min="1000" max="200000" step="1000" />
+            </div>
+          </label>
+        </div>
       </section>
 
       <!-- ── Site access ───────────────────────────────────────────────── -->
-      <section class="panel">
-        <div class="panel-head"><h2>Site access</h2></div>
+      <section class="block">
+        <h2 class="group-title">Site access</h2>
+        <div class="group">
+          <div class="setting setting--stacked">
+            <div class="setting-text">
+              <strong>Blocklist</strong>
+              <small>
+                Never automate these — subdomains included, so <code>example.com</code>
+                also covers <code>app.example.com</code>. Pre-seeded with identity providers.
+              </small>
+            </div>
+            <div class="setting-control">
+              <textarea id="blocklist" rows="3" spellcheck="false" placeholder="one hostname per line"></textarea>
+            </div>
+          </div>
+          <div class="setting setting--stacked">
+            <div class="setting-text">
+              <strong>Allowlist</strong>
+              <small>If this has any entries, <em>only</em> these sites can be automated. Empty allows all (minus the blocklist).</small>
+            </div>
+            <div class="setting-control">
+              <textarea id="allowlist" rows="3" spellcheck="false" placeholder="leave empty to allow all sites"></textarea>
+            </div>
+          </div>
+        </div>
+      </section>
 
-        <label class="field">
-          <span>Blocklist</span>
-          <textarea id="blocklist" rows="4" spellcheck="false" placeholder="one hostname per line"></textarea>
-          <small class="muted">
-            Never automate these. Subdomains are included, so
-            <code>example.com</code> also covers <code>app.example.com</code>.
-            Pre-seeded with identity providers, where an automation mistake is
-            expensive to undo.
-          </small>
-        </label>
+      <!-- ── Advanced ──────────────────────────────────────────────────── -->
+      <section class="block">
+        <details class="disclosure">
+          <summary>Advanced</summary>
+          <div class="disclosure-body">
+            <div class="group">
+              <label class="setting" for="agentWindowPool">
+                <div class="setting-text">
+                  <strong>Pool agent windows</strong>
+                  <small>Collapse every session's background window into one shared window instead of one each.</small>
+                </div>
+                <div class="setting-control">
+                  <input type="checkbox" class="switch" id="agentWindowPool" />
+                </div>
+              </label>
 
-        <label class="field">
-          <span>Allowlist</span>
-          <textarea id="allowlist" rows="4" spellcheck="false" placeholder="leave empty to allow all sites"></textarea>
-          <small class="muted">
-            If this has any entries, <em>only</em> these sites can be automated.
-            Empty means every site is allowed (minus the blocklist).
-          </small>
-        </label>
+              <label class="setting" for="emulateFocus">
+                <div class="setting-text">
+                  <strong>Emulate page focus</strong>
+                  <small>
+                    Experimental. Tells a page it is focused so input lands even on a fully
+                    covered window. Not needed for the common case; leave off unless comparing
+                    a reproducible site failure with and without it.
+                  </small>
+                </div>
+                <div class="setting-control">
+                  <input type="checkbox" class="switch" id="emulateFocus" />
+                </div>
+              </label>
+
+              <label class="setting" for="logActivity">
+                <div class="setting-text">
+                  <strong>Log tool calls to the side panel</strong>
+                  <small>Feeds the Activity view. Off stops recording calls there.</small>
+                </div>
+                <div class="setting-control">
+                  <input type="checkbox" class="switch" id="logActivity" />
+                </div>
+              </label>
+
+              <label class="setting" for="consoleBufferSize">
+                <div class="setting-text">
+                  <strong>Console buffer</strong>
+                  <small>How many recent console messages to keep per tab.</small>
+                </div>
+                <div class="setting-control">
+                  <input type="number" id="consoleBufferSize" min="50" max="5000" step="50" />
+                </div>
+              </label>
+
+              <label class="setting" for="networkBufferSize">
+                <div class="setting-text">
+                  <strong>Network buffer</strong>
+                  <small>How many recent network requests to keep per tab.</small>
+                </div>
+                <div class="setting-control">
+                  <input type="number" id="networkBufferSize" min="50" max="5000" step="50" />
+                </div>
+              </label>
+            </div>
+          </div>
+        </details>
       </section>
 
       <div class="actions">
@@ -229,8 +345,7 @@
       </div>
 
       <footer class="page-foot muted">
-        <span id="version"></span> · MIT licensed · Fully local — nothing leaves
-        your machine except the pages you ask it to visit.
+        <span id="version"></span> · MIT licensed · Fully local
       </footer>
     </div>
 

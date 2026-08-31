@@ -240,10 +240,11 @@ export function renderFindResults(results, query) {
 export function renderTabs(tabs, activeTabId, workstreams = [], opts = {}) {
   if (!tabs.length) return 'No tabs open.';
 
-  // tabId -> workstream label, so each row says which job owns it.
+  // tabId -> ownership, so same-named workstreams from different sessions are
+  // never rendered as if they were one job.
   const owner = new Map();
   for (const w of workstreams) {
-    for (const id of w.tabIds) owner.set(id, w.name);
+    for (const id of w.tabIds) owner.set(id, { workstream: w.name, sessionId: w.sessionId });
   }
 
   const row = (t) => {
@@ -253,7 +254,13 @@ export function renderTabs(tabs, activeTabId, workstreams = [], opts = {}) {
     if (t.discarded) marks.push('discarded');
     if (t.status === 'loading') marks.push('loading');
     const suffix = marks.length ? ` (${marks.join(', ')})` : '';
-    const stream = owner.has(t.id) ? `  [${owner.get(t.id)}]` : '';
+    const owned = owner.get(t.id);
+    // The session id disambiguates same-named workstreams across sessions, but
+    // with no explicit group the workstream *is* the session label, and
+    // "harbor · harbor" is just noise — show the one name then.
+    const stream = owned
+      ? `  [${owned.workstream}${owned.sessionId && owned.sessionId !== owned.workstream ? ` · ${owned.sessionId}` : ''}]`
+      : '';
     return `  ${t.id}  ${shortUrl(t.url || t.pendingUrl || 'about:blank')}  "${truncate(t.title || '', 60)}"${suffix}${stream}`;
   };
 
@@ -270,9 +277,9 @@ export function renderTabs(tabs, activeTabId, workstreams = [], opts = {}) {
   for (const [windowId, group] of byWindow) {
     // Which sessions have tabs here. The header is where an agent looks to see
     // it is about to act in a window another agent is mid-task in.
-    const here = [...new Set(group.map((t) => owner.get(t.id)).filter(Boolean))];
+    const here = [...new Set(group.map((t) => owner.get(t.id)?.sessionId).filter(Boolean))];
     const who = here.length
-      ? `  ← ${here.map((n) => (n === opts.label ? `${n} (you)` : n)).join(', ')}`
+      ? `  ← ${here.map((n) => (n === opts.sessionId ? `${n} (you)` : n)).join(', ')}`
       : '';
     // Bracketed rather than a second arrow: the two say different things, and a
     // session *can* have tabs in a window it is not bound to — that mismatch is
@@ -339,8 +346,20 @@ function formatBytes(n) {
  * @param {object} p.meta page metadata (viewport, scroll)
  * @param {{width:number,height:number}} p.image the image actually returned
  */
-export function captureGeometry({ mode, clip, meta = {}, image }) {
-  const line = `${mode} screenshot, ${image.width}x${image.height}`;
+/**
+ * The numeric CSS↔image mapping behind `captureGeometry`, factored out so the
+ * screenshot's advice and the click-time inversion (`space:"image"` in
+ * router.js) can never drift apart — the whole point is that a coordinate read
+ * off the image lands where the model expects.
+ *
+ * `covered` is the CSS-pixel region the image spans; `scale = image / covered`
+ * is the factor a caller divides image coords by. Rounding matches the text
+ * output exactly, so the two functions agree to the byte and to the pixel.
+ *
+ * @returns {{scale:number, originX:number, originY:number, coveredW:number,
+ *   coveredH:number, mode:string} | null} null when the viewport is unknown.
+ */
+export function captureMapping({ mode, clip, meta = {}, image }) {
   const viewport = meta.viewport || {};
 
   let covered;
@@ -357,11 +376,33 @@ export function captureGeometry({ mode, clip, meta = {}, image }) {
     covered = { x: 0, y: 0, w: viewport.w, h: viewport.h };
   }
 
+  if (!covered.w || !covered.h || !image?.width) return null;
+
+  // One scale for both axes, derived from width. This is correct only while
+  // `downscale()` (router.js) rescales by a single width-derived factor and
+  // never independently clamps height. If it ever grows a maxHeight cap, the
+  // y-axis factor would diverge and this must return {scaleX, scaleY} instead —
+  // the round-trip tests in test/run.mjs only exercise the uniform case.
+  return {
+    scale: image.width / covered.w,
+    originX: covered.x,
+    originY: covered.y,
+    coveredW: covered.w,
+    coveredH: covered.h,
+    mode,
+  };
+}
+
+export function captureGeometry({ mode, clip, meta = {}, image }) {
+  const line = `${mode} screenshot, ${image.width}x${image.height}`;
+
+  const m = captureMapping({ mode, clip, meta, image });
   // With no viewport the mapping cannot be stated honestly, and a guessed one
   // is worse than saying nothing.
-  if (!covered.w || !covered.h) return line;
+  if (!m) return line;
 
-  const scale = image.width / covered.w;
+  const covered = { x: m.originX, y: m.originY, w: m.coveredW, h: m.coveredH };
+  const scale = m.scale;
   const at = covered.x || covered.y ? ` at (${covered.x},${covered.y})` : '';
   const sized = `${line} — ${scale.toFixed(2)}x of ${covered.w}x${covered.h} CSS px${at}`;
 

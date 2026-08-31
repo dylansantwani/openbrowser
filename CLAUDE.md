@@ -370,30 +370,75 @@ then means two completely different things.
 `Input.dispatchKeyEvent` land nowhere when `document.visibilityState` is
 `hidden` — no error, the call reports success, and the page never sees the
 click. Screenshots and the accessibility tree work fine on hidden tabs, which is
-what makes this so easy to miss. Anything dispatching trusted input must
-foreground the tab first; see `ensureForeground()` in `background/router.js`.
-The cost is that input cannot be parallelised across tabs in one window, which
-is a Chrome constraint, not a design choice.
+what makes this so easy to miss. The cost is that input cannot be parallelised
+across tabs in one window, which is a Chrome constraint, not a design choice.
+
+**Foregrounding to fix this was the disease, not the cure, and it is gone.** The
+earlier answer was `ensureForeground()`: activate the tab (and focus its window)
+before every trusted-input dispatch. It was guaranteed, and it was the single
+biggest complaint this project produced — the user's view yanked to the agent's
+tab several times a second for the length of a run. That function has been
+**removed**. `browser_act`, `browser_input` and `browser_upload` no longer
+activate a tab or raise a window; only the two calls whose whole purpose is to
+show a human a tab still focus — `browser_tabs action:"select"` and
+`browser_window focus` (both still gated by `assertOwnWindow`).
+
+What replaces it is two independent moves, neither of which touches the user's
+window:
+
+- **Keep the agent out of your window in the first place.** `soloWindow`
+  (default on) gives a session its own window, and `agentWindowPool` (default
+  on) collapses those into one shared background window instead of one per
+  session — see "collapsing sprawl into a pool" in `windows.js`. A tab that is
+  the active tab of an *unfocused* window is normally still `visible`, so it
+  takes trusted input while sitting behind whatever you are doing. This covers
+  the common case with no interruption at all.
+- **When the tab really is `hidden`, tell the truth instead of stealing focus.**
+  Full opaque coverage, a native-fullscreen app on its own Space, or off-screen
+  placement do mark a tab `hidden`, and input then drops. Rather than
+  foreground to force it, the dispatch reports `UNVERIFIED … dispatched`: the
+  input was sent, but no page change was observed, so the agent must verify
+  before continuing. A click that honestly says "I could not confirm this" is
+  strictly better than one that lies about landing — which is the whole failure
+  this section is about.
+
+`Emulation.setFocusEmulationEnabled` (`emulateFocus` in `cdp.js`) is the
+optional third move: it tells Blink the page is focused and active regardless of
+window state, so even a fully covered tab keeps compositing and takes trusted
+input — the same trick Playwright applies on every page, which is why Playwright
+never calls `bringToFront()`. It is **default off**, and deliberately so: it is
+an experiment, not a proven guarantee, and the honest-reporting path above
+already removes the silent-wrong-click without it. Turn it on (plus launching
+Chrome with `--disable-renderer-backgrounding
+--disable-backgrounding-occluded-windows`) when you need input to land on a
+window that stays entirely covered. `test/run.mjs` asserts the default stays
+off; if you make it on, that test and this paragraph both have to change
+together.
 
 **`active` is necessary and not sufficient, and that is why an agent made the
 browser unusable.** Everything above is about *tabs*, and the window the tab is
 in has the same power to hide it: a tab is `active` in a minimized window and
 `active` in a window another window completely covers, and Chrome calls the
 document hidden in both. So `chrome.tabs.get().active` cannot answer the only
-question `ensureForeground` cares about. The page can, and now does — one
-`visibility` round trip after activating, reported rather than fixed, because
-the fix is a human uncovering a window and a click that lies about landing is
-worse than a warning. The minimized case was not merely unhandled but
-*advertised*: `browser_window state:"minimized"` said "automation keeps running",
-and every click after it went nowhere. Input un-minimizes now.
+question that matters before trusted input: is this page actually taking
+events? The page can answer, and the dispatch surfaces it — a tab that is
+`hidden` yields an `UNVERIFIED … dispatched` result rather than a false success,
+because the real fix is a human uncovering the window and a click that lies
+about landing is worse than a warning. The minimized case is now stated outright
+rather than papered over: `browser_window state:"minimized"` says OpenBrowser
+will not raise the window automatically and that state-changing input should be
+verified, instead of the old claim that "automation keeps running" while every
+click went nowhere.
 
-The bigger half of this is social rather than technical. Foregrounding is
-correct and unavoidable, and in *your* window it means the view being yanked to
-the agent's tab several times a second for the length of a run — reported as
-"the agent makes the window unusable while I am working in it".
-`restoreFocusAfterInput` does not fix it; it converts a steal into a flicker.
-Nothing polite is available, because only one tab per window is foreground and
-the agent needs that slot.
+The bigger half of this was always social rather than technical. The old fix,
+`ensureForeground()`, was correct in the narrow sense — it guaranteed the tab
+took input — and ruinous in practice: in *your* window it yanked the view to the
+agent's tab several times a second for the length of a run, reported as "the
+agent makes the window unusable while I am working in it". `restoreFocusAfterInput`
+only converted the steal into a flicker. **Both have been removed.** Nothing
+polite was available while the agent shared your window, because only one tab per
+window is foreground and the agent needed that slot — so the agent stops sharing
+your window instead.
 
 So a session stops sharing: `soloWindow` (default on) has `ensureWindow` open a
 window rather than hand over the one you are in. A tab that is foreground in an
@@ -444,20 +489,30 @@ keep what you were doing. Three consequences worth keeping in view:
   page an agent chose. A stopped call is recoverable and names its remedy; a
   stolen keystroke is neither. Every path that can bring a tab forward goes
   through `assertOwnWindow`.
-- **Only trusted input needs the tab in front, and most work is not trusted
-  input.** Filling fields goes through the content script, which writes the DOM
-  and works perfectly on a tab reporting `visibilityState: "hidden"` — measured,
-  along with navigation, snapshots, screenshots and eval. So `browser_input`
-  foregrounds lazily, at the first thing that actually needs it, and a form fill
-  now surfaces nothing at all. `browser_upload` likewise: `setFileInput` never
-  foregrounds, only the file-picker click does.
-- **Occlusion does not hide a tab.** Measured, after being assumed twice in the
-  other direction: a window completely covered by a maximized one keeps
-  `visibilityState: "visible"`, as does every tab in a Chrome that is behind
-  another application. Only *not being the active tab of its window* hides a
-  tab. So an agent's window can sit permanently behind yours, or on another
-  Space, and still take trusted input — which is the whole reason the
-  one-window-per-session design works rather than merely relocating the problem.
+- **Most work is not trusted input, and none of it foregrounds any more.**
+  Filling fields goes through the content script, which writes the DOM and works
+  perfectly on a tab reporting `visibilityState: "hidden"` — measured, along with
+  navigation, snapshots, screenshots and eval. Trusted input (`browser_act`, the
+  file-picker click behind `browser_upload`) used to foreground the tab first;
+  now nothing does. A form fill surfaces nothing, and a click on a visible
+  background tab lands without touching your window.
+- **Occlusion's effect on a tab is not uniform, and the logs settled it.** This
+  was measured as "a window completely covered by a maximized one keeps
+  `visibilityState: visible`" — and then a hundred `tab N is hidden — window
+  covered … Chrome drops trusted input` warnings in real sessions said
+  otherwise. Both are true: simple overlap on the same Space often keeps a tab
+  visible, but full opaque coverage, a native-fullscreen app (its own Space, so
+  everything else is on an *inactive* one), and off-screen placement all mark it
+  `hidden` and drop input. So the one-window-per-session design cannot lean on
+  occlusion-is-harmless the way this note originally claimed. What it leans on
+  instead is two things that need no focus theft: an agent window that is merely
+  *behind* yours stays `visible` and takes input (the common case), and when a
+  window genuinely goes `hidden`, the dispatch returns `UNVERIFIED … dispatched`
+  rather than a false success, so the agent verifies instead of clicking into the
+  void. `emulateFocus` (default **off**, see "backgrounded tab silently drops CDP
+  input" above) is the opt-in that closes the covered case outright — with the
+  page emulating focus even a fully covered window takes trusted input — but it
+  is not relied on by default.
 - **Sharing is still reachable, so it still has to be survivable.** An explicit
   `use`/`pick`, or adopting a tab in your window, puts a session back in it. That
   path now says so once per session per window and names `action:"new"` — once,
@@ -492,6 +547,40 @@ converts for you, so a `getBoundingClientRect()` value passed straight through
 is wrong there by exactly the factor above. Neither convention is wrong; a
 capture that does not state which one it is using is.
 
+**`browser_act coordinate space:"image"` is the Claude-in-Chrome side of that
+trade, offered as an opt-in.** A vision model — a local one above all — has only
+the picture, and making it invert `captureGeometry`'s factor by hand before
+every click is where those clicks go wrong. So `space:"image"` says "these
+pixels came off the last screenshot" and the extension inverts them: each
+capture's mapping (`fmt.captureMapping` — the single source `captureGeometry`'s
+advice also reads, so the two can never disagree) is saved to
+`chrome.storage.session` keyed by tab, and `imageToViewport` (`router.js`)
+reverses it — `origin + image/scale`, minus the *current* scroll for a
+`full_page` capture, which is document-space. Default stays `css` (viewport CSS
+px) so nothing that already passes coordinates breaks, and every screenshot
+result ends with the one-line call that lands correctly. Session storage rather
+than a variable for the same reason everything else here uses it: the worker
+dies between the capture and the click. The mapping is stamped with the URL and
+viewport it was taken against and cleared on navigation and tab close, and
+`imageToViewport` refuses if the page navigated or resized since — so no recent
+capture, a stale one, or a page that has moved on all raise an *error*, not a
+guess. A silent wrong click is the whole failure this avoids, and freshness is
+as much a part of it as presence: a null mapping (no viewport, no honest factor)
+therefore *clears* the record rather than leaving the previous one to be read
+against a different image.
+
+**The live cursor is the one overlay driven by the click point, not a ref.** A
+trusted click happens off-screen in the background, so `content/actions.js`
+`cursor()` draws a pointer that travels to the same top-level point the CDP click
+lands on, rings on contact, and persists between actions — the only feedback a
+`coordinate` click gets, since it has no element to outline (`highlight` needs a
+ref). `showCursor` in `router.js` fires it fire-and-forget to the top frame from
+`browser_act` and the typing path; `agentFrame(false)` tears it down with the
+"driving" frame at session end. It obeys `overlay.css`'s cascade rule — the
+travel transform and the ripple/press/label are the properties left
+un-`!important`, because a forced value outranks the transition or keyframe and
+freezes it looking wired-up. Gated by the `showCursor` setting (default on).
+
 **`element.click()` is ignored by serious sites.** It produces `isTrusted:
 false`. Everything pointer-related goes through CDP's Input domain for this
 reason. If you are tempted to "simplify" by using `.click()`, don't.
@@ -524,7 +613,7 @@ mcp-server/src/
   tools.js            the 14 tool schemas — token-critical
 
 test/
-  run.mjs             199 tests, no browser needed
+  run.mjs             246 tests, no browser needed
   a11y-browser.html   73 tests, needs a browser (npm run preview)
   overlay-preview.html the on-page overlays, self-checking (same server)
 ```
@@ -581,7 +670,7 @@ presence — a `.value` can be empty while the control visibly shows a value
 ## Testing
 
 ```bash
-npm test          # 199 tests — run before and after every change
+npm test          # 246 tests — run before and after every change
 npm run preview   # then open /test/a11y-browser.html for 68 DOM tests
 ```
 

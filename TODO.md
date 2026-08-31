@@ -340,10 +340,12 @@ silently drops `Input.dispatchMouseEvent` and `Input.dispatchKeyEvent`, the wors
 failure this project can produce — pulled the user out of their group every time
 the agent clicked.
 
-The requirement is that the tab be foreground *while input is dispatched*.
-Keeping it afterwards was never part of that, and was the whole of the
-annoyance. `restoreFocusAfterInput` (default on) records what was active before
-the first steal in a burst and puts it back once the call is done:
+The requirement was taken to be that the tab be foreground *while input is
+dispatched*. Keeping it afterwards was never part of that, and was the whole of
+the annoyance. The intermediate fix — `restoreFocusAfterInput`, **since removed**
+along with `ensureForeground` itself (see "Superseded" below and HANDOFF.md) —
+recorded what was active before the first steal in a burst and put it back once
+the call was done:
 
 - Debounced (700ms), so twenty clicks do not flip the view twenty times.
 - Restores to the tab active before the *first* steal, not the previous one.
@@ -353,12 +355,23 @@ the first steal in a burst and puts it back once the call is done:
   and never for `browser_tabs`/`browser_window`, where being asked to focus a
   tab is the point of the call.
 
-**Rejected: give the agent its own window.** An unfocused window's active tab is
-normally still `visible`, so this looks like it removes the problem outright —
-but Chrome's native window-occlusion tracking marks fully covered windows hidden
-on Windows, which is exactly this user's platform, and that reintroduces
-silently dropped input. Not worth trading a visible annoyance for an invisible
-wrong-click. Revisit only with a live visibility check before each dispatch.
+**Superseded: give the agent its own window — shipped as `soloWindow` (default
+on), pooled by `agentWindowPool` (default on).** This was first rejected because
+a fully covered window is marked hidden and reintroduces silently dropped input.
+It shipped anyway, because the alternative (`restoreFocusAfterInput`) only
+converted the steal into a flicker and never removed it — and both it and
+`ensureForeground` are now gone. An agent's window that is merely *behind* yours
+stays `visible` and takes trusted input, which is the common case and the whole
+reason the design works without stealing focus. The residual case — a window
+that goes genuinely `hidden` (full opaque coverage, native-fullscreen on its own
+Space, off-screen) — is handled honestly rather than by force: the dispatch
+returns `UNVERIFIED … dispatched` so the agent verifies instead of clicking into
+the void. `Emulation.setFocusEmulationEnabled` (`emulateFocus`, `cdp.js`) keeps
+even a fully covered tab compositing so input lands, but it is **default off** —
+an opt-in for people who need input on a permanently covered window, paired with
+the `--disable-renderer-backgrounding --disable-backgrounding-occluded-windows`
+launch flags. `test/run.mjs` pins the default off. See CLAUDE.md, "backgrounded
+tab silently drops CDP input".
 
 ## Agent-driven tabs are marked on the page ✅ fixed, verified live
 

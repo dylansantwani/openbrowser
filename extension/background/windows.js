@@ -23,6 +23,8 @@ import * as frames from './frames.js';
 
 /** label -> windowId */
 const BOUND_KEY = 'sessionWindows';
+const AGENT_POOL_KEY = 'agentWindowPoolV1';
+let poolPromise = null;
 
 /**
  * How long the in-browser prompt waits for a human.
@@ -109,10 +111,10 @@ const mutateBindings = (fn) => mutate(BOUND_KEY, fn);
 const idOf = (entry) => (entry && typeof entry === 'object' ? entry.id : entry);
 const isOwn = (entry) => !!(entry && typeof entry === 'object' && entry.own);
 
-export async function bind(label, windowId, { own = false } = {}) {
+export async function bind(label, windowId, { own = false, agent = false } = {}) {
   if (!label) return null;
   await mutateBindings((all) => {
-    all[label] = { id: windowId, own };
+    all[label] = { id: windowId, own, agent };
   });
   return windowId;
 }
@@ -268,6 +270,44 @@ export async function createFor(label, { focused = false } = {}) {
 }
 
 /**
+ * One normal, unfocused window shared by background MCP sessions.
+ *
+ * Direct CDP input is target-addressed, so sessions do not need one active tab
+ * per window. A single pool removes the window-per-agent sprawl and, after the
+ * first creation, removes the macOS new-window stacking flash as well. Tab
+ * ownership remains per session; sharing this container grants no session
+ * access to another session's tabs.
+ */
+async function pooledWindow(label) {
+  if (!poolPromise) {
+    poolPromise = (async () => {
+      let id = null;
+      try {
+        id = (await chrome.storage.session.get(AGENT_POOL_KEY))[AGENT_POOL_KEY] || null;
+        if (id != null) await chrome.windows.get(id);
+      } catch {
+        id = null;
+      }
+
+      if (id == null) {
+        // Reuse the carefully tested non-front window creation path. Its
+        // temporary own binding is immediately replaced with a pooled-agent
+        // binding below; other sessions wait on this same promise.
+        id = await createFor(label);
+        await chrome.storage.session.set({ [AGENT_POOL_KEY]: id });
+      }
+      return id;
+    })().finally(() => {
+      poolPromise = null;
+    });
+  }
+
+  const id = await poolPromise;
+  await bind(label, id, { agent: true });
+  return id;
+}
+
+/**
  * The window this session works in, asking if there is any doubt.
  *
  * Throws the chooser rather than picking for you whenever more than one window
@@ -291,15 +331,13 @@ export async function ensureWindow(label, settings = {}) {
   const bound = await boundWindowId(label);
   if (bound != null) return bound;
 
-  // With a window of its own there is no wrong window to land in, so there is
-  // also nothing to ask. That deletes the chooser from the common path rather
-  // than answering it — worth noting, because the chooser was itself the fix
-  // for agents landing in the human's window, and this is the same fix taken
-  // one step further: do not choose between someone else's windows at all.
-  //
-  // The cost is a window per session, which is visible and understandable. The
-  // thing it buys is that the browser stays usable while an agent runs in it.
-  if (settings.soloWindow !== false) return createFor(label);
+  // Background sessions share a dedicated agent window by default. Their tabs
+  // remain session-owned and their mutations are serialised per tab, while the
+  // container window stays behind the person using Chrome. `agentWindowPool:
+  // false` preserves the older one-window-per-session layout for diagnosis.
+  if (settings.soloWindow !== false) {
+    return settings.agentWindowPool === false ? createFor(label) : pooledWindow(label);
+  }
 
   const wins = await listWindows();
 

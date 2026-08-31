@@ -1,171 +1,96 @@
 /*
- * Options page. Reuses the side panel's design tokens and component styles;
- * everything here is the delta for a full-width page instead of a 360px rail.
+ * Options page. Reuses the side panel's design tokens and shared components
+ * (toggle switch, grouped inset list); everything here is the delta for a
+ * centred full-width page instead of a 360px rail.
  */
 
 body.options {
   background: var(--bg-sunken);
-  padding: 32px 20px 48px;
+  padding: 40px 20px 56px;
   display: block;
   font-size: 14px;
 }
 
 .wrap {
-  max-width: 680px;
+  max-width: 640px;
   margin: 0 auto;
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 26px;
+}
+
+/* ── Header ──────────────────────────────────────────────────────────── */
+
+.page-head {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 
 .page-head .brand {
-  gap: 10px;
-  margin-bottom: 6px;
+  gap: 12px;
+  align-items: center;
 }
 
 .page-head .logo {
-  width: 24px;
-  height: 24px;
-  border-radius: 6px;
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
 }
 
 .page-head h1 {
   margin: 0;
-  font-size: 20px;
+  font-size: 21px;
   font-weight: 650;
   letter-spacing: -0.015em;
+  line-height: 1.1;
 }
 
-.page-head .muted {
+.page-status {
+  margin: 3px 0 0;
+}
+
+.page-status .status {
+  cursor: default;
+  padding: 2px 8px;
+  font-size: 11.5px;
+}
+
+.lede {
   margin: 0;
+  max-width: 58ch;
+  line-height: 1.55;
+}
+
+/* ── Blocks (a titled group + optional note) ─────────────────────────── */
+
+.block {
+  display: flex;
+  flex-direction: column;
+}
+
+.block .group-title {
+  margin-left: 4px;
+}
+
+/* At page scale the rows can breathe a little more than in the rail. */
+.options .setting {
+  padding: 14px 16px;
+}
+
+.options .setting-text strong {
+  font-size: 14px;
+}
+
+.options .setting-text small {
   max-width: 52ch;
 }
 
-.panel {
-  padding: 18px;
-}
-
-.panel-head {
-  margin-bottom: 14px;
-}
-
-.panel-head h2 {
-  font-size: 12px;
-}
-
-/* ── Steps ───────────────────────────────────────────────────────────── */
-
-.steps {
+/* The getting-started snippet sits full width inside its stacked row. */
+.setting--stacked .snippet {
   margin: 0;
-  padding-left: 20px;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  color: var(--text-muted);
-}
-
-.steps li {
-  padding-left: 4px;
-}
-
-.steps strong {
-  color: var(--text);
-  font-weight: 600;
-}
-
-.steps .snippet {
-  margin: 8px 0 0;
   white-space: normal;
-}
-
-.steps .status {
-  margin-left: 4px;
-  vertical-align: middle;
-  cursor: default;
-}
-
-/* ── Fields ──────────────────────────────────────────────────────────── */
-
-.field {
-  margin-bottom: 18px;
-}
-
-.field:last-child {
-  margin-bottom: 0;
-}
-
-.field > span {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text);
-  margin-bottom: 6px;
-}
-
-.field small {
-  display: block;
-  margin-top: 6px;
-  font-size: 12px;
-  line-height: 1.5;
-  max-width: 60ch;
-}
-
-.field input[type="number"] {
-  max-width: 180px;
-}
-
-textarea {
-  font-size: 12.5px;
-}
-
-/* ── Checkboxes ──────────────────────────────────────────────────────── */
-
-.check {
-  display: flex;
-  gap: 11px;
-  align-items: flex-start;
-  padding: 12px;
-  margin-bottom: 8px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--bg-sunken);
-  cursor: pointer;
-  transition: border-color 0.12s;
-}
-
-.check:hover {
-  border-color: var(--border-strong);
-}
-
-.check:last-of-type {
-  margin-bottom: 0;
-}
-
-.check input {
-  margin: 2px 0 0;
-  width: 15px;
-  height: 15px;
-  flex-shrink: 0;
-  accent-color: var(--accent);
-  cursor: pointer;
-}
-
-.check > span {
-  display: block;
-  min-width: 0;
-}
-
-.check strong {
-  display: block;
-  font-size: 13px;
-  font-weight: 600;
-  margin-bottom: 3px;
-}
-
-.check small {
-  display: block;
-  font-size: 12px;
-  line-height: 1.5;
-  max-width: 62ch;
+  word-break: break-all;
 }
 
 /* ── Actions ─────────────────────────────────────────────────────────── */
@@ -173,21 +98,22 @@ textarea {
 .actions {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
   position: sticky;
   bottom: 0;
-  padding: 14px 0;
-  background: linear-gradient(to top, var(--bg-sunken) 72%, transparent);
+  margin-top: 2px;
+  padding: 16px 0;
+  background: linear-gradient(to top, var(--bg-sunken) 74%, transparent);
 }
 
 .actions .btn {
-  padding: 8px 16px;
+  padding: 9px 18px;
   font-size: 13px;
 }
 
 .saved {
-  font-size: 12px;
-  font-weight: 500;
+  font-size: 12.5px;
+  font-weight: 550;
   color: var(--ok);
   animation: fade-in 0.18s ease-out;
 }
@@ -196,10 +122,13 @@ textarea {
   from { opacity: 0; transform: translateX(-4px); }
 }
 
+#port-error:not([hidden]) {
+  color: var(--error);
+}
+
 .page-foot {
   font-size: 12px;
   text-align: center;
-  padding-top: 4px;
 }
 
 kbd {
