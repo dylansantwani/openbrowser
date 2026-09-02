@@ -245,7 +245,7 @@ export const TOOLS = [
   {
     name: 'browser_screenshot',
     description:
-      'Capture the page as an image. Expensive — prefer browser_snapshot. Use for visual verification, canvas/video/PDF, or when a snapshot does not explain what you see.',
+      'Capture the page as an image. Costs ~20x a snapshot; use it when stuck, for canvas/video/PDF, or visual verification. Image coordinates work with browser_act space:"image".',
     inputSchema: {
       type: 'object',
       properties: {
@@ -483,7 +483,9 @@ Token discipline:
 - browser_snapshot mode:"interactive" is the default view of a page. mode:"diff" in loops.
 - Scope with the "selector" param on dense pages.
 - Batch multi-step flows with browser_batch instead of one call per step.
-- Screenshots cost roughly 20x a snapshot. Use them to verify, not to navigate.
+- Screenshots cost roughly 20x a snapshot. Use them to verify, not for routine navigation.
+
+Stuck? Use your eyes. After two actions with no visible progress, take ONE browser_screenshot — overlays, modals, cookie banners, and canvas UIs may be invisible to snapshots. Then act on what you see with browser_act space:"image".
 
 Reliability:
 - browser_act uses real trusted input events, so it works where JS-dispatched clicks are rejected.
