@@ -15,7 +15,7 @@ import { createTransport, DEFAULT_PORT, NO_EXTENSION } from './hub.js';
 import { McpServer } from './mcp.js';
 import { TOOLS, TOOL_NAMES, SERVER_INSTRUCTIONS } from './tools.js';
 
-const VERSION = '1.0.0';
+const VERSION = '1.2.0';
 
 function parseArgs(argv) {
   const opts = {
@@ -104,41 +104,50 @@ if (opts.mode === 'hub') {
 }
 
 /**
- * Stable label for this server process, used to name the browser tab group.
+ * This session's name — one word, allocated by the hub: "harbor".
  *
- * The point is legibility when several agents are running at once: a window
- * full of tabs is meaningless, whereas "opencode 6f2a" next to "claude 91c3"
- * tells you immediately who opened what — and which group is safe to close.
- * The suffix disambiguates two instances of the same client.
+ * It used to be `client · word` ("claude-code · harbor"), and that composite
+ * was the single most confusing thing a human or a model met here. The tab
+ * strip, the on-page frame, the panel, and every error all carried a two-part
+ * label whose first half was the same for every session of one client and
+ * whose second half was the only part that meant anything. The hub already
+ * guarantees the word is unique across every client it serves, so the prefix
+ * bought nothing — the session *is* the word now, and the same word appears
+ * everywhere. Which MCP client a session belongs to still matters to a person
+ * looking at the panel, so it rides along on every call as `_client`, metadata
+ * the browser records against the session and never uses as identity.
  */
 let sessionLabel = null;
 
 function sessionName() {
   if (sessionLabel) return sessionLabel;
-  const client = server?.clientInfo?.name || 'mcp';
 
-  // The distinguishing half normally comes from the hub, the only place that
-  // can see every live session and so the only one that can guarantee two never
-  // collide onto the same tab group.
+  // The name normally comes from the hub, the only place that can see every
+  // live session and so the only one that can guarantee two never collide onto
+  // the same tab group.
   //
   // When it does not — an older hub owner that predates name allocation — the
-  // suffix MUST still come from somewhere. Falling back to a bare client name
-  // put every session of the same client into one shared tab group, driving
-  // each other's tabs. A degraded name is fine; a non-unique one is not.
+  // name MUST still be unique. Falling back to a bare client name put every
+  // session of the same client into one shared tab group, driving each other's
+  // tabs. A degraded name is fine; a non-unique one is not.
   let name = transport.sessionName;
   if (!name) {
-    name = process.pid.toString(16).slice(-4);
+    name = `${clientName()}-${process.pid.toString(16).slice(-4)}`;
     log(
       `hub did not assign a session name — it is running an older version. ` +
         `Using "${name}"; restart the first-started MCP client for readable names and tab cleanup.`
     );
   }
-  sessionLabel = `${client} · ${name}`;
-  // The hub allocated the unique half but cannot know the client's name, so it
-  // has to be told the label the tab group will actually carry — otherwise its
-  // cleanup on disconnect looks for a workstream that does not exist.
+  sessionLabel = name;
+  // Tell the hub the label this session's tab group actually carries, so its
+  // cleanup on disconnect looks for the right group and reserves the right name.
   transport.setSessionLabel?.(sessionLabel);
   return sessionLabel;
+}
+
+/** The MCP client's own name for itself ("claude-code", "opencode"), for display. */
+function clientName() {
+  return String(server?.clientInfo?.name || 'mcp').trim() || 'mcp';
 }
 
 const server = new McpServer({
@@ -172,16 +181,21 @@ const server = new McpServer({
     // GIF recording and long waits legitimately outrun the default budget.
     const timeout = timeoutFor(name, args);
 
-    // Every call carries the session label. The browser uses it to group this
-    // session's tabs; an explicit `group` argument still wins, so an agent can
-    // still split its own work into sub-workstreams.
+    // Every call carries the session name. The browser uses it to own and group
+    // this session's tabs; an explicit `group` argument splits that session's
+    // own tabs into named sub-groups and never changes who owns them.
     //
     // Stamped *after* the spread, and that order is load-bearing. `checkArgs`
     // deliberately exempts underscore-prefixed keys, so a model emitting
-    // `_session: "claude · harbor"` passes validation — and with the spread last
-    // it would overwrite this one and be handed another session's tab group.
-    // Identity is asserted here or nowhere.
-    return transport.call(name, { ...args, _session: sessionName() }, { timeout });
+    // `_session: "harbor"` passes validation — and with the spread last it would
+    // overwrite this one and be handed another session's tabs. Identity is
+    // asserted here or nowhere. `_client` is display metadata for the panel and
+    // is stamped the same way so a model cannot mislabel itself either.
+    return transport.call(
+      name,
+      { ...args, _session: sessionName(), _client: clientName() },
+      { timeout }
+    );
   },
 }).start();
 

@@ -25,16 +25,32 @@ export const DEFAULT_PORT = 8848;
 /**
  * Names for concurrent sessions, in the order they are handed out.
  *
- * This is what a human reads in the tab strip, so it is worth getting right:
- * "claude · harbor" tells you which job a tab belongs to at a glance, while
- * "claude 8cac" is four characters of hex nobody can hold in their head or say
- * out loud. Short, common, visually distinct words — no two starting with the
- * same letter, so they stay separable even truncated in a narrow tab group.
+ * A session *is* its name. "harbor" is what a human reads on the tab group, what
+ * the on-page frame says, what the panel lists, and what every error the model
+ * sees calls it — one word, the same everywhere. Short, common, easy to say out
+ * loud ("close harbor's tabs"), and visually distinct from each other. The first
+ * sixteen share no first letter, so they stay separable even truncated in a
+ * narrow tab group; the rest keep the same flavour so a strip full of agents
+ * still reads as names rather than as a code.
+ *
+ * Sixty-four, because twenty or thirty agents at once is a real workload now,
+ * and a session that runs out of words falls back to `session-17` — unique, and
+ * exactly the kind of label nobody can hold in their head. Names are released
+ * when a session's cleanup completes (see `_endSession`), so a day of short
+ * jobs does not exhaust the list either.
  */
 const SESSION_NAMES = [
   'harbor', 'meadow', 'falcon', 'copper', 'lantern', 'willow',
   'basalt', 'ember', 'quarry', 'thistle', 'juniper', 'saffron',
   'orchard', 'pelican', 'granite', 'nutmeg',
+  'aspen', 'birch', 'cedar', 'delta', 'fjord', 'garnet',
+  'heron', 'indigo', 'jasper', 'kestrel', 'linden', 'marble',
+  'nettle', 'osprey', 'pebble', 'quill', 'raven', 'sable',
+  'tundra', 'umber', 'velvet', 'walnut', 'yarrow', 'zephyr',
+  'amber', 'bramble', 'cobalt', 'dune', 'elm', 'fennel',
+  'glacier', 'hazel', 'ivory', 'jade', 'kelp', 'lotus',
+  'moss', 'nova', 'olive', 'pine', 'reef', 'slate',
+  'tide', 'valley', 'wren', 'ochre',
 ];
 
 /** How long a single browser call may take before we give up on it. */
@@ -163,19 +179,38 @@ export class Hub {
   }
 
   /**
-   * Mark a label as spoken for, both whole and by its distinguishing half.
+   * Mark a label as spoken for.
    *
-   * Labels arrive as `client · name` ("claude · harbor"). Reserving only the
-   * whole string would let opencode claim `harbor` while Claude Code is still
-   * on it — different labels, so different tab groups, but a human reading the
-   * tab strip now sees two "harbor"s, which defeats the point of readable
-   * names.
+   * A label is normally just the word ("harbor"). Older servers composed
+   * `client · name` ("claude · harbor"), and a browser can still hold a tab
+   * group under one of those, so the distinguishing half after the last " · "
+   * is reserved too — otherwise a fresh session would be handed "harbor" while a
+   * group called "claude · harbor" is still on screen, and a human reading the
+   * strip sees two harbors.
    */
   _reserve(label) {
     if (typeof label !== 'string' || !label) return;
     this.takenNames.add(label);
     const cut = label.lastIndexOf(' · ');
     if (cut !== -1) this.takenNames.add(label.slice(cut + 3));
+  }
+
+  /**
+   * Give a name back, once nothing in any browser carries it.
+   *
+   * Names used to be kept forever: a finished session could leave a tab group
+   * behind, and handing its name to the next session would drop that session
+   * straight into the leftover tabs. That is still true — which is why this is
+   * only called from `_endSession` *after* the browser has confirmed the
+   * cleanup, which ungroups or closes everything under the name. Holding names
+   * past that point had a cost of its own: a day of short jobs walked off the
+   * end of the list, and every later agent was `session-N`.
+   */
+  _release(label) {
+    if (typeof label !== 'string' || !label) return;
+    this.takenNames.delete(label);
+    const cut = label.lastIndexOf(' · ');
+    if (cut !== -1) this.takenNames.delete(label.slice(cut + 3));
   }
 
   /**
@@ -280,11 +315,10 @@ export class Hub {
 
       conn.on('close', () => {
         this.peers.delete(conn);
-        // The name is deliberately *not* released. A finished session can leave
-        // its tab group behind — cleanup only closes tabs it opened, not ones
-        // it adopted — and handing the same name to the next session would drop
-        // it straight into those leftover tabs. Names are cheap; collisions are
-        // not.
+        // The name is released only once the browser confirms the cleanup —
+        // see `_endSession`. Releasing it here, before the tab group is gone,
+        // would hand it to the next session and drop that session straight
+        // into the leftover tabs.
         const name = conn.sessionLabel || conn.sessionName;
         if (name) this._endSession(name);
       });
@@ -641,17 +675,26 @@ export class Hub {
       ? this.liveBrowsers().filter((c) => c.instance === bound)
       : this.liveBrowsers();
     this.sessionBrowsers.delete(name);
-    for (const conn of targets) {
-      conn.sendJSON({
-        type: 'call',
-        id: `session-end-${name}-${this.peers.size}`,
-        tool: '__session_end',
-        // The extension guards every 'call', cleanup included — without the
-        // stamp a current extension rejects session-end and never tidies the
-        // tabs of a hub-initiated cleanup.
-        args: { _session: name, _browser: conn.instance, _protocolRevision: PROTOCOL_REVISION },
-      });
-    }
+
+    // Through `_rawCallTo` rather than a bare frame, so the result comes back
+    // and the name can be released once every browser has finished tidying.
+    // The extension guards every 'call', cleanup included — `_rawCallTo` stamps
+    // the revision, without which a current extension rejects session-end and
+    // never tidies the tabs of a hub-initiated cleanup.
+    const done = targets.map((conn) => {
+      try {
+        return this._rawCallTo(conn, '__session_end', { _session: name }, { timeout: 15_000 });
+      } catch (err) {
+        return Promise.reject(err);
+      }
+    });
+    // Released only when every browser answered. A browser that failed or timed
+    // out may still hold the group, and a name in doubt stays taken — the seed
+    // on its next connect reserves it again anyway, so nothing is lost by
+    // waiting, while releasing early is how a stranger inherits a live group.
+    return Promise.allSettled(done).then((results) => {
+      if (!results.length || results.every((r) => r.status === 'fulfilled')) this._release(name);
+    });
   }
 
   /**
@@ -761,8 +804,11 @@ export class Hub {
         continue;
       }
       for (const w of windows) {
+        // Same naming as `browser_window list` inside one browser: the role is
+        // what a human recognises; the id is what `use` takes.
+        const role = w.agent ? 'the agent window' : w.own ? `${w.own}'s window` : `the user's${w.focused ? ', focused' : ''}`;
         lines.push(
-          `  ${++n} · browser:"${name}" windowId:${w.windowId}  (${w.tabs} tab${w.tabs === 1 ? '' : 's'})` +
+          `  ${++n} · browser:"${name}" windowId:${w.windowId}  (${role}; ${w.tabs} tab${w.tabs === 1 ? '' : 's'})` +
             (w.titles?.length ? `  ${w.titles.join(', ')}` : '')
         );
       }
@@ -1094,7 +1140,7 @@ export class Hub {
     // for the frame to reach the extension before the server is torn down.
     // `_sessionName`, not the getter: a hub owner that never drove a tab has no
     // name, and shutdown is not the moment to claim one.
-    this._endSession(this.sessionLabel || this._sessionName);
+    this._endSession(this.sessionLabel || this._sessionName)?.catch?.(() => {});
     await new Promise((resolve) => setTimeout(resolve, 150));
     await this.server?.close();
   }

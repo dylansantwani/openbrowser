@@ -19,7 +19,9 @@
       .rail {
         width: 380px;
         min-height: 720px;
-        background: #fff;
+        /* The panel's own ground, so forced-dark emulation cannot invert a white
+           frame around a dark panel and make its header text look wrong. */
+        background: var(--bg, #fff);
         border-radius: 10px;
         overflow: hidden;
         box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
@@ -66,12 +68,34 @@
        * Stub the parts of the chrome.* API the panel touches. Enough to render
        * a realistic populated state — nothing here talks to a real browser.
        */
+      // Window 2 is the shared agent window; three agents live in it. "harbor"
+      // has a plain group plus a "research" sub-group, like a real run.
       const fakeTabs = [
-        { id: 481, windowId: 1, title: 'Sign in · Example', url: 'https://app.example.com/login', active: true },
-        { id: 482, windowId: 1, title: 'Dashboard — Acme Analytics', url: 'https://acme.io/dashboard?range=30d' },
-        { id: 483, windowId: 1, title: 'Search results for "wireless keyboard"', url: 'https://shop.example.net/s?q=wireless+keyboard' },
-        { id: 484, windowId: 1, title: 'GitHub · openbrowser', url: 'https://github.com/openbrowser/openbrowser' },
+        { id: 481, windowId: 2, groupId: 11, title: 'Sign in · Example', url: 'https://app.example.com/login', active: true },
+        { id: 482, windowId: 2, groupId: 12, title: 'Dashboard — Acme Analytics', url: 'https://acme.io/dashboard?range=30d' },
+        { id: 483, windowId: 2, groupId: 12, title: 'Search results for "wireless keyboard"', url: 'https://shop.example.net/s?q=wireless+keyboard' },
+        { id: 484, windowId: 2, groupId: 13, title: 'GitHub · openbrowser', url: 'https://github.com/openbrowser/openbrowser' },
+        { id: 485, windowId: 2, groupId: 14, title: 'Amazon.com: 3D printed cable clips', url: 'https://www.amazon.com/s?k=3d+printed+cable+clips' },
+        { id: 486, windowId: 2, groupId: 14, title: 'New Tab', url: 'about:blank' },
+        { id: 490, windowId: 1, groupId: -1, title: 'Inbox', url: 'https://mail.google.com/', active: true },
       ];
+      const fakeGroups = [
+        { id: 11, windowId: 2, title: 'harbor', color: 'blue' },
+        { id: 12, windowId: 2, title: 'harbor · research', color: 'purple' },
+        { id: 13, windowId: 2, title: 'meadow', color: 'cyan' },
+        { id: 14, windowId: 2, title: 'falcon', color: 'green' },
+        // A hand-made group with an agent-looking title: never shown as an agent.
+        { id: 15, windowId: 1, title: 'harbor', color: 'red' },
+      ];
+      const sessionStore = {
+        tabGroupOwnersV2: {
+          11: { sessionId: 'harbor', workstream: 'harbor', client: 'claude-code' },
+          12: { sessionId: 'harbor', workstream: 'research', client: 'claude-code' },
+          13: { sessionId: 'meadow', workstream: 'meadow', client: 'opencode' },
+          14: { sessionId: 'falcon', workstream: 'falcon', client: 'cursor' },
+        },
+        agentWindowPoolV1: 2,
+      };
 
       const listeners = [];
 
@@ -100,6 +124,11 @@
               },
               run_tool: {
                 text:
+                  'the agent window (id 2) · 6 tabs  agents: harbor, meadow, falcon\n' +
+                  '  481  app.example.com/login  "Sign in · Example"  active  [harbor]\n' +
+                  '  482  acme.io/dashboard?range=30d  "Dashboard — Acme Analytics"  [harbor · research]\n' +
+                  '  484  github.com/openbrowser/openbrowser  "GitHub · openbrowser"  [meadow]\n' +
+                  '\n' +
                   'app.example.com/login · "Sign in · Example" · tab 481 · 1280x800\n' +
                   'banner\n  link "Example" [e1] /\n' +
                   'main\n  heading "Sign in" h1\n  form\n' +
@@ -116,12 +145,26 @@
           lastError: null,
         },
         tabs: {
-          query: async (q) => (q.active ? fakeTabs.filter((t) => t.active) : fakeTabs),
+          query: async (q = {}) =>
+            fakeTabs.filter(
+              (t) => (q.groupId == null || t.groupId === q.groupId) && (!q.active || t.active)
+            ),
           update: async () => {},
           remove: async () => {},
           onCreated: { addListener() {} },
           onRemoved: { addListener() {} },
           onUpdated: { addListener() {} },
+          onActivated: { addListener() {} },
+        },
+        tabGroups: {
+          query: async () => fakeGroups,
+          onCreated: { addListener() {} },
+          onUpdated: { addListener() {} },
+          onRemoved: { addListener() {} },
+        },
+        storage: {
+          session: { get: async (key) => (key in sessionStore ? { [key]: sessionStore[key] } : {}) },
+          onChanged: { addListener() {} },
         },
         windows: { update: async () => {} },
       };

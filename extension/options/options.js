@@ -23,6 +23,7 @@ const BOOLEAN_FIELDS = [
   'autoConfirmLeave',
   'captureBodies',
   'agentWindowPool',
+  'raiseWindowOnSelect',
   'emulateFocus',
   'logActivity',
 ];

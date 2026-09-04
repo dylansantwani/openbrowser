@@ -1,7 +1,8 @@
 # Tool reference
 
-Every tool takes an optional `tabId`. Omit it to act on the active tab; pass it
-to drive many tabs in parallel.
+Every tool takes an optional `tabId`. Omit it to act on your session's last-used
+tab (one is opened for you if you have none); pass it to drive many tabs in
+parallel. A tab another agent owns is refused.
 
 Refs (`e12`, `f2e5`) come from `browser_snapshot` or `browser_find`. A ref
 prefixed with `fN` lives inside iframe N. Refs survive minor re-renders and

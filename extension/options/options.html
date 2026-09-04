@@ -118,7 +118,7 @@
             <div class="setting-text">
               <strong>Mark driven pages</strong>
               <small>
-                A softly pulsing orange border with the session's name, so a page an
+                A softly breathing blue frame with the agent&rsquo;s name, so a page an
                 agent is driving is unmistakable at a glance.
               </small>
             </div>
@@ -137,8 +137,8 @@
             <div class="setting-text">
               <strong>Keep agents in a background window</strong>
               <small>
-                Agents work behind the window you're using and never pull focus from
-                it. Turn off only to watch them inside a window you choose.
+                Agents share one “agent window” behind the one you're using and never
+                pull focus from it. Turn off only to watch them inside a window you choose.
               </small>
             </div>
             <div class="setting-control">
@@ -162,7 +162,7 @@
           <label class="setting" for="groupTabs">
             <div class="setting-text">
               <strong>Group agent tabs</strong>
-              <small>Collects each session's tabs into a labelled, colored tab group.</small>
+              <small>Collects each agent's tabs into a tab group named after it — “harbor”, “harbor · research”.</small>
             </div>
             <div class="setting-control">
               <input type="checkbox" class="switch" id="groupTabs" />
@@ -275,6 +275,20 @@
               </div>
               <div class="setting-control">
                 <input type="checkbox" class="switch" id="agentWindowPool" />
+              </div>
+            </label>
+
+            <label class="setting" for="raiseWindowOnSelect">
+              <div class="setting-text">
+                <strong>Let agents bring their window to the front</strong>
+                <small>
+                  Off, agents can only switch which tab is showing inside their own
+                  window — nothing they do raises a window over yours. Click a tab
+                  in the side panel when you want to look.
+                </small>
+              </div>
+              <div class="setting-control">
+                <input type="checkbox" class="switch" id="raiseWindowOnSelect" />
               </div>
             </label>
 

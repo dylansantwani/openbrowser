@@ -26,25 +26,25 @@
   body {
     margin: 0;
     font: 15px/1.6 ui-sans-serif, system-ui, -apple-system, sans-serif;
-    color: #1c1917;
+    color: #1c1c1e;
     background: #fff;
   }
   .page { max-width: 620px; margin: 0 auto; padding: 88px 24px 64px; }
   h1 { font-size: 26px; margin: 0 0 6px; }
-  p { color: #57534e; }
+  p { color: #6e6e73; }
   .controls {
     position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
     display: flex; gap: 8px; z-index: 2147483647;
-    background: #1c1917; padding: 8px; border-radius: 10px;
+    background: #1c1c1e; padding: 8px; border-radius: 10px;
   }
   .controls button {
     font: 500 13px/1 ui-sans-serif, system-ui, sans-serif;
     padding: 8px 12px; border-radius: 6px; cursor: pointer;
     border: 1px solid rgba(255,255,255,.18);
-    background: rgba(255,255,255,.08); color: #fafaf9;
+    background: rgba(255,255,255,.08); color: #f2f2f7;
   }
   #log { position: fixed; bottom: 64px; left: 50%; transform: translateX(-50%);
-         font: 12px ui-monospace, monospace; color: #78716c; }
+         font: 12px ui-monospace, monospace; color: #98989f; }
 </style>
 </head>
 <body>
@@ -84,7 +84,7 @@
 
 <script>
   // Mirrors actions.js: agentFrame()
-  function agentFrame(on, label = 'OpenBrowser · claude · meadow') {
+  function agentFrame(on, label = 'OpenBrowser · meadow') {
     document.querySelector('.ob-agent-frame')?.remove();
     if (!on) return;
     const box = document.createElement('div');
@@ -94,7 +94,7 @@
   }
 
   // Mirrors actions.js: windowPick()
-  function windowPick(on, label = 'claude · meadow') {
+  function windowPick(on, label = 'meadow') {
     document.querySelector('.ob-window-pick')?.remove();
     if (!on) return;
 
@@ -108,7 +108,7 @@
 
     const title = document.createElement('div');
     title.className = 'ob-window-pick-title';
-    title.textContent = `⚡ ${label} wants to work in this window`;
+    title.textContent = `Agent "${label}" wants to work in this window`;
 
     const sub = document.createElement('div');
     sub.className = 'ob-window-pick-sub';
@@ -342,7 +342,7 @@
 
     const failed = results.filter(([s]) => s === 'FAIL');
     log(results.map(([s, m]) => `${s}  ${m}`).join('\n'));
-    document.getElementById('log').style.color = failed.length ? '#dc2626' : '#78716c';
+    document.getElementById('log').style.color = failed.length ? '#ff3b30' : '#98989f';
     document.getElementById('log').style.whiteSpace = 'pre';
     document.getElementById('log').style.textAlign = 'left';
   }

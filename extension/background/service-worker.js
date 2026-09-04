@@ -68,11 +68,13 @@ boot();
 
 function updateBadge() {
   const status = bridge.status;
+  // The same three status colours the panel uses (--ok / --warn / --text-3), so
+  // the toolbar badge and the panel's status capsule never disagree.
   const config = {
-    connected: { text: '', color: '#22c55e' },
-    connecting: { text: '···', color: '#eab308' },
-    disconnected: { text: '○', color: '#94a3b8' },
-  }[status] || { text: '', color: '#94a3b8' };
+    connected: { text: '', color: '#34c759' },
+    connecting: { text: '···', color: '#ff9500' },
+    disconnected: { text: '○', color: '#aeaeb2' },
+  }[status] || { text: '', color: '#aeaeb2' };
 
   chrome.action.setBadgeText({ text: config.text }).catch(() => {});
   chrome.action.setBadgeBackgroundColor({ color: config.color }).catch(() => {});

@@ -96,6 +96,21 @@ const DEFAULTS = {
   agentWindowPool: true,
 
   /**
+   * Let `browser_tabs select` / `browser_window focus` raise the agent window
+   * over whatever the user is doing.
+   *
+   * Off, and off on purpose. Those two calls exist so a human can be shown a
+   * tab, and for a long time they did that by focusing the window — which, in
+   * practice, meant an agent window jumping in front of the page someone was
+   * reading, mid-keystroke, several times a run. A tab can be made the visible
+   * one *inside* the agent window without the window moving at all, and that
+   * is what the calls do now. The person watching brings the window forward
+   * themselves — the side panel's tab rows do exactly that on click. Turn this
+   * on only if you want agents to be able to take the front of the screen.
+   */
+  raiseWindowOnSelect: false,
+
+  /**
    * Experimental page-focus emulation. It can help a site whose JavaScript
    * explicitly checks document focus, but it is not documented as a native
    * window-occlusion override and is not required for background CDP input.

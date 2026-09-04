@@ -261,8 +261,32 @@ async function main() {
   // cannot name is one it cannot use, and this is the exact silent-wrong-click
   // the coordinate documentation exists to prevent. Trimmed once (150→130 bytes)
   // before raising.
+  //
+  // Raised to 15.2KB for `browser_screenshot` `selector` (element mode by CSS
+  // selector). A purely visual target — a `<canvas>`, `<svg>` chart, an `<img>`
+  // — carries no interactive role, so it never gets a ref, so element mode was
+  // unreachable for it and the only way to frame it was a hand-guessed pixel
+  // `region`. A model cannot see the element's box, so the guess clips it, and
+  // the model reads a half-cut graph as the whole answer without knowing it did.
+  // Not hypothetical: a capable model burned thirty region screenshots trying to
+  // crop one velocity-time graph, every crop clipping the axis, and answered off
+  // the clipped view. The selector is the syntax for "frame this element,
+  // whatever its box is", which the extension computes and clips to — whole
+  // element, native resolution, never clipped. Region stays the labelled last
+  // resort. Trimmed twice (redundant prose across the tool and selector
+  // descriptions) before raising.
+  //
+  // Raised to 15.6KB for `browser_act action:"google_login"` (+ `account`,
+  // `consent`). A guided "Sign in with Google" is unreachable without the enum
+  // value and the two params, and the whole reason it exists is to make the two
+  // decisions a model must not take alone — which identity, and whether to grant
+  // access — into explicit, human-gated calls (and to refuse the password step
+  // outright). A capability a model cannot name is one it cannot use, and here
+  // that would mean the model falling back to clicking account rows blind, which
+  // is exactly the identity-picking-for-the-user this prevents. The gating logic
+  // is pure and separately tested (testOAuth); this is only the syntax for it.
   const schemaBytes = JSON.stringify(tools).length;
-  check('tool schemas stay under 14.7KB', schemaBytes < 14_700, `${schemaBytes} bytes`);
+  check('tool schemas stay under 15.6KB', schemaBytes < 15_600, `${schemaBytes} bytes`);
 
   // A screenshot's pixels are in neither coordinate space every other argument
   // uses; `space:"image"` is the only syntax for converting them back, so it has
@@ -293,6 +317,18 @@ async function main() {
     'browser_act can answer native dialogs',
     actProps.action?.enum?.includes('dialog') && actProps.accept?.type === 'boolean',
     JSON.stringify({ enum: actProps.action?.enum, accept: actProps.accept })
+  );
+
+  // A non-interactive graphic (canvas/svg/img) never gets a ref, so element mode
+  // has to be reachable by CSS selector or it is unreachable for exactly the
+  // thing screenshots exist to read. The param a model has never been shown is
+  // one it cannot use, so the schema has to carry it.
+  const shotTool = tools.find((t) => t.name === 'browser_screenshot');
+  check(
+    'browser_screenshot advertises a selector for element mode',
+    shotTool?.inputSchema?.properties?.selector?.type === 'string' &&
+      shotTool?.inputSchema?.properties?.mode?.enum?.includes('element'),
+    JSON.stringify(Object.keys(shotTool?.inputSchema?.properties || {}))
   );
 
   const ping = await server.request('ping');
@@ -339,6 +375,29 @@ async function main() {
     'find forwards its selector scope',
     ext.seen.find((c) => c.tool === 'browser_find')?.args.selector === 'div[role=dialog]'
   );
+
+  // A `selector` on browser_screenshot is what lets a model frame a chart/canvas/
+  // svg that has no ref, instead of guessing a pixel region that clips it. The
+  // whole feature is dead if the strict validator drops the param as unknown, so
+  // it has to be advertised and it has to survive the trip to the extension.
+  await server.request('tools/call', {
+    name: 'browser_screenshot',
+    arguments: { mode: 'element', selector: 'canvas' },
+  });
+  check(
+    'screenshot forwards its element selector',
+    ext.seen.find((c) => c.tool === 'browser_screenshot')?.args.selector === 'canvas'
+  );
+
+  // The guided Google sign-in lives behind `account`/`consent`; the strict
+  // validator must let them through or the whole flow is unreachable, and a
+  // dropped `consent` would be the difference between asking and granting.
+  await server.request('tools/call', {
+    name: 'browser_act',
+    arguments: { action: 'google_login', account: 'sam@work.com', consent: true },
+  });
+  const gl = ext.seen.find((c) => c.tool === 'browser_act' && c.args.action === 'google_login');
+  check('google_login forwards account and consent intact', gl?.args.account === 'sam@work.com' && gl?.args.consent === true, JSON.stringify(gl?.args));
 
   // `tabId` on the batch itself is the shape people write first, and repeating
   // it on every step is easy to get subtly wrong — one step missing it silently
@@ -446,19 +505,20 @@ async function main() {
     firstLabel !== secondLabel,
     `both were ${firstLabel}`
   );
+  // A session *is* its name: one word, the same on the tab group, the page
+  // frame, the panel, and in every result. The old `client · word` composite
+  // was the most confusing thing here, and the prefix bought no uniqueness —
+  // the hub already guarantees the word is unique across every client.
   check(
-    'the label is a readable word, not a hex id',
-    /^[\w-]+ · [a-z-]+\d*$/.test(secondLabel || ''),
-    secondLabel
-  );
-  // A label must never be just the client name. It briefly was, when the hub
-  // supplied no name, and every session of a given client then shared one tab
-  // group and drove each other's tabs.
-  check(
-    'a label always carries a distinguishing suffix',
-    / · \S+$/.test(firstLabel || '') && / · \S+$/.test(secondLabel || ''),
+    'the label is one readable word, not a hex id or a composite',
+    /^[a-z]+(-\d+)?$/.test(secondLabel || '') && /^[a-z]+(-\d+)?$/.test(firstLabel || ''),
     `${firstLabel} / ${secondLabel}`
   );
+  // Which MCP client a session belongs to still matters to a person reading the
+  // panel, so it travels as metadata — stamped server-side like `_session`, so
+  // a model cannot mislabel itself.
+  const clientStamp = ext.seen.find((c) => c.tool === 'browser_tabs')?.args._client;
+  check('the client name rides along as display metadata', clientStamp === 'second', clientStamp);
 
   // `checkArgs` deliberately lets underscore-prefixed arguments through, so a
   // model can put `_session` on any call it makes. The stamp therefore has to
@@ -466,13 +526,18 @@ async function main() {
   // another agent's tab group — and be handed its tabs — by naming it.
   const spoofed = await server.request('tools/call', {
     name: 'browser_snapshot',
-    arguments: { _session: 'somebody · else' },
+    arguments: { _session: 'somebody', _client: 'not-me' },
   });
   check('a spoofed _session does not fail the call', spoofed.result?.isError === false);
   check(
     "a model cannot assert another session's identity",
     ext.seen.filter((c) => c.tool === 'browser_snapshot').pop()?.args._session === firstLabel,
     ext.seen.filter((c) => c.tool === 'browser_snapshot').pop()?.args._session
+  );
+  check(
+    'nor mislabel its client',
+    ext.seen.filter((c) => c.tool === 'browser_snapshot').pop()?.args._client === 'test',
+    ext.seen.filter((c) => c.tool === 'browser_snapshot').pop()?.args._client
   );
 
   // A disconnected client is the only reliable "task over" signal, so the hub
@@ -522,10 +587,10 @@ async function main() {
   const freshLabel = ext2.seen.find((c) => c.tool === 'browser_tabs')?.args._session;
   check(
     'a name whose tab group is still live is not reused',
-    !!freshLabel && !/ · (harbor|meadow)$/.test(freshLabel),
+    !!freshLabel && !/^(harbor|meadow)$/.test(freshLabel),
     freshLabel
   );
-  check('the session still gets a readable name', /^claude · [a-z-]+\d*$/.test(freshLabel || ''), freshLabel);
+  check('the session still gets a readable name', /^[a-z]+(-\d+)?$/.test(freshLabel || ''), freshLabel);
 
   fresh.proc.kill();
   ext2.conn.close();
@@ -537,11 +602,46 @@ async function main() {
   // label. Both are pure bookkeeping, so they are asserted directly.
   const { Hub } = await importFrom('mcp-server', 'src', 'hub.js');
   const bookkeeping = new Hub({ port: 0 });
-  bookkeeping._reserve('claude · harbor');
-  check('reserving a label also reserves its distinguishing half', bookkeeping.takenNames.has('harbor'));
-  check('the first free name is handed out', bookkeeping._claimName() === 'meadow');
-  bookkeeping.setSessionLabel('opencode · falcon');
-  check("the owner's own label is reserved", bookkeeping._claimName() === 'copper');
+  bookkeeping._reserve('harbor');
+  check('a reserved name is not handed out', bookkeeping._claimName() === 'meadow');
+  // A browser can still hold a group under an older server's `client · word`
+  // label; the word half has to count as taken too.
+  bookkeeping._reserve('claude · falcon');
+  check('a legacy composite label reserves its distinguishing half', bookkeeping.takenNames.has('falcon'));
+  check('and that word is skipped', bookkeeping._claimName() === 'copper');
+  bookkeeping.setSessionLabel('lantern');
+  check("the owner's own label is reserved", bookkeeping._claimName() === 'willow');
+
+  // Twenty-odd agents at once is a real workload. Every one of them gets a
+  // word, not `session-17`.
+  const crowd = new Hub({ port: 0 });
+  const handed = Array.from({ length: 40 }, () => crowd._claimName());
+  check('forty concurrent sessions all get real words',
+    handed.every((n) => /^[a-z]+$/.test(n)) && new Set(handed).size === 40, handed.join(','));
+
+  // And names come back when a session's cleanup has finished — not on
+  // disconnect, which would hand the name to the next session while the tab
+  // group is still on screen, but once the browser confirms the tidy-up.
+  const recycler = await new Hub({ port: PORT2 + 1 }).start();
+  let endSeen = 0;
+  const ext3 = await fakeExtension(PORT2 + 1, {
+    onCall: (msg) => {
+      if (msg.tool === '__session_end') endSeen++;
+      if (msg.tool === '__session_list') return { names: [] };
+      return undefined;
+    },
+  });
+  await sleep(200);
+  const word = recycler._claimName();
+  check('a name is taken while its session lives', recycler.takenNames.has(word));
+  const ending = recycler._endSession(word);
+  check('a name is still taken until the browser confirms cleanup', recycler.takenNames.has(word));
+  await ending;
+  check('the browser was asked to tidy the session', endSeen === 1, `${endSeen} cleanup call(s)`);
+  check('the name is released once cleanup completes', !recycler.takenNames.has(word));
+  check('and is the first one handed out again', recycler._claimName() === word);
+  ext3.conn.close();
+  await recycler.stop();
 
   // ── Two browsers, one hub ────────────────────────────────────────────────
   section('Two browsers with the extension installed');
@@ -574,6 +674,10 @@ async function main() {
   section('Macro substitution');
   await testMacros();
 
+  // ── Guided Google sign-in gating ─────────────────────────────────────────
+  section('Google sign-in: the safety gates');
+  await testOAuth();
+
   // ── Window binding ───────────────────────────────────────────────────────
   section('Window binding');
   await testWindowBinding();
@@ -581,6 +685,10 @@ async function main() {
   // ── Tab groups under load ────────────────────────────────────────────────
   section('Tab groups with several agents');
   await testGroupConcurrency();
+
+  // ── Many sessions in parallel: naming, no-foreground, no takeover ────────
+  section('Parallel sessions: named, backgrounded, isolated');
+  await testParallelSessions();
 
   // ── Background input and mutation isolation ─────────────────────────────
   section('Background input and mutation isolation');
@@ -1012,34 +1120,63 @@ async function testFormatting() {
 
   check('respects the character budget', fmt.renderTree(nodes, { maxChars: 40 }).truncated === true);
 
-  // ── The tab list has to say which window each tab is in ──────────────────
+  // ── The tab list: an agent sees its own tabs, and everyone else as counts ─
   //
-  // It was a flat list of every tab in the browser, with the window nowhere in
-  // it. An agent with three windows open therefore had no way to tell where it
-  // was working, and the only window-ish signal available — the workstream tag
-  // — describes a *group*, which can be left behind in a window the session no
-  // longer works in. That is precisely how agents ended up certain they were in
-  // one window while acting in another.
-  const tabList = fmt.renderTabs(
-    [
-      { id: 11, windowId: 501, url: 'https://mail.google.com/', title: 'Inbox' },
-      { id: 12, windowId: 501, url: 'https://example.com/a', title: 'A' },
-      { id: 21, windowId: 502, url: 'https://example.com/b', title: 'B' },
-    ],
-    11,
-    [
-      { name: 'mail', sessionId: 'claude · harbor', tabIds: [11, 12], windowId: 501 },
-      { name: 'research', sessionId: 'claude · meadow', tabIds: [21], windowId: 502 },
-    ],
-    { boundWindowId: 501, sessionId: 'claude · harbor' }
-  );
-  check('tabs are grouped under a window header', /window 501 \(2 tabs\)/.test(tabList), tabList);
-  check('both windows appear', /window 502 \(1 tab\)/.test(tabList));
-  check('the calling session sees which window is its own', /window 501 [^\n]*\[your window\]/.test(tabList), tabList);
-  check('the session reads as "(you)" in its own window', /claude · harbor \(you\)/.test(tabList));
-  check('another session in another window is named', /window 502[^\n]*claude · meadow/.test(tabList));
-  check('every tab is still listed exactly once',
-    tabList.split('\n').filter((l) => /^ {2}\d+ {2}/.test(l)).length === 3, tabList);
+  // It was a flat list of every tab in the browser. With twenty agents that was
+  // expensive and actively misleading — an agent reading a neighbour's tab id
+  // off it is exactly how tabs got taken over. Now a session is told who it is,
+  // where it works, which tabs are its own, and how many tabs everyone else
+  // holds; the user's windows are counted, never listed.
+  const tabs = [
+    { id: 11, windowId: 501, url: 'https://mail.google.com/', title: 'Inbox', active: true },
+    { id: 12, windowId: 501, url: 'https://example.com/a', title: 'A' },
+    { id: 13, windowId: 501, url: 'https://example.com/m', title: 'M' },
+    { id: 21, windowId: 502, url: 'https://example.com/b', title: 'B' },
+    { id: 31, windowId: 700, url: 'https://news.example/', title: 'News', active: true },
+    { id: 32, windowId: 700, url: 'https://docs.example/', title: 'Docs' },
+  ];
+  const wins = [
+    { windowId: 501, focused: false, agent: true },
+    { windowId: 502, focused: false, own: 'falcon' },
+    { windowId: 700, focused: true },
+  ];
+  const agentGroups = [
+    { name: 'harbor', sessionId: 'harbor', tabIds: [11], windowId: 501 },
+    { name: 'mail', sessionId: 'harbor', tabIds: [12], windowId: 501 },
+    { name: 'meadow', sessionId: 'meadow', tabIds: [13], windowId: 501 },
+    { name: 'falcon', sessionId: 'falcon', tabIds: [21], windowId: 502 },
+  ];
+  const mine = fmt.renderTabs(tabs, wins, agentGroups, { boundWindowId: 501, sessionId: 'harbor' });
+  check('an agent is told who it is and where it works',
+    /^You are agent "harbor", working in the agent window \(id 501\)\./m.test(mine), mine);
+  check('its own tabs are listed in full', /Your tabs \(2\):\n {2}11 {2}mail\.google\.com {2}"Inbox" {2}active\n {2}12 {2}example\.com\/a {2}"A" {2}group: mail/.test(mine), mine);
+  check('only its own tab ids appear',
+    mine.split('\n').filter((l) => /^ {2}\d+ {2}/.test(l)).map((l) => l.trim().split(/\s+/)[0]).join() === '11,12', mine);
+  check('other agents in its window are counted, not listed',
+    /Other agents in your window: meadow \(1 tab\)/.test(mine) && !/ 13 /.test(mine), mine);
+  check('agents elsewhere are counted too', /Agents in other windows: falcon \(1 tab\)/.test(mine), mine);
+  check('the user\'s windows are counted and marked off-limits',
+    /The user's windows — not yours to act on: window 700 \(the user's, focused\) · 2 tabs/.test(mine) && !/ 31 /.test(mine), mine);
+
+  // One window in full, on request — including one of the user's, so a tab of
+  // theirs can be found and adopted by explicit id.
+  const one = fmt.renderTabs(tabs.filter((t) => t.windowId === 700), wins, agentGroups,
+    { boundWindowId: 501, sessionId: 'harbor', windowId: 700 });
+  check('an explicit windowId lists that window in full', /window 700 \(the user's, focused\) · 2 tabs\n {2}31 /.test(one) && / 32 /.test(one), one);
+
+  // The side panel has no session and is a human: every window, every tab,
+  // every owner.
+  const all = fmt.renderTabs(tabs, wins, agentGroups, {});
+  check('the human view names each window by role',
+    /^the agent window \(id 501\) · 3 tabs {2}agents: harbor, meadow$/m.test(all) && /^falcon's window \(id 502\)/m.test(all), all);
+  check('the human view tags every owned tab', /^ {2}12 .*\[harbor · mail\]$/m.test(all) && /^ {2}13 .*\[meadow\]$/m.test(all), all);
+  check('every tab is listed exactly once in the human view',
+    all.split('\n').filter((l) => /^ {2}\d+ {2}/.test(l)).length === 6, all);
+
+  // A session with nothing yet is told how to start, not shown an empty list.
+  const fresh = fmt.renderTabs(tabs, wins, agentGroups, { boundWindowId: null, sessionId: 'quarry' });
+  check('a fresh session is told no window is bound yet', /No window is bound yet/.test(fresh), fresh);
+  check('and how to get a tab', /You have no tabs yet\. browser_navigate opens one/.test(fresh), fresh);
 
   // Diffing.
   fmt.storeSnapshot(1, 'a\nb\nc');
@@ -1114,6 +1251,161 @@ async function testFormatting() {
 
   // No viewport, no honest mapping — better than a guessed one.
   check('mapping is null without a viewport', fmt.captureMapping({ mode: 'viewport', meta: {}, image: { width: 500 } }) === null);
+
+  // ── Coordinate stress: many sessions, the whole parameter space ────────────
+  // "Stress test with a bunch of different sessions until it is perfect." The
+  // coordinate contract is the thing a low-context model leans on hardest — it
+  // reads a pixel off the image and hands it straight back — so the mapping has
+  // to hold across every viewport size, device pixel ratio, maxWidth and clip a
+  // real run throws at it, not just the three worked examples above. This models
+  // the actual pipeline (capture at dpr, then downscale to maxWidth) and asserts,
+  // over thousands of randomized captures, that: nothing is ever NaN/Infinity or
+  // a non-positive scale; the clip's own corners land on the image's corners; a
+  // point projected CSS→image and inverted back lands within a pixel; and the
+  // pure formatter carries no state between sessions (interleaved runs equal
+  // isolated ones). A seeded PRNG makes a failure reproducible.
+  let seed = 0x1a2b3c4d;
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+  const pick = (arr) => arr[Math.floor(rnd() * arr.length)];
+  const invertPt = (m, ix, iy) => ({ x: m.originX + ix / m.scale, y: m.originY + iy / m.scale });
+  const projectPt = (m, cx, cy) => ({ x: (cx - m.originX) * m.scale, y: (cy - m.originY) * m.scale });
+
+  // One capture the way router.js would produce it: dpr then maxWidth downscale.
+  const synth = (sid) => {
+    const vw = 320 + Math.floor(rnd() * 3000);
+    const vh = 320 + Math.floor(rnd() * 2000);
+    const dpr = pick([1, 1.25, 1.5, 2, 2.5, 3]);
+    const maxWidth = pick([640, 800, 1000, 1280, 1512, 2000]);
+    const mode = pick(['viewport', 'full_page', 'region', 'element']);
+    const meta = { viewport: { w: vw, h: vh }, scroll: { maxY: Math.floor(rnd() * 4000) } };
+
+    let clip = null;
+    if (mode === 'region' || mode === 'element') {
+      // captureBeyondViewport means a clip may legitimately run past the fold, so
+      // exercise clips wider/taller than the viewport too.
+      const w = 1 + Math.floor(rnd() * (vw * 1.4));
+      const h = 1 + Math.floor(rnd() * (vh * 1.4));
+      clip = { x: Math.floor(rnd() * vw), y: Math.floor(rnd() * vh), width: w, height: h };
+    }
+    const coveredW = clip ? Math.round(clip.width) : mode === 'full_page' ? vw : vw;
+    const nativeW = Math.max(1, Math.round(coveredW * dpr));
+    const imageW = Math.min(nativeW, maxWidth);
+    // Height tracks width uniformly, exactly as downscale() does.
+    const image = { width: imageW, height: Math.max(1, Math.round(imageW * 0.5)) };
+    return { sid, mode, clip, meta, image };
+  };
+
+  const N = 6000;
+  const captures = Array.from({ length: N }, (_, i) => synth(i % 37 /* 37 "sessions" */));
+  // Interleave: compute in a shuffled order, keyed by capture, to prove the
+  // formatter shares nothing across sessions.
+  const order = captures.map((_, i) => i);
+  for (let i = order.length - 1; i > 0; i--) {
+    const j = Math.floor(rnd() * (i + 1));
+    [order[i], order[j]] = [order[j], order[i]];
+  }
+  const interleaved = new Map();
+  for (const i of order) interleaved.set(i, fmt.captureMapping(captures[i]));
+
+  let bad = 0, drift = 0, cornerMiss = 0, stateLeak = 0, worstDrift = 0, firstBad = null;
+  for (let i = 0; i < N; i++) {
+    const c = captures[i];
+    const m = interleaved.get(i);
+    if (fmt.captureMapping(c) === null ? m !== null : JSON.stringify(fmt.captureMapping(c)) !== JSON.stringify(m)) stateLeak++;
+    if (!m) { if (!c.image.width || !c.meta.viewport) continue; bad++; firstBad ??= c; continue; }
+    if (!Number.isFinite(m.scale) || m.scale <= 0 || !Number.isFinite(m.originX) || !Number.isFinite(m.originY)) {
+      bad++; firstBad ??= { c, m }; continue;
+    }
+    // The clip's top-left is image (0,0); its bottom-right is (imageW,imageH).
+    const tl = projectPt(m, m.originX, m.originY);
+    const br = projectPt(m, m.originX + m.coveredW, m.originY + m.coveredH);
+    if (Math.abs(tl.x) > 0.5 || Math.abs(tl.y) > 0.5 || Math.abs(br.x - c.image.width) > 1.5) cornerMiss++;
+    // A random image point must invert and re-project to within a pixel.
+    const ix = rnd() * c.image.width, iy = rnd() * c.image.height;
+    const back = projectPt(m, invertPt(m, ix, iy).x, invertPt(m, ix, iy).y);
+    const d = Math.max(Math.abs(back.x - ix), Math.abs(back.y - iy));
+    worstDrift = Math.max(worstDrift, d);
+    if (d > 0.001) drift++;
+  }
+  check(`${N} randomized captures across 37 sessions produce no bad mapping`, bad === 0, JSON.stringify(firstBad));
+  check('every clip maps its own corners onto the image corners', cornerMiss === 0, `${cornerMiss} off`);
+  check('image↔CSS round trip holds to sub-pixel everywhere', drift === 0, `worst ${worstDrift.toExponential(2)}px`);
+  check('the mapping is pure — sessions never leak into each other', stateLeak === 0, `${stateLeak} mismatches`);
+}
+
+/**
+ * The Google sign-in gates, tested where they live — a pure decision function,
+ * so the safety-critical behaviour is provable without a browser. The bar is
+ * simple and absolute: it must never turn a password screen, an unconfirmed
+ * consent screen, or an unchosen chooser into a click. Every one of those has
+ * been, at some point, the thing an over-eager agent would do on its own.
+ */
+async function testOAuth() {
+  const oauth = await importFrom('extension', 'background', 'oauth.js');
+  const { googleDecision, matchAccount, mergeGoogleFrames } = oauth;
+
+  const accounts = [
+    { index: 0, email: 'sam@work.com', name: 'Sam Ray' },
+    { index: 1, email: 'sam@personal.com', name: 'Sam Ray' },
+    { index: 2, email: 'dana@work.com', name: 'Dana Lee' },
+  ];
+
+  // The three hard gates.
+  const pw = googleDecision({ stage: 'password', account: 'sam@work.com', consent: true });
+  check('a password screen is always a stop, even with account+consent', pw.do === 'stop' && pw.reason === 'password');
+  check('the password stop refuses to type', /will not type a password/i.test(pw.message));
+
+  const consentNo = googleDecision({ stage: 'consent' });
+  check('a consent screen stops until consent:true', consentNo.do === 'stop' && consentNo.reason === 'consent');
+  const consentYes = googleDecision({ stage: 'consent', consent: true });
+  check('consent:true grants access', consentYes.do === 'allow');
+  const consentTruthy = googleDecision({ stage: 'consent', consent: 'yes' });
+  check('only the boolean true grants — not a truthy string', consentTruthy.do === 'stop');
+
+  // The chooser: list-and-ask unless an explicit account is given.
+  const list = googleDecision({ stage: 'chooser', accounts });
+  check('a chooser with no account lists and stops', list.do === 'list' && /which account/i.test(list.message));
+  check('the list names every account and index', /\[0\] sam@work\.com/.test(list.message) && /\[2\] dana@work\.com/.test(list.message));
+
+  const byIndex = googleDecision({ stage: 'chooser', accounts, account: 2 });
+  check('an explicit index selects that account', byIndex.do === 'click' && byIndex.account.email === 'dana@work.com');
+  const byEmail = googleDecision({ stage: 'chooser', accounts, account: 'sam@personal.com' });
+  check('an exact email selects that account', byEmail.do === 'click' && byEmail.account.index === 1);
+
+  // Ambiguity must refuse, not guess — "sam@" matches two.
+  const ambiguous = googleDecision({ stage: 'chooser', accounts, account: 'sam@' });
+  check('an ambiguous account fragment refuses rather than guessing', ambiguous.do === 'stop' && ambiguous.reason === 'no-match');
+  const noMatch = googleDecision({ stage: 'chooser', accounts, account: 'nobody@x.com' });
+  check('an unmatched account stops', noMatch.do === 'stop');
+
+  // matchAccount resolution rules.
+  check('exact email beats a partial of another', matchAccount(accounts, 'dana@work.com')?.index === 2);
+  check('a unique name fragment resolves', matchAccount(accounts, 'Dana')?.index === 2);
+  check('a shared name fragment is ambiguous → null', matchAccount(accounts, 'Sam Ray') === null);
+  check('an empty account resolves to nothing', matchAccount(accounts, '') === null);
+
+  const email = googleDecision({ stage: 'email' });
+  check('an email-entry screen stops (no identity guessing)', email.do === 'stop' && email.reason === 'email');
+  const unknown = googleDecision({ stage: 'unknown' });
+  check('a page with no Google sign-in stops with guidance', unknown.do === 'stop' && unknown.reason === 'unknown');
+
+  // Frame merge: safety-first precedence and de-duplication across frames.
+  const merged = mergeGoogleFrames([
+    { isGoogle: true, stage: 'chooser', accounts: [{ email: 'a@x.com', point: { x: 1, y: 1 } }] },
+    { isGoogle: false, stage: 'chooser', accounts: [{ email: 'A@x.com', point: { x: 2, y: 2 } }, { email: 'b@x.com', point: { x: 3, y: 3 } }] },
+  ]);
+  check('accounts merge across frames and de-dup by email (case-insensitive)', merged.accounts.length === 2 && merged.accounts[0].index === 0 && merged.accounts[1].index === 1);
+
+  const safety = mergeGoogleFrames([
+    { stage: 'chooser', accounts: [{ email: 'stray@x.com', point: { x: 1, y: 1 } }] },
+    { stage: 'password', accounts: [] },
+  ]);
+  check('a password frame outranks a stray chooser row (never click)', safety.stage === 'password');
+  const consentWins = mergeGoogleFrames([
+    { stage: 'chooser', accounts: [] },
+    { stage: 'consent', accounts: [], allow: { point: { x: 5, y: 5 } } },
+  ]);
+  check('a consent frame outranks an empty chooser', consentWins.stage === 'consent' && !!consentWins.allow);
 }
 
 async function testMacros() {
@@ -1279,7 +1571,7 @@ async function testWindowBinding() {
   } catch (err) {
     threw = err.message;
   }
-  check('an unknown window id re-lists the windows', !!threw && threw.includes('no window 77') && threw.includes('window 1'));
+  check('an unknown window id re-lists the windows', !!threw && threw.includes('no window with id 77') && threw.includes('window 1'));
 
   // Sessions must not share a window binding by accident.
   await win.use('claude · meadow', 1);
@@ -1423,6 +1715,35 @@ async function testWindowBinding() {
   await win.unbind('claude · harbor');
   check('unbind forgets the window', (await win.boundWindowId('claude · harbor')) === null);
 
+  // ── Windows have roles, and the role is what gets said ───────────────────
+  //
+  // A bare Chrome id was the whole of what a window used to be called, and it
+  // is the reason nobody could read window output. The shared agent window,
+  // a window opened for one session, and the user's windows are three
+  // different things and are named as such; the id stays because `use` takes
+  // it.
+  windows = [
+    { id: 1, focused: true, tabs: [] },
+    { id: 2, focused: false, tabs: [] },
+  ];
+  const pooled = await win.ensureWindow('pooled-a', {});
+  const soloWin = await win.createFor('soloist');
+  const named = await win.listWindows();
+  const byId = new Map(named.map((w) => [w.windowId, w]));
+  check('the shared agent window is flagged', byId.get(pooled)?.agent === true, JSON.stringify(named));
+  check('a window opened for one session names that session', byId.get(soloWin)?.own === 'soloist');
+  check('the user\'s windows are neither', !byId.get(1)?.agent && !byId.get(1)?.own);
+  check('the agent window is called that', win.windowName(byId.get(pooled)) === `the agent window (id ${pooled})`);
+  check('a session\'s own window is called that', win.windowName(byId.get(soloWin)) === `soloist's window (id ${soloWin})`);
+  check('the user\'s window says whose it is and whether it is focused',
+    win.windowName(byId.get(1)) === "window 1 (the user's, focused)" && win.windowName(byId.get(2)) === "window 2 (the user's)");
+  // `select`/`focus` may switch the visible tab only where no human is: the
+  // session's own window, or the shared agent window — never the user's.
+  check('the agent window counts as agent-only for a pooled session', (await win.agentWindowIdFor('pooled-a')) === pooled);
+  check('a session\'s own window counts as agent-only', (await win.agentWindowIdFor('soloist')) === soloWin);
+  await win.use('sharer', 1);
+  check('a session sharing the user\'s window has no agent-only window', (await win.agentWindowIdFor('sharer')) === null);
+
   // The click can outlive the service worker that opened the prompt, so the
   // binding is written from the message itself and not only from the waiting
   // promise. Without this a killed worker loses the answer and asks again.
@@ -1553,6 +1874,335 @@ async function testWindowBinding() {
  * errors; a session just quietly loses track of its own tabs, and can be handed
  * one from a group in a different window.
  */
+/**
+ * A Chrome stub faithful enough to drive the *real* router across many sessions
+ * at once — tabs, windows (with the agent-window pool), tab groups, and an
+ * async storage.session that keeps the read-modify-write hazard the real one
+ * has. `focusRaises` records every windows.update({focused:true}); `agentWindows`
+ * every window the code created for itself. That pair is what proves no agent
+ * ever brought its own window to the front.
+ */
+function makeChromeStub({ seed = 0 } = {}) {
+  const nap = () => new Promise((r) => setTimeout(r, Math.floor(Math.random() * 2)));
+  const tabs = new Map(); // id -> {id, windowId, groupId, active, url, status}
+  const wins = new Map(); // id -> {id, type, focused, state}
+  const tabGroups = new Map(); // id -> {id, title, color, windowId}
+  const sessionStore = {};
+  const localStore = {};
+  const focusRaises = []; // window ids raised to the front
+  const agentWindows = new Set(); // windows the code created
+  // Offsets so ids never collide across iterations — the router keeps in-memory
+  // caches between "worker restarts", and a reused id would be a test artifact,
+  // not a real overlap (Chrome hands out fresh ids for a worker's lifetime).
+  const userWindow = 1 + seed * 100000;
+  let nextTab = 1000 + seed * 100000;
+  let nextWin = 10 + seed * 100000;
+  let nextGroup = 100 + seed * 100000;
+  let focusedWindow = userWindow;
+
+  wins.set(userWindow, { id: userWindow, type: 'normal', focused: true, state: 'normal' });
+
+  const tabObjs = (windowId) =>
+    [...tabs.values()].filter((t) => t.windowId === windowId).map((t) => ({ ...t }));
+
+  const chrome = {
+    runtime: {
+      getManifest: () => ({ version: '1.0.0' }),
+      getPlatformInfo: (cb) => cb && cb({ os: 'mac' }),
+      lastError: null,
+      onMessage: { addListener() {}, removeListener() {} },
+      id: 'test-extension',
+    },
+    tabs: {
+      onRemoved: { addListener() {}, removeListener() {} },
+      onUpdated: { addListener() {}, removeListener() {} },
+      onActivated: { addListener() {}, removeListener() {} },
+      async create({ url = 'about:blank', windowId, active = false } = {}) {
+        await nap();
+        const id = nextTab++;
+        const wid = windowId != null && wins.has(windowId) ? windowId : focusedWindow;
+        tabs.set(id, { id, windowId: wid, groupId: -1, active: !!active, url, status: 'complete' });
+        return { ...tabs.get(id) };
+      },
+      async get(id) {
+        await nap();
+        if (!tabs.has(id)) throw new Error(`No tab with id: ${id}.`);
+        return { ...tabs.get(id) };
+      },
+      async query(q = {}) {
+        await nap();
+        let out = [...tabs.values()];
+        if (q.windowId != null) out = out.filter((t) => t.windowId === q.windowId);
+        if (q.groupId != null) out = out.filter((t) => t.groupId === q.groupId);
+        if (q.active != null) out = out.filter((t) => t.active === q.active);
+        return out.map((t) => ({ ...t }));
+      },
+      async update(id, patch = {}) {
+        await nap();
+        if (!tabs.has(id)) throw new Error(`No tab with id: ${id}.`);
+        Object.assign(tabs.get(id), patch);
+        return { ...tabs.get(id) };
+      },
+      async remove(ids) {
+        await nap();
+        for (const id of [].concat(ids)) tabs.delete(id);
+      },
+      async move(id, { windowId, index } = {}) {
+        await nap();
+        if (!tabs.has(id)) throw new Error(`No tab with id: ${id}.`);
+        if (windowId != null) tabs.get(id).windowId = windowId;
+        return { ...tabs.get(id) };
+      },
+      async reload(id) {
+        await nap();
+        if (!tabs.has(id)) throw new Error(`No tab with id: ${id}.`);
+        tabs.get(id).status = 'complete';
+      },
+      async duplicate(id) {
+        await nap();
+        const src = tabs.get(id);
+        const nid = nextTab++;
+        tabs.set(nid, { ...src, id: nid, active: false });
+        return { ...tabs.get(nid) };
+      },
+      async group({ tabIds, groupId, createProperties }) {
+        await nap();
+        const id = groupId ?? nextGroup++;
+        if (!tabGroups.has(id)) {
+          tabGroups.set(id, { id, title: '', color: 'grey', windowId: createProperties?.windowId ?? focusedWindow });
+        }
+        const target = tabGroups.get(id).windowId;
+        for (const t of [].concat(tabIds)) {
+          if (tabs.has(t)) { tabs.get(t).groupId = id; tabs.get(t).windowId = target; }
+        }
+        return id;
+      },
+      async ungroup(ids) {
+        for (const t of [].concat(ids)) if (tabs.has(t)) tabs.get(t).groupId = -1;
+      },
+      async setZoom() {},
+      async sendMessage() { return undefined; }, // no content script → callers fall back
+    },
+    windows: {
+      onRemoved: { addListener() {}, removeListener() {} },
+      WINDOW_ID_NONE: -1,
+      async create({ focused = false, url } = {}) {
+        await nap();
+        const id = nextWin++;
+        wins.set(id, { id, type: 'normal', focused: !!focused, state: 'normal' });
+        agentWindows.add(id);
+        const tid = nextTab++;
+        tabs.set(tid, { id: tid, windowId: id, groupId: -1, active: true, url: url || 'about:blank', status: 'complete' });
+        if (focused) { focusedWindow = id; focusRaises.push(id); }
+        return { id, type: 'normal', focused: !!focused, tabs: [{ ...tabs.get(tid) }] };
+      },
+      async get(id, opts = {}) {
+        await nap();
+        if (!wins.has(id)) throw new Error(`No window with id: ${id}.`);
+        const w = { ...wins.get(id) };
+        if (opts.populate) w.tabs = tabObjs(id);
+        return w;
+      },
+      async getAll(opts = {}) {
+        await nap();
+        return [...wins.values()].map((w) => (opts.populate ? { ...w, tabs: tabObjs(w.id) } : { ...w }));
+      },
+      async getLastFocused() {
+        await nap();
+        return { ...(wins.get(focusedWindow) || wins.get(userWindow)) };
+      },
+      async update(id, patch = {}) {
+        await nap();
+        if (!wins.has(id)) throw new Error(`No window with id: ${id}.`);
+        if (patch.focused === true) {
+          for (const w of wins.values()) w.focused = false;
+          wins.get(id).focused = true;
+          focusedWindow = id;
+          focusRaises.push(id);
+        }
+        Object.assign(wins.get(id), patch);
+        return { ...wins.get(id) };
+      },
+      async remove(id) { wins.delete(id); },
+    },
+    tabGroups: {
+      TAB_GROUP_ID_NONE: -1,
+      onRemoved: { addListener() {} },
+      async query(q = {}) {
+        await nap();
+        let out = [...tabGroups.values()];
+        if (q.windowId != null) out = out.filter((g) => g.windowId === q.windowId);
+        return out.map((g) => ({ ...g }));
+      },
+      async get(id) {
+        if (!tabGroups.has(id)) throw new Error('no group');
+        return { ...tabGroups.get(id) };
+      },
+      async update(id, patch) {
+        await nap();
+        if (tabGroups.has(id)) Object.assign(tabGroups.get(id), patch);
+        return { ...tabGroups.get(id) };
+      },
+    },
+    webNavigation: {
+      onCommitted: { addListener() {} },
+      onDOMContentLoaded: { addListener() {} },
+      async getAllFrames() { return []; },
+    },
+    debugger: {
+      onEvent: { addListener() {} },
+      onDetach: { addListener() {} },
+      async attach() {},
+      async detach() {},
+      async sendCommand() { return {}; },
+    },
+    scripting: {
+      async executeScript() { return []; },
+      async insertCSS() {},
+    },
+    storage: {
+      local: {
+        async get(key) { await nap(); return key == null ? { ...localStore } : { [key]: localStore[key] }; },
+        async set(obj) { await nap(); Object.assign(localStore, structuredClone(obj)); },
+        async remove(key) { delete localStore[key]; },
+      },
+      session: {
+        async get(key) {
+          await nap();
+          if (key == null) return structuredClone(sessionStore);
+          return key in sessionStore ? { [key]: structuredClone(sessionStore[key]) } : {};
+        },
+        async set(obj) { await nap(); Object.assign(sessionStore, structuredClone(obj)); },
+        async remove(key) { await nap(); for (const k of [].concat(key)) delete sessionStore[k]; },
+      },
+      onChanged: { addListener() {} },
+    },
+  };
+
+  return { chrome, state: { tabs, wins, tabGroups, sessionStore }, focusRaises, agentWindows, userWindow };
+}
+
+/**
+ * The heart of the multi-session promise: several agents driving one browser at
+ * once must (1) each get their own named workstream, (2) never bring a window to
+ * the front, and (3) never read or touch another session's tabs. This drives the
+ * real `dispatch` — the same entry every MCP call lands on — with N sessions
+ * acting concurrently, then asserts all three, and repeats to shake out the
+ * storage read-modify-write races that only surface with three or more agents.
+ */
+/**
+ * One storm: `sessions` agents each open `tabsPer` tabs at once through the real
+ * `dispatch`, then the three invariants are measured. Returns a tally of every
+ * violation so the caller can both report a readable single run and hammer it in
+ * a loop. No `check` here — the caller owns assertions.
+ */
+async function parallelScenario(router, groups, { sessions, tabsPer, seed }) {
+  const stub = makeChromeStub({ seed });
+  globalThis.chrome = stub.chrome;
+  const owned = new Map(sessions.map((s) => [s, []]));
+
+  const opens = [];
+  for (const s of sessions) {
+    for (let i = 0; i < tabsPer; i++) {
+      const url = `https://${s}-${i}.test/`;
+      opens.push(
+        router.dispatch('browser_tabs', { action: 'new', url, _session: s, _client: 'test' }).then((res) => {
+          const m = /opened tab (\d+)/.exec(res.text || '');
+          if (m) owned.get(s).push(Number(m[1]));
+        })
+      );
+    }
+  }
+  await Promise.all(opens);
+
+  const total = [...owned.values()].reduce((n, a) => n + a.length, 0);
+  const owners = await groups.ownersFor([...owned.values()].flat());
+  let misowned = 0;
+  for (const [s, ids] of owned) for (const id of ids) if (owners.get(id)?.sessionId !== s) misowned++;
+  const distinctOwners = new Set([...owners.values()].map((o) => o.sessionId));
+
+  const raisedAgent = stub.focusRaises.filter((id) => stub.agentWindows.has(id));
+  const userFocused = stub.state.wins.get(stub.userWindow)?.focused === true;
+
+  let leak = 0;
+  for (const s of sessions) {
+    const listing = (await router.dispatch('browser_tabs', { action: 'list', _session: s, _client: 'test' })).text;
+    for (const id of owned.get(s)) if (!new RegExp(`\\b${id}\\b`).test(listing)) leak++;
+    for (const [other, ids] of owned) {
+      if (other === s) continue;
+      for (const id of ids) if (new RegExp(`\\b${id}\\b`).test(listing)) leak++;
+    }
+  }
+
+  let breaches = 0;
+  for (const s of sessions) {
+    const victim = sessions.find((o) => o !== s);
+    const foreignId = owned.get(victim)[0];
+    for (const action of ['close', 'reload', 'group']) {
+      const args = { action, _session: s, _client: 'test', tabIds: [foreignId] };
+      if (action === 'group') args.group = 'steal';
+      let refused = false;
+      try { await router.dispatch('browser_tabs', args); } catch { refused = true; }
+      if (!refused) breaches++;
+    }
+    if (!stub.state.tabs.has(foreignId)) breaches++;
+  }
+
+  let wrongHome = 0;
+  for (const s of sessions) {
+    const text = (await router.dispatch('browser_tabs', { action: 'reload', _session: s, _client: 'test' })).text;
+    const m = /reloaded tab\(s\): (\d+)/.exec(text);
+    if (!m || !owned.get(s).includes(Number(m[1]))) wrongHome++;
+  }
+
+  return {
+    total, expected: sessions.length * tabsPer, misowned, distinctOwners: distinctOwners.size,
+    raisedAgent: raisedAgent.length, userFocused, agentWindows: stub.agentWindows.size,
+    leak, breaches, wrongHome,
+  };
+}
+
+async function testParallelSessions() {
+  // Importing after the first stub is installed binds the real modules to it;
+  // later scenarios reinstall a fresh stub on the same (cached) modules, which
+  // also exercises the in-memory caches surviving a "worker restart".
+  globalThis.chrome = makeChromeStub({ seed: 0 }).chrome;
+  const router = await importFrom('extension', 'background', 'router.js');
+  const groups = await importFrom('extension', 'background', 'groups.js');
+
+  const SESSIONS = ['harbor', 'meadow', 'cedar', 'quill', 'sable', 'flint'];
+
+  // One readable run, asserted invariant by invariant.
+  const r = await parallelScenario(router, groups, { sessions: SESSIONS, tabsPer: 3, seed: 1 });
+  check('every session opened all of its tabs', r.total === r.expected, `${r.total}/${r.expected}`);
+  check('every tab is owned by exactly the session that opened it', r.misowned === 0, `${r.misowned} mis-owned`);
+  check('all sessions are represented and named distinctly', r.distinctOwners === SESSIONS.length, `${r.distinctOwners}`);
+  check('no agent window was ever brought to the front', r.raisedAgent === 0, `${r.raisedAgent} raises`);
+  check('the user window stays focused throughout', r.userFocused, `${r.userFocused}`);
+  check('agents share the background pool, not one window each', r.agentWindows >= 1 && r.agentWindows <= 2, `${r.agentWindows} agent windows`);
+  check('a session lists its own tabs and never another session\'s', r.leak === 0, `${r.leak} leaks`);
+  check('closing/reloading/grouping a foreign tab is always refused', r.breaches === 0, `${r.breaches} breaches`);
+  check('a no-tabId call resolves to the caller\'s own tab, never another\'s', r.wrongHome === 0, `${r.wrongHome} wrong`);
+
+  // Then hammer it: many storms, growing session counts, fresh stub each time —
+  // the loop is where a read-modify-write race or a cache surviving a restart
+  // actually shows up, because it needs the interleaving to land just so.
+  const ITERATIONS = 40;
+  let clean = 0;
+  const failures = [];
+  for (let i = 0; i < ITERATIONS; i++) {
+    const n = 3 + (i % 8); // 3..10 concurrent sessions
+    const sessions = Array.from({ length: n }, (_, k) => `s${i}_${k}`);
+    const res = await parallelScenario(router, groups, { sessions, tabsPer: 4, seed: 100 + i });
+    const ok =
+      res.total === res.expected && res.misowned === 0 && res.distinctOwners === n &&
+      res.raisedAgent === 0 && res.userFocused && res.leak === 0 && res.breaches === 0 && res.wrongHome === 0;
+    if (ok) clean++;
+    else failures.push({ i, n, ...res });
+  }
+  check(`${ITERATIONS} parallel storms (up to 10 sessions × 4 tabs) hold every invariant`, clean === ITERATIONS, JSON.stringify(failures.slice(0, 2)));
+}
+
 async function testGroupConcurrency() {
   // A window none of the fixture tabs live in, standing in for "whatever Chrome
   // last focused" — which is the human's window, and the one an agent must not
@@ -1695,7 +2345,7 @@ async function testGroupConcurrency() {
 
   // A duplicate that already exists — made by hand, or left by an older build —
   // must not hide half the workstream from the session that owns it.
-  const stray = { id: nextGroupId++, title: '⚡ dev · harbor', color: 'blue', windowId: 20 };
+  const stray = { id: nextGroupId++, title: 'session-a · dev · harbor', color: 'blue', windowId: 20 };
   tabGroups.set(stray.id, stray);
   tabs.set(9, { id: 9, windowId: 20, groupId: stray.id });
   sessionStore.tabGroupOwnersV2[stray.id] = { sessionId: 'session-a', workstream: 'dev · harbor' };
@@ -1733,6 +2383,43 @@ async function testGroupConcurrency() {
     (await groups.tabsFor('session-a', 'dev · harbor')).length === 0);
   check('releasing one session leaves the same-named other session intact',
     (await groups.tabsFor('session-b', 'dev · harbor')).join() === '5');
+
+  // ── What a group is called, and how it is recognised ─────────────────────
+  //
+  // The session's name is the group's name; a sub-group appends. And a group is
+  // an agent's because the owner record says so, not because of anything in
+  // its title — a "⚡ " prefix used to be the marker, and a display string a
+  // human can edit is not identity.
+  check('a session\'s plain tabs are grouped under its own name', groups.titleFor('harbor', 'harbor') === 'harbor');
+  check('a sub-group is "<session> · <group>"', groups.titleFor('harbor', 'research') === 'harbor · research');
+  check('a session with no group named falls back to its own name', groups.titleFor('harbor', undefined) === 'harbor');
+
+  tabs.set(40, { id: 40, windowId: 10, groupId: -1 });
+  await groups.assign(40, 'harbor', 'research', 'claude-code');
+  const research = [...tabGroups.values()].find((g) => g.title === 'harbor · research');
+  check('the Chrome group carries the session-first title', !!research, [...tabGroups.values()].map((g) => g.title).join('|'));
+  check('the group title has no marker glyph', [...tabGroups.values()].every((g) => !g.title.includes('⚡')));
+  check('the owner record carries the client for the panel',
+    sessionStore.tabGroupOwnersV2[research.id]?.client === 'claude-code', JSON.stringify(sessionStore.tabGroupOwnersV2[research.id]));
+
+  // A group the user made by hand, whatever it is called, is never an agent's.
+  const handmade = { id: nextGroupId++, title: 'harbor · research', color: 'red', windowId: 10 };
+  tabGroups.set(handmade.id, handmade);
+  tabs.set(41, { id: 41, windowId: 10, groupId: handmade.id });
+  const listed = await groups.list();
+  check('agent groups are recognised by ownership, not by title',
+    listed.some((g) => g.groupId === research.id) && !listed.some((g) => g.groupId === handmade.id),
+    JSON.stringify(listed.map((g) => [g.groupId, g.title])));
+  check('the listing reports the session and client',
+    listed.find((g) => g.groupId === research.id)?.sessionId === 'harbor' &&
+      listed.find((g) => g.groupId === research.id)?.client === 'claude-code');
+  check('a hand-made group\'s tab is unowned', (await groups.ownerFor(41)) === null);
+
+  // The batch form: one read for several ids, missing ids simply absent.
+  const owners = await groups.ownersFor([40, 41, 5, 9999]);
+  check('ownersFor answers for every existing tab',
+    owners.get(40)?.sessionId === 'harbor' && owners.get(41) === null && owners.get(5)?.sessionId === 'session-b' && !owners.has(9999),
+    JSON.stringify([...owners]));
 }
 
 async function testBackgroundInputInvariants() {
@@ -1741,8 +2428,30 @@ async function testBackgroundInputInvariants() {
   const settings = readFileSync(join(ROOT, 'extension', 'background', 'settings.js'), 'utf8');
 
   check('ordinary input has no automatic foreground helper', !/ensureForeground|hiddenTabWarning/.test(router));
-  check('explicit select still focuses only when explicitly requested',
-    /case 'select'[\s\S]*chrome\.windows\.update\(tab\.windowId, \{ focused: true \}\)/.test(router));
+  // Nothing an agent calls may bring a window to the front. The one place the
+  // router can focus a window is `showTab`, and only behind the default-off
+  // `raiseWindowOnSelect` setting; `select` and `focus` both go through it.
+  const raises = router.match(/chrome\.windows\.update\([^)]*focused: true/g) || [];
+  check('exactly one code path can raise a window', raises.length === 1, `${raises.length} sites`);
+  check('and it is gated by the default-off setting',
+    /if \(settings\.raiseWindowOnSelect === true\) \{\s*await chrome\.windows\.update\([^)]*focused: true/.test(router));
+  check('raising windows is off by default', /raiseWindowOnSelect: false/.test(settings));
+  check('select and focus both go through the guarded path',
+    /case 'select'[\s\S]{0,900}showTab\(tabId, settings\)/.test(router) && /if \(args\.focus\) \{[\s\S]{0,300}showTab\(tabId, settings\)/.test(router));
+  check('the tab group title carries no marker glyph',
+    !/⚡/.test(readFileSync(join(ROOT, 'extension', 'background', 'groups.js'), 'utf8')) &&
+      !/⚡/.test(readFileSync(join(ROOT, 'extension', 'sidepanel', 'panel.js'), 'utf8')) &&
+      !/⚡/.test(readFileSync(join(ROOT, 'extension', 'content', 'actions.js'), 'utf8')));
+  // Batch close/reload take ids straight from a model; every path that acts on
+  // a list of ids has to refuse another agent's tabs before touching any.
+  check('batch close, reload and group refuse foreign tabs',
+    /case 'close': \{[\s\S]{0,400}assertNotForeign\(ids/.test(router) &&
+      /case 'reload': \{[\s\S]{0,200}assertNotForeign\(ids/.test(router) &&
+      /case 'group': \{[\s\S]{0,500}assertNotForeign\(ids/.test(router));
+  // A call with no `group` means "my tab", not "my tab in the group that shares
+  // my name" — see `rememberSessionTab`.
+  check('tab resolution without a group spans the whole session',
+    /groups\.tabsFor\(sessionId, args\.group \|\| null/.test(router));
   check('mouse presses carry real pointer pressure',
     /type: 'mousePressed'[\s\S]{0,120}force: 0\.5/.test(cdp));
   check('focus emulation is diagnostic and default-off', /emulateFocus: false/.test(settings));

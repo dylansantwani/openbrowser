@@ -91,6 +91,40 @@ The pick prompt is the one thing on a page an agent must not be able to see:
 it is in `OWN_DECORATION` in `a11y.js`, so it never enters a snapshot, so no
 agent can find its buttons and answer a question about itself.
 
+**Nothing an agent calls brings a window to the front.** `browser_tabs select`
+and `browser_window focus` used to activate the tab *and* focus its window, and
+with agents pooled in one background window that meant the agent window
+jumping over whatever the person was reading. Both now go through `showTab` in
+`router.js`, which activates the tab inside an agent-only window (its own, or
+the shared pool — `windows.agentWindowIdFor`) and touches the window only when
+`raiseWindowOnSelect` is on, which it is not by default. `test/run.mjs` asserts
+that `chrome.windows.update(…focused: true)` appears exactly once in the router
+and only behind that guard. A human who wants to look clicks a tab row in the
+side panel; that path raises the window because a human asked.
+
+**A list of tab ids from a model is checked as a whole before anything acts.**
+`close`, `reload` and `group` with `tabIds` used to act on every id unchecked,
+so an agent could close another agent's tabs — or the user's — by passing ids it
+had read off a listing. `assertNotForeign` refuses the batch if any id belongs
+to another session. Related: `browser_tabs list` shows a session only its own
+tab ids; other agents are counts. An id a model never sees is one it cannot
+misuse.
+
+**"My tab" means the session's last tab, in any of its groups.** A call with no
+`group` used to resolve only inside the group that shared the session's name,
+so an agent that had opened its tabs under `group:"research"` and then made an
+ordinary call was handed a fresh blank tab and snapshotted `about:blank`.
+`rememberSessionTab` records every tab under the session as a whole as well as
+under its group, and `sessionTabId` with no `group` searches the whole session.
+With `group`, resolution is scoped to that group as before.
+
+**Windows are named by role, not by id.** `windows.windowName` renders `the
+agent window (id N)`, `harbor's window (id N)`, or `window N (the user's,
+focused)`; `format.windowLabel` is the same function for the module the tests
+load standalone. The id stays because `action:"use" windowId:` takes it. Bare
+ids were the single biggest reason nobody — human or model — could read the
+window output.
+
 ---
 
 ## Where the token budget goes
@@ -569,6 +603,72 @@ as much a part of it as presence: a null mapping (no viewport, no honest factor)
 therefore *clears* the record rather than leaving the previous one to be read
 against a different image.
 
+**A visual element has no ref, so framing it needed a selector path, or the
+model guesses pixels and clips it.** `mode:"element"` clips a screenshot to one
+element's box — but it resolved that box only from a `ref`, and a ref exists
+only for something the accessibility tree lists. A `<canvas>`, an `<svg>` chart,
+a bare `<img>` carry no interactive role and so get no ref, which left exactly
+one way to capture just the graph: `mode:"region"` with a hand-typed pixel
+rectangle. The model cannot see the element's bounding box, so the rectangle is
+a guess, and a guess clips — a real Opus 4.8 session burned *thirty* region
+shots cropping one velocity-time graph, every crop cutting the axis off before
+its endpoint, and answered off the half it could see without knowing a half was
+missing. Worse than a clip, the viewport fallback is downscaled below native
+(`maxWidth` 1280 against a 1512px viewport = 0.85x), so the small axis numbers
+blur at the exact moment they must be read. `browser_screenshot selector:` closes
+it: `locateSelector` (`router.js`) broadcasts `resolveSelector` to every frame,
+each returns its single largest *visible* match in top-level viewport coords,
+and the biggest box across frames wins — a selector like `"svg"` or `"canvas"`
+is deliberately broad and the one the model means is almost always the largest.
+The clip is then the element's real box plus a little padding, captured at the
+device pixel ratio and only downscaled if it exceeds `maxWidth` — so an element
+capture is both un-clipped *and* crisper than the viewport shot that drove the
+flailing. `locateTarget` routes a selector the same way for `browser_act` and
+`browser_scroll`, so the three speak one language; only `browser_screenshot`
+advertises it, to keep the schema budget honest. Region stays, labelled the last
+resort it is. `test/run.mjs` asserts the param is advertised and survives the
+trip; `test/a11y-browser.html` drives the real `resolveSelector` against a wide
+svg with a decoy, an `<img>`, a `display:none` node and an invalid selector.
+
+Three refinements make the same fix land for a model that barely knows what it
+wants. **`mode:"element"` with no ref and no selector auto-frames the main
+graphic** (`VISUAL_SELECTOR = "canvas, svg, img, video"`, largest visible wins) —
+"screenshot the chart" needs no CSS from a low-context model. **A clip now sets
+`captureBeyondViewport`** (`cdp.js`), or an element taller than the fold — or one
+scrolled so half sits below it — comes back blank for the off-screen part, which
+is the same half-a-graph failure wearing different clothes. And a **wide-angle
+shot that a chart dominates ends with a one-line nudge** to the element call
+(`probeVisual` in `router.js`, gated on the graphic being a real share of the
+frame), because the model that took a blurry viewport shot is exactly the one
+that did not know element mode existed. The coordinate stress test in
+`test/run.mjs` fuzzes 6,000 captures across 37 "sessions" — every viewport, dpr,
+maxWidth and (beyond-viewport) clip — asserting the mapping never goes
+NaN/∞/≤0, the clip's corners land on the image's corners, the image↔CSS round
+trip holds to sub-pixel, and the pure formatter leaks nothing between sessions.
+
+**"Sign in with Google" is two decisions a model must never take alone, so the
+tool makes them stop-and-ask, and refuses the third outright.** `browser_act
+action:"google_login"` exists because the tempting thing — click the first Google
+account and sail through — decides *who the user is* to a third-party site and
+then *grants that site access*, both silently. So the flow is gated, and the
+gate is a pure function (`oauth.googleDecision`) precisely so the safety
+behaviour is provable without a browser: a chooser is enumerated and the flow
+**stops until an explicit `account`** is passed (the model is told to ask the
+user which, or whether to use Google at all); the consent screen **stops until
+`consent:true`**, which only a boolean true satisfies, never a truthy string; and
+the password screen is a **hard stop with no override** — automation does not
+type passwords. Only a `click`/`allow` verdict ever becomes a trusted event, in
+`googleLogin` (`router.js`), which is also the one place identity resolution
+(`matchAccount`) refuses ambiguity rather than guessing — `"sam@"` matching two
+accounts returns nothing. The page read (`googleAccounts`, content) is pure
+observation across every frame — a One-Tap iframe and the page both — and
+`mergeGoogleFrames` ranks a password or consent frame *above* a stray chooser
+row, so a misread on a grant page cannot become a click. Google's markup churns,
+so every DOM strategy is best-effort and the default is `unknown` + stop, never
+a guess. Tested three ways: the gates as a pure truth-table (`testOAuth`), the
+real parser against chooser/password/consent fixtures (`test/a11y-browser.html`),
+and the params surviving strict validation (`test/run.mjs`).
+
 **The live cursor is the one overlay driven by the click point, not a ref.** A
 trusted click happens off-screen in the background, so `content/actions.js`
 `cursor()` draws a pointer that travels to the same top-level point the CDP click
@@ -633,12 +733,15 @@ extension/
     recorder.js       console/network ring buffers, captured continuously
     groups.js         tab groups, one per MCP session
     windows.js        which window a session works in; the in-browser chooser
+    oauth.js          guided "Sign in with Google" gates — pure, unit-testable
     bridge.js         WebSocket client + reconnection + MV3 keepalive
   content/            injected into every frame
   sidepanel/          the UI — calls the same dispatch() as MCP. The Agents view
-                      is built from Chrome's own tab groups (the "⚡ " title
-                      prefix), so it needs no worker round-trip and stays right
-                      while the worker sleeps.
+                      is built from Chrome's own tab groups plus the ownership
+                      map groups.js keeps in chrome.storage.session, so it needs
+                      no worker round-trip and stays right while the worker
+                      sleeps. One card per agent; the design tokens (palette,
+                      radius, motion) for every surface live in panel.css.
   options/            settings — shares panel.css tokens; System Settings style
 
 mcp-server/src/
@@ -649,8 +752,12 @@ mcp-server/src/
   tools.js            the 14 tool schemas — token-critical
 
 test/
-  run.mjs             246 tests, no browser needed
-  a11y-browser.html   73 tests, needs a browser (npm run preview)
+  run.mjs             333 tests, no browser needed — incl. the parallel-session
+                      stress (`testParallelSessions`): a Chrome stub faithful
+                      enough to drive the real `dispatch`, N sessions opening
+                      tabs at once, asserting named/backgrounded/isolated over
+                      40 storms up to 10 sessions each
+  a11y-browser.html   88 tests, needs a browser (npm run preview)
   overlay-preview.html the on-page overlays, self-checking (same server)
 ```
 
@@ -706,8 +813,8 @@ presence — a `.value` can be empty while the control visibly shows a value
 ## Testing
 
 ```bash
-npm test          # 246 tests — run before and after every change
-npm run preview   # then open /test/a11y-browser.html for 68 DOM tests
+npm test          # 333 tests — run before and after every change
+npm run preview   # then open /test/a11y-browser.html for 88 DOM tests
 ```
 
 The DOM tests need a **real viewport**. In a zero-sized or not-yet-laid-out
@@ -764,10 +871,15 @@ This trips people up constantly — if a fix "didn't work", check this first.
 
 ## Session naming and cleanup live in the hub owner
 
-Session names (`claude · harbor`) are allocated by the **hub**, because that is
-the only process that can see every live session and therefore the only one that
-can guarantee two never collide onto the same tab group. Cleanup on disconnect
-is triggered there too.
+A session *is* its name: one word (`harbor`), allocated by the **hub**, because
+that is the only process that can see every live session and therefore the only
+one that can guarantee two never collide onto the same tab group. The same word
+is the tab-group title, the on-page caption, the panel card, and the "you" in
+every result — never a composite, never a prefix. Which MCP client a session
+belongs to is stamped alongside as `_client` and is display-only. Sixty-four
+words are available and a word is released once the browser confirms that
+session's cleanup (`_endSession` awaits `__session_end`), so names recycle.
+Cleanup on disconnect is triggered there too.
 
 The consequence trips people up: the hub is owned by whichever `mcp-server`
 process started **first**. Reloading the extension does not update it. If

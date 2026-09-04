@@ -19,7 +19,7 @@
 /** Shared param fragments, so wording stays identical across tools. */
 const TAB = {
   type: 'number',
-  description: 'Tab to act on. Omit for the active tab.',
+  description: 'Tab to act on. Omit for your last tab.',
 };
 
 const REF = {
@@ -39,7 +39,7 @@ export const TOOLS = [
   {
     name: 'browser_tabs',
     description:
-      'List, open, close, select, or reload tabs. Every other tool takes a tabId, so many sites can be driven in parallel. Optional "group" splits your tabs into named, coloured workstreams.',
+      'List, open, close, select, or reload your tabs. Every other tool takes a tabId, so many sites can be driven in parallel. Optional "group" splits your tabs into named, coloured sub-groups.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -50,7 +50,7 @@ export const TOOLS = [
         },
         group: {
           type: 'string',
-          description: 'Optional workstream label; omit for normal work. Splits one session into named tab groups.',
+          description: 'Optional sub-group label; omit for normal work. Splits your own tabs into named tab groups.',
         },
         tabId: TAB,
         tabIds: {
@@ -63,7 +63,7 @@ export const TOOLS = [
           type: 'boolean',
           description: 'For "new": open unfocused. Default true, so parallel work keeps focus.',
         },
-        windowId: { type: 'number', description: 'For "new": target window. For "list": only that window.' },
+        windowId: { type: 'number', description: 'For "new": target window. For "list": that window in full.' },
       },
     },
   },
@@ -145,7 +145,7 @@ export const TOOLS = [
   {
     name: 'browser_act',
     description:
-      'Pointer and element actions. Dispatches real trusted input events, so it works on sites that ignore synthetic ones (Stripe, Google, banking, canvas). Auto-scrolls the target into view.',
+      'Pointer and element actions. Dispatches real trusted input events, so it works on sites that ignore synthetic ones (Stripe, Google, banking, canvas). Auto-scrolls the target into view. action:"google_login" guides a "Sign in with Google" flow (lists accounts, asks the user which; never a password).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -156,12 +156,20 @@ export const TOOLS = [
             'click', 'double_click', 'right_click', 'middle_click',
             'hover', 'focus', 'blur', 'scroll', 'scroll_to',
             'drag', 'select_option', 'check', 'uncheck', 'clear', 'submit',
-            'dialog',
+            'dialog', 'google_login',
           ],
         },
         accept: {
           type: 'boolean',
           description: 'For "dialog": true = OK/Leave, false = Cancel/Stay.',
+        },
+        account: {
+          type: 'string',
+          description: 'For "google_login": which account (email or index). Omit to list them and ask the user.',
+        },
+        consent: {
+          type: 'boolean',
+          description: 'For "google_login": true only after the user confirms granting access.',
         },
         promptText: {
           type: 'string',
@@ -245,7 +253,7 @@ export const TOOLS = [
   {
     name: 'browser_screenshot',
     description:
-      'Capture the page as an image. Costs ~20x a snapshot; use it when stuck, for canvas/video/PDF, or visual verification. Image coordinates work with browser_act space:"image".',
+      'Capture the page as an image. Costs ~20x a snapshot; use it when stuck, for canvas/video/PDF, or visual verification. To read one element (chart/canvas/svg/image), use mode:"element" with a selector. Image coordinates work with browser_act space:"image".',
     inputSchema: {
       type: 'object',
       properties: {
@@ -253,15 +261,21 @@ export const TOOLS = [
         mode: {
           type: 'string',
           enum: ['viewport', 'full_page', 'element', 'region'],
-          description: 'Default "viewport".',
+          description: 'Default "viewport". "element" frames one element — with a selector, or alone auto-frames the main chart/image.',
         },
         ref: REF,
+        selector: {
+          type: 'string',
+          description:
+            'For "element": CSS selector (e.g. "canvas", "svg") to frame that element exactly — the reliable way to capture something with no ref: whole element, native resolution, never clipped.',
+        },
         region: {
           type: 'array',
           items: { type: 'number' },
           minItems: 4,
           maxItems: 4,
-          description: 'For "region": [x,y,width,height]. Also use to zoom into small detail.',
+          description:
+            'For "region": [x,y,width,height] in viewport px. Last resort — a guessed rect clips the target; prefer mode:"element" with a selector.',
         },
         format: { type: 'string', enum: ['png', 'jpeg'], description: 'Default jpeg (much smaller).' },
         quality: { type: 'number', description: 'jpeg only, 1-100. Default 70.' },
@@ -436,7 +450,7 @@ export const TOOLS = [
           enum: ['none', 'slow3g', 'fast3g', 'offline'],
           description: 'Emulate a slow or absent network.',
         },
-        focus: { type: 'boolean', description: 'Bring the tab and its window to the front.' },
+        focus: { type: 'boolean', description: 'Make the tab the visible one in its window. Never raises the window.' },
         state: {
           type: 'string',
           enum: ['normal', 'minimized', 'maximized', 'fullscreen'],
@@ -494,8 +508,10 @@ Reliability:
 
 Clicking by sight: prefer a ref. When only a screenshot shows the target (canvas, maps, PDF, a game), read the pixel off the image and click it with browser_act coordinate:[imageX,imageY] space:"image" — the extension converts image pixels to the page for you, so you never do the scale math. Plain coordinate:[x,y] (no space) is viewport CSS pixels.
 
-Parallelism: every tool takes a tabId. Open tabs with browser_tabs action:"new" (background by default) and fan work across them with the browser_batch "parallel" param. You never need a tab in the foreground to act on it — clicks, typing, navigation, snapshots and uploads all work on a background tab. Don't call browser_tabs action:"select" or browser_window focus just to interact: those raise the user's Chrome window and interrupt them. Reserve them for when a human genuinely needs to look at the tab.
+Who you are: one agent with a short name ("harbor"), shown on your tab group, on the pages you drive, and in every result. Your tabs live in a shared background "agent window" alongside other agents' tabs; the user's own windows are separate. A call with no tabId acts on your last-used tab, and opens one for you if you have none. browser_tabs action:"list" shows your tabs in full and everyone else as counts — other agents' tabs are never yours to use, and passing one of their tabIds is refused. To work on one of the user's pages, pass its tabId explicitly (see it with browser_tabs action:"list" windowId:<id>); it then becomes one of your tabs.
 
-Groups are optional, and sessions are already isolated from one another — so omit "group" for ordinary work. Pass it only to split your own session's tabs into named workstreams (e.g. group:"invoices" vs group:"emails"); those tabs then collect into one coloured Chrome tab group. Two different sessions using the same label never share tabs.
+Parallelism: every tool takes a tabId. Open tabs with browser_tabs action:"new" (background by default) and fan work across them with the browser_batch "parallel" param. You never need a tab in the foreground to act on it — clicks, typing, navigation, snapshots and uploads all work on a background tab. browser_tabs action:"select" and browser_window focus only change which tab is showing inside the agent window; they never bring a window in front of the user, so there is no reason to call them while working.
+
+Groups are optional — omit "group" for ordinary work. Pass it only to split your own tabs into named sub-groups (group:"invoices" vs group:"emails"); each becomes a coloured Chrome tab group titled "<you> · <group>". Two agents using the same group label never share tabs.
 
 Trust the result, not the attempt. When an action reports "UNVERIFIED … dispatched", the input was sent but no page change was observed — the tab may be covered, or the control may do nothing on its own. Re-snapshot and confirm the expected state before continuing; do not blindly retry with force. A fully covered agent window drops trusted input silently, so hammering a click just repeats one that already landed or never will.`;

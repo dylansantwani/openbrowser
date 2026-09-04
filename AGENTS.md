@@ -37,8 +37,16 @@ Two halves, two languages of failure:
   null"`.
 - **Sessions must not touch each other's tabs or windows.** Anything keyed by an
   agent-chosen name is keyed by `(session, name)`. Never act on a tab the session
-  did not choose; `_session` and `_browser` are stamped server-side after the
-  args spread so a model cannot spoof them.
+  did not choose; `_session`, `_client` and `_browser` are stamped server-side
+  after the args spread so a model cannot spoof them. Every path that takes a
+  list of tab ids goes through `assertNotForeign` first.
+- **Nothing an agent calls raises a window.** The only `windows.update(…focused:
+  true)` in `router.js` is inside `showTab`, behind the default-off
+  `raiseWindowOnSelect` setting; `npm test` asserts this. Humans raise windows
+  (side-panel click); agents do not.
+- **A session is one word.** `harbor`, never `client · harbor`; tab groups are
+  `harbor` / `harbor · research` with no marker glyph. Agent groups are
+  recognised by the ownership map in `chrome.storage.session`, never by title.
 - **`element.click()` is ignored by serious sites** (`isTrusted: false`). All
   pointer/keyboard input goes through CDP's Input domain.
 

@@ -156,6 +156,139 @@ var OB = globalThis.OB || (globalThis.OB = {});
     },
 
     /**
+     * Locate an element by CSS selector rather than a ref, so a purely visual
+     * target — a `<canvas>`, `<svg>` chart, or `<img>` — can be framed exactly
+     * even though it carries no interactive role and so never appears in the
+     * snapshot with a ref. Without this the only way to capture such a thing was
+     * a hand-guessed pixel `region`, which clips the target as often as it frames
+     * it (a velocity graph whose axis ran off the crop, thirty times over).
+     *
+     * Returns the single largest visible match in this frame, with its rect in
+     * top-level viewport coordinates — the same shape `resolve` returns — so the
+     * background can pick a winner across frames and clip to it directly.
+     */
+    async resolveSelector({ selector, scroll = true }) {
+      let els;
+      try {
+        els = [...document.querySelectorAll(selector)];
+      } catch {
+        return { error: `"${selector}" is not a valid CSS selector` };
+      }
+      const visible = els.filter((el) => {
+        if (!a11y.isVisible(el)) return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      });
+      if (!visible.length) return { found: 0 };
+
+      // The biggest box is the chart, not a stray decorative node that also
+      // matches (`svg` icons, say). Deterministic, so a re-resolve picks the same
+      // element.
+      visible.sort((a, b) => {
+        const ra = a.getBoundingClientRect();
+        const rb = b.getBoundingClientRect();
+        return rb.width * rb.height - ra.width * ra.height;
+      });
+      const el = visible[0];
+      if (scroll) await actions.scrollIntoView(el);
+
+      const rect = el.getBoundingClientRect();
+      return {
+        found: visible.length,
+        point: actions.clickPoint(el),
+        rect: {
+          x: Math.round(rect.x + actions.frameOffset.x),
+          y: Math.round(rect.y + actions.frameOffset.y),
+          w: Math.round(rect.width),
+          h: Math.round(rect.height),
+        },
+        selector: a11y.cssPath(el),
+        tag: el.localName,
+      };
+    },
+
+    /**
+     * Read a Google sign-in page in this frame: which stage it is at, and the
+     * accounts it offers with the point to click each. Pure observation — it
+     * clicks nothing. The router (`googleLogin`) decides what, if anything, may
+     * be clicked, and only after the human-gated checks in `oauth.js`.
+     *
+     * Google's markup changes often, so every strategy is best-effort and the
+     * default is to report `unknown` and offer nothing rather than to guess.
+     */
+    googleAccounts() {
+      const isGoogle =
+        /(^|\.)google\.com$/.test(location.hostname) ||
+        /(^|\.)accounts\.google\./.test(location.hostname) ||
+        !!document.querySelector('[data-identifier]');
+
+      const EMAIL = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i;
+      const accounts = [];
+      const seen = new Set();
+      const add = (email, name, clickEl) => {
+        const key = (email || '').toLowerCase();
+        if (!key || seen.has(key) || !clickEl) return;
+        const point = actions.clickPoint(clickEl);
+        if (!point) return;
+        seen.add(key);
+        accounts.push({ email, name: name || null, point, rect: rectOf(clickEl) });
+      };
+      const rectOf = (el) => {
+        const r = el.getBoundingClientRect();
+        return {
+          x: Math.round(r.x + actions.frameOffset.x),
+          y: Math.round(r.y + actions.frameOffset.y),
+          w: Math.round(r.width),
+          h: Math.round(r.height),
+        };
+      };
+      const textName = (el, email) =>
+        ((el.innerText || '').replace(email, '').trim().split('\n').map((s) => s.trim()).find(Boolean)) || null;
+
+      // Strategy 1: the chooser and One-Tap both stamp the email on the row.
+      for (const el of document.querySelectorAll('[data-identifier]')) {
+        if (!a11y.isVisible(el)) continue;
+        const email = el.getAttribute('data-identifier');
+        const row = el.closest('li,[role="link"],[role="button"],a,div[jsaction],div[role="listitem"]') || el;
+        add(email, textName(row, email), row);
+      }
+      // Strategy 2 (fallback): a clickable row whose visible text holds an email.
+      if (!accounts.length) {
+        for (const el of document.querySelectorAll('li,[role="link"],a[href],[jsaction],[role="button"]')) {
+          if (!a11y.isVisible(el)) continue;
+          const t = (el.innerText || '').trim();
+          if (!t || t.length > 140) continue;
+          const m = t.match(EMAIL);
+          if (m) add(m[0], textName(el, m[0]), el);
+        }
+      }
+
+      // The consent grant: a primary "Allow/Continue/Weiter" button, only when
+      // the page reads like the OAuth grant (mentions access to the account).
+      let allow = null;
+      const bodyText = (document.body?.innerText || '').toLowerCase();
+      const looksLikeConsent = /wants access|access to your|will be able to|is asking|grant .* access/.test(bodyText);
+      if (looksLikeConsent) {
+        for (const b of document.querySelectorAll('button,[role="button"]')) {
+          if (!a11y.isVisible(b)) continue;
+          if (/^(allow|continue|weiter|autoriser|permitir|続行|許可)$/i.test((b.innerText || '').trim())) {
+            const point = actions.clickPoint(b);
+            if (point) { allow = { point, rect: rectOf(b) }; break; }
+          }
+        }
+      }
+
+      const hasVisible = (sel) => [...document.querySelectorAll(sel)].some((el) => a11y.isVisible(el));
+      let stage = 'unknown';
+      if (accounts.length) stage = 'chooser';
+      else if (hasVisible('input[type="password"]')) stage = 'password';
+      else if (allow) stage = 'consent';
+      else if (hasVisible('input[type="email"],input[autocomplete="username"]')) stage = 'email';
+
+      return { isGoogle, url: location.href, stage, accounts, allow };
+    },
+
+    /**
      * What holds focus right now.
      *
      * Only interesting for its negative answer: if focus is on the body, a key
@@ -472,6 +605,10 @@ var OB = globalThis.OB || (globalThis.OB = {});
   // ---------------------------------------------------------------------------
   // Wiring
   // ---------------------------------------------------------------------------
+
+  // Exposed for the DOM test harness, which drives handlers directly rather than
+  // through chrome messaging. Not read anywhere in production.
+  OB.__handlers = handlers;
 
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     const handler = handlers[msg?.cmd];

@@ -219,50 +219,78 @@ export function renderFindResults(results, query) {
 }
 
 /**
- * The tab list, grouped by window.
+ * What a window is called in prose. Mirrors `windowName` in windows.js, which
+ * cannot be imported here without dragging chrome.* side effects into a module
+ * the tests load standalone.
  *
- * It used to be one flat list of every tab in the browser, with no indication
- * of which window any of them was in — and `windowId` was accepted and then
- * ignored, so asking about one window returned the same bytes as asking about
- * another. An agent trying to work out where it was could not: the only
- * window-shaped information anywhere in the output was the workstream tag, and
- * that describes a *group*, which can outlive a rebind in the window the
- * session has left. Two internally-consistent stories that disagree is worse
- * than one incomplete one, and this is the call that has to settle it.
- *
- * Headers cost a line per window. That is the cheapest correct answer to "which
- * window am I in" available, and far cheaper than the retries a wrong one buys.
- *
- * @param {object} [opts]
- * @param {number|null} [opts.boundWindowId] the calling session's window
- * @param {string|null} [opts.label] the calling session, so it reads as "(you)"
+ * @param {{windowId:number, agent?:boolean, own?:string|null, focused?:boolean}} win
  */
-export function renderTabs(tabs, activeTabId, workstreams = [], opts = {}) {
-  if (!tabs.length) return 'No tabs open.';
+export function windowLabel(win) {
+  if (win.agent) return `the agent window (id ${win.windowId})`;
+  if (win.own) return `${win.own}'s window (id ${win.windowId})`;
+  return `window ${win.windowId} (the user's${win.focused ? ', focused' : ''})`;
+}
 
-  // tabId -> ownership, so same-named workstreams from different sessions are
-  // never rendered as if they were one job.
-  const owner = new Map();
-  for (const w of workstreams) {
-    for (const id of w.tabIds) owner.set(id, { workstream: w.name, sessionId: w.sessionId });
+/** One tab, one line: `id  host/path  "title"  marks  [owner]`. */
+function tabRow(t, owned, { showOwner = true, self = null } = {}) {
+  const marks = [];
+  // `active` is Chrome's per-window flag: the tab currently showing in *its*
+  // window. It used to be "the tab in the user's focused window", which told an
+  // agent about the human's screen and nothing about its own.
+  if (t.active) marks.push('active');
+  if (t.audible) marks.push('audio');
+  if (t.discarded) marks.push('discarded');
+  if (t.status === 'loading') marks.push('loading');
+  const suffix = marks.length ? `  ${marks.join(', ')}` : '';
+
+  let tag = '';
+  if (owned) {
+    const isSelf = self && owned.sessionId === self;
+    const group = owned.sessionId && owned.workstream !== owned.sessionId ? owned.workstream : null;
+    if (isSelf) {
+      // Your own rows never repeat your name; only a sub-group is news.
+      if (group) tag = `  group: ${group}`;
+    } else if (showOwner) {
+      tag = `  [${owned.sessionId || owned.workstream}${group ? ` · ${group}` : ''}]`;
+    }
   }
+  return `  ${t.id}  ${shortUrl(t.url || t.pendingUrl || 'about:blank')}  "${truncate(t.title || '', 60)}"${suffix}${tag}`;
+}
 
-  const row = (t) => {
-    const marks = [];
-    if (t.id === activeTabId) marks.push('active');
-    if (t.audible) marks.push('audio');
-    if (t.discarded) marks.push('discarded');
-    if (t.status === 'loading') marks.push('loading');
-    const suffix = marks.length ? ` (${marks.join(', ')})` : '';
-    const owned = owner.get(t.id);
-    // The session id disambiguates same-named workstreams across sessions, but
-    // with no explicit group the workstream *is* the session label, and
-    // "harbor · harbor" is just noise — show the one name then.
-    const stream = owned
-      ? `  [${owned.workstream}${owned.sessionId && owned.sessionId !== owned.workstream ? ` · ${owned.sessionId}` : ''}]`
-      : '';
-    return `  ${t.id}  ${shortUrl(t.url || t.pendingUrl || 'about:blank')}  "${truncate(t.title || '', 60)}"${suffix}${stream}`;
-  };
+/**
+ * The tab list.
+ *
+ * Two audiences, two shapes. A *session* — an agent — is shown its own tabs in
+ * full and everything else summarised: which other agents share its window and
+ * how many tabs they hold, and how many windows the user has. That is the
+ * answer to every question an agent legitimately has ("what am I working on",
+ * "where am I", "is anyone else here") without handing it two hundred tab ids
+ * that are not its to use. Twenty agents in one browser made the old flat list
+ * of every tab both expensive and actively misleading: an agent reading a
+ * neighbour's tab id off it is exactly how tabs got taken over.
+ *
+ * The *side panel* has no session and sees every window in full, tagged with
+ * who owns what — a human's view.
+ *
+ * Either caller can name a `windowId` to see one window in full.
+ *
+ * @param {Array} tabs Chrome tab objects (with `windowId`, `active`)
+ * @param {Array} windows `windows.listWindows()` output: `{windowId, focused, agent, own}`
+ * @param {Array} groups `groups.list()` output: `{name, sessionId, tabIds}`
+ * @param {object} [opts]
+ * @param {string|null} [opts.sessionId] the calling session, if any
+ * @param {number|null} [opts.boundWindowId] the window that session works in
+ * @param {number|null} [opts.windowId] restrict to this window, in full
+ */
+export function renderTabs(tabs, windows = [], groups = [], opts = {}) {
+  const { sessionId = null, boundWindowId = null, windowId = null } = opts;
+
+  const owner = new Map();
+  for (const g of groups) {
+    for (const id of g.tabIds) owner.set(id, { workstream: g.name, sessionId: g.sessionId });
+  }
+  const winById = new Map(windows.map((w) => [w.windowId, w]));
+  const winOf = (id) => winById.get(id) || { windowId: id };
 
   // Insertion order is Chrome's own window order, which is stable across calls
   // — worth keeping, since an agent comparing two listings reads position.
@@ -274,20 +302,74 @@ export function renderTabs(tabs, activeTabId, workstreams = [], opts = {}) {
   }
 
   const out = [];
-  for (const [windowId, group] of byWindow) {
-    // Which sessions have tabs here. The header is where an agent looks to see
-    // it is about to act in a window another agent is mid-task in.
-    const here = [...new Set(group.map((t) => owner.get(t.id)?.sessionId).filter(Boolean))];
-    const who = here.length
-      ? `  ← ${here.map((n) => (n === opts.sessionId ? `${n} (you)` : n)).join(', ')}`
-      : '';
-    // Bracketed rather than a second arrow: the two say different things, and a
-    // session *can* have tabs in a window it is not bound to — that mismatch is
-    // the drift worth seeing, not something to paper over.
-    const mine = opts.boundWindowId != null && windowId === opts.boundWindowId ? ' [your window]' : '';
-    out.push(`window ${windowId} (${group.length} tab${group.length === 1 ? '' : 's'})${mine}${who}`);
-    out.push(...group.map(row));
+
+  // ── One window in full, or the human's full view ─────────────────────────
+  if (windowId != null || !sessionId) {
+    if (!tabs.length) return windowId != null ? `no tabs in window ${windowId}.` : 'No tabs open.';
+    for (const [id, list] of byWindow) {
+      const here = [...new Set(list.map((t) => owner.get(t.id)?.sessionId).filter(Boolean))];
+      const who = here.length
+        ? `  agents: ${here.map((n) => (n === sessionId ? `${n} (you)` : n)).join(', ')}`
+        : '';
+      const yours = sessionId && boundWindowId === id ? '  ← you work here' : '';
+      out.push(`${windowLabel(winOf(id))} · ${list.length} tab${list.length === 1 ? '' : 's'}${who}${yours}`);
+      out.push(...list.map((t) => tabRow(t, owner.get(t.id), { self: sessionId })));
+    }
+    return out.join('\n');
   }
+
+  // ── An agent's own view ──────────────────────────────────────────────────
+  const mine = tabs.filter((t) => owner.get(t.id)?.sessionId === sessionId);
+  const home = boundWindowId != null ? winOf(boundWindowId) : null;
+
+  out.push(
+    home
+      ? `You are agent "${sessionId}", working in ${windowLabel(home)}.`
+      : `You are agent "${sessionId}". No window is bound yet — the first tab you open settles it.`
+  );
+
+  if (mine.length) {
+    out.push(`Your tabs (${mine.length}):`);
+    out.push(...mine.map((t) => tabRow(t, owner.get(t.id), { self: sessionId })));
+  } else {
+    out.push('You have no tabs yet. browser_navigate opens one for you; browser_tabs action:"new" opens more.');
+  }
+
+  // Everyone else, as counts. Names, so the human's "close meadow's tabs" and
+  // the agent's picture of the window agree; no ids, because those tabs are not
+  // this agent's to act on and a listing that shows them invites it to.
+  const others = new Map();
+  for (const t of tabs) {
+    const o = owner.get(t.id);
+    if (!o?.sessionId || o.sessionId === sessionId) continue;
+    const key = `${o.sessionId}|${t.windowId}`;
+    others.set(key, (others.get(key) || 0) + 1);
+  }
+  if (others.size) {
+    const inHome = [];
+    const elsewhere = [];
+    for (const [key, n] of others) {
+      const [name, win] = key.split('|');
+      const text = `${name} (${n} tab${n === 1 ? '' : 's'})`;
+      (Number(win) === boundWindowId ? inHome : elsewhere).push(text);
+    }
+    if (inHome.length) out.push(`Other agents in your window: ${inHome.join(', ')} — their tabs are not yours to use.`);
+    if (elsewhere.length) out.push(`Agents in other windows: ${elsewhere.join(', ')}.`);
+  }
+
+  // The user's windows: counted, never listed. An explicit windowId shows one.
+  const userWins = [...byWindow.entries()].filter(([id]) => {
+    const w = winOf(id);
+    return !w.agent && !w.own && id !== boundWindowId;
+  });
+  if (userWins.length) {
+    const parts = userWins.map(([id, list]) => `${windowLabel(winOf(id))} · ${list.length} tab${list.length === 1 ? '' : 's'}`);
+    out.push(
+      `The user's windows — not yours to act on: ${parts.join('; ')}. ` +
+        'To read one, pass windowId:<id>; to drive one of its tabs, pass that tabId explicitly (it then joins your tabs).'
+    );
+  }
+
   return out.join('\n');
 }
 

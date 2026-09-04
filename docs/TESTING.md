@@ -120,6 +120,34 @@ The point of the debugger. Verify on a site that rejects synthetic events:
 - [ ] Snapshot two tabs alternately — refs do not bleed between them
 - [ ] Close a tab mid-run — the error names the tab, others keep working
 
+### Names, windows, and isolation (several agents at once)
+
+Start two or three MCP clients against one Chrome.
+
+- [ ] Each session's tab group is titled with one word (`harbor`), no ⚡, and
+      `group:"research"` makes a second group titled `harbor · research`
+- [ ] The on-page caption reads `OpenBrowser · harbor`; the side panel shows one
+      card per agent with its client as a chip and sub-groups indented
+- [ ] `browser_tabs action:"list"` from a session begins `You are agent "…",
+      working in the agent window (id …)`, lists only that session's tab ids, and
+      shows other agents as `name (N tabs)`
+- [ ] `browser_tabs action:"list" windowId:<user window>` lists that window in full
+- [ ] `browser_window action:"list"` names each window by role — `the agent
+      window`, `<name>'s window`, `window N (the user's, focused)`
+- [ ] `browser_tabs action:"select"` on an owned tab switches the visible tab in
+      the agent window and the agent window does **not** come to the front; the
+      result says so. Same for `browser_window focus:true`
+- [ ] Turn on "Let agents bring their window to the front" in Advanced — `select`
+      now raises it; turn it back off
+- [ ] `browser_tabs action:"close" tabIds:[<another agent's tab>]` is refused and
+      names the owning agent; nothing closes. Same for `reload` and `group`
+- [ ] Open a tab with `group:"research"`, then call `browser_snapshot` with no
+      `group` — it snapshots that tab, not a fresh blank one
+- [ ] Disconnect a client — its tabs close, and the *next* client to start gets
+      that name back (not `session-N`)
+- [ ] Clicking a tab row in the side panel still brings the agent window forward
+      (that is a human asking)
+
 ### Inspection
 
 - [ ] `console` shows output from before the call was made

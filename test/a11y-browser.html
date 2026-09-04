@@ -143,12 +143,29 @@
       );
     </script>
 
+    <!-- Screenshot-by-selector fixture: a wide chart mid-page, plus a tiny decoy
+         svg, so the "largest visible match wins" rule is actually exercised. -->
+    <div id="shotfix" style="position:absolute;left:-9999px;top:0">
+      <svg id="decoy" width="16" height="16"><rect width="16" height="16"/></svg>
+      <svg id="chart" width="820" height="460"><rect width="820" height="460"/></svg>
+      <img id="pic" src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw=="
+           style="width:300px;height:200px" alt="" />
+      <svg id="hiddensvg" width="900" height="900" style="display:none"></svg>
+    </div>
+
+    <script>
+      // Shim just enough chrome for the content scripts to load in a bare page:
+      // main.js registers a runtime listener at load, format.js a tabs one.
+      window.chrome = {
+        runtime: { onMessage: { addListener() {} } },
+        tabs: { onRemoved: { addListener() {} } },
+      };
+    </script>
     <script src="../extension/content/a11y.js"></script>
     <script src="../extension/content/actions.js"></script>
+    <script src="../extension/content/main.js"></script>
 
     <script type="module">
-      // format.js registers a chrome listener at import time.
-      globalThis.chrome = { tabs: { onRemoved: { addListener() {} } } };
       const fmt = await import('../extension/background/format.js');
 
       const out = [];
@@ -465,6 +482,73 @@
         offPoint?.offscreen === true && /outside the viewport/.test(offPoint.obstructedBy || ''),
         offPoint?.obstructedBy);
       offscreen.remove();
+
+      // --- Screenshot by selector -------------------------------------------
+      // The fix for blind region-cropping: frame a visual element (canvas/svg/
+      // img) by CSS selector, so element mode reaches things that have no ref.
+      const rs = OB.__handlers.resolveSelector;
+      const chart = await rs({ selector: 'svg', scroll: false });
+      check('resolveSelector finds a match', chart.found >= 1, JSON.stringify(chart));
+      check('largest visible svg wins over a decoy', chart.selector?.includes('chart'), chart.selector);
+      const chartEl = document.getElementById('chart');
+      check('rect matches the real element box',
+        chart.rect && chart.rect.w === Math.round(chartEl.getBoundingClientRect().width) &&
+          chart.rect.h === Math.round(chartEl.getBoundingClientRect().height),
+        JSON.stringify(chart.rect));
+
+      const img = await rs({ selector: 'img#pic', scroll: false });
+      check('resolveSelector frames an <img> by selector', img.found === 1 && img.rect.w === 300, JSON.stringify(img.rect));
+
+      // mode:"element" with nothing named auto-frames the largest graphic across
+      // tag types — the chart svg (820x460) beats the img (300x200) and decoy.
+      const auto = await rs({ selector: 'canvas, svg, img, video', scroll: false });
+      check('auto-target picks the largest graphic across tags', auto.selector?.includes('chart'), auto.selector);
+      check('auto-target ignores tiny/hidden graphics', auto.rect.w === 820 && auto.rect.h === 460, JSON.stringify(auto.rect));
+
+      const none = await rs({ selector: '.does-not-exist', scroll: false });
+      check('no match reports found:0, not an error', none.found === 0 && !none.error, JSON.stringify(none));
+
+      const hidden = await rs({ selector: '#hiddensvg', scroll: false });
+      check('display:none is not a match', hidden.found === 0, JSON.stringify(hidden));
+
+      const bad = await rs({ selector: ':::nope', scroll: false });
+      check('an invalid selector is reported, not thrown', /not a valid/.test(bad.error || ''), JSON.stringify(bad));
+
+      // --- Google sign-in parser (googleAccounts) ---------------------------
+      // Isolate: the signup fixture's own password/email inputs would otherwise
+      // leak into stage detection, since the parser reads the whole document.
+      const ga = OB.__handlers.googleAccounts;
+      const fixtureEl = document.getElementById('fixture');
+      const savedDisplay = fixtureEl.style.display;
+      fixtureEl.style.display = 'none';
+      const g = document.createElement('div');
+      g.style.cssText = 'position:fixed;top:0;left:0;width:400px;background:#fff;z-index:99999';
+      document.body.appendChild(g);
+
+      g.innerHTML =
+        '<div data-identifier="sam@work.com" role="link"><div>Sam Ray</div><div>sam@work.com</div></div>' +
+        '<div data-identifier="dana@home.com" role="link"><div>Dana Lee</div><div>dana@home.com</div></div>';
+      let gr = ga();
+      check('googleAccounts detects the account chooser', gr.stage === 'chooser', gr.stage);
+      check('googleAccounts reads both accounts with click points',
+        gr.accounts.length === 2 && gr.accounts.every((a) => a.point && typeof a.point.x === 'number'),
+        JSON.stringify(gr.accounts.map((a) => a.email)));
+      check('googleAccounts reads email and name', gr.accounts[0].email === 'sam@work.com' && /Sam Ray/.test(gr.accounts[0].name || ''), JSON.stringify(gr.accounts[0]));
+
+      g.innerHTML = '<input type="password" aria-label="Password" />';
+      gr = ga();
+      check('googleAccounts flags the password screen and offers nothing', gr.stage === 'password' && gr.accounts.length === 0, gr.stage);
+
+      g.innerHTML = '<p>This app wants access to your Google Account</p><button>Allow</button>';
+      gr = ga();
+      check('googleAccounts flags a real consent screen with an Allow point', gr.stage === 'consent' && !!gr.allow?.point, JSON.stringify({ stage: gr.stage, allow: gr.allow }));
+
+      g.innerHTML = '<button>Allow</button>';
+      gr = ga();
+      check('a lone Allow button without consent wording is not consent', gr.stage !== 'consent', gr.stage);
+
+      g.remove();
+      fixtureEl.style.display = savedDisplay;
 
       // --- Token cost --------------------------------------------------------
       const domBytes = document.getElementById('fixture').innerHTML.length;

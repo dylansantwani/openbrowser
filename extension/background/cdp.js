@@ -463,6 +463,12 @@ export async function captureScreenshot(tabId, { format = 'jpeg', quality = 70, 
 
   if (clip) {
     params.clip = { x: clip.x, y: clip.y, width: clip.width, height: clip.height, scale: 1 };
+    // An element or region can extend past the fold — a chart taller than the
+    // viewport, or one scrolled so its lower half is below it. Without this the
+    // off-screen part of the clip comes back blank (the exact half-a-graph a
+    // model then reads as the whole thing); with it the clip is filled from the
+    // real content, wherever it sits.
+    params.captureBeyondViewport = true;
   } else if (fullPage) {
     const metrics = await send(tabId, 'Page.getLayoutMetrics');
     const content = metrics.cssContentSize || metrics.contentSize;

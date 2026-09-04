@@ -1,19 +1,43 @@
 /*
- * Visual feedback for actions taken by an agent.
+ * The agent layer — everything OpenBrowser draws on a page it is driving.
  *
  * Injected into every page, so every rule is namespaced and every property is
  * forced — a page's own `div { all: unset }` or aggressive resets must not be
  * able to make the overlay invisible or, worse, make it intercept clicks.
+ *
+ * One system, four marks:
+ *
+ *   frame      the ambient "this tab is being driven" border, breathing slowly,
+ *              with the agent's name in a pill at the top right.
+ *   highlight  a box around the element an action just touched, fading out.
+ *   cursor     a pointer that travels to each click point and rings on contact;
+ *              the one mark that persists between actions.
+ *   prompt     the "an agent wants to work in this window" card.
+ *
+ * They share ONE hue, the extension's accent blue (#2f6fed — `--accent` in
+ * sidepanel/panel.css, so the page and the panel read as one product), and
+ * weight carries the meaning: the frame is translucent and slow because it is
+ * ambient; the cursor, ripple and highlight are solid because they mean "here,
+ * now". Every label — the frame caption, the cursor pill, the highlight tag —
+ * is the same pill: dark glass, white text, a small blue dot. The prompt card
+ * is the same glass at card size.
+ *
+ * Motion follows the panel's scale: cubic-bezier(0.22, 0.61, 0.36, 1) for
+ * everything; 140ms for hover, 240ms for anything that appears or moves, 900ms
+ * for a mark that fades on its own, 2.6s for the frame's breath. This file
+ * cannot read the panel's CSS variables — it lives in other people's pages —
+ * so the values are repeated here and must be kept in step by hand.
+ *
+ * The cascade rule that shapes the whole file: `!important` author declarations
+ * outrank CSS animations and transitions, so any property a keyframe, a
+ * transition, or the script drives is declared WITHOUT it. Everything static
+ * stays forced. Getting this backwards shipped once — a "pulsing" frame that
+ * never moved — and test/overlay-preview.html now samples computed values
+ * across the cycle rather than trusting that an animation exists.
  */
 
-/*
- * Two colours carry one meaning each, everywhere the agent draws on a page:
- *   #2f6fed (action blue) — "the agent is acting *here*, now": the cursor, its
- *      ripple, and the target highlight. It matches the extension's own UI
- *      accent, so the on-page marks and the side panel read as one product.
- *   #f97316 (driving orange) — the ambient "this whole tab is being driven"
- *      frame. A different job, so a different colour; never mixed with the blue.
- */
+/* ── Highlight: the element an action just touched ─────────────────────────── */
+
 .ob-highlight {
   position: fixed !important;
   z-index: 2147483646 !important;
@@ -21,45 +45,52 @@
   box-sizing: border-box !important;
   border: 2px solid #2f6fed !important;
   border-radius: 6px !important;
-  background: rgba(47, 111, 237, 0.1) !important;
-  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.75), 0 2px 10px rgba(47, 111, 237, 0.25) !important;
+  background: rgba(47, 111, 237, 0.08) !important;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.7), 0 2px 12px rgba(47, 111, 237, 0.28) !important;
   margin: 0 !important;
   padding: 0 !important;
-  animation: ob-highlight-fade 0.9s ease-out forwards !important;
+  animation: ob-highlight-fade 0.9s cubic-bezier(0.22, 0.61, 0.36, 1) forwards !important;
 }
 
+/* The pill. Same recipe as .ob-cursor-label and .ob-agent-frame::after. */
 .ob-highlight[data-ob-label]::after {
   content: attr(data-ob-label);
   position: absolute;
   bottom: 100%;
   left: 0;
-  transform: translateY(-3px);
-  background: #2f6fed;
-  color: #fff;
-  font: 600 11px/1.45 ui-sans-serif, system-ui, -apple-system, sans-serif;
+  transform: translateY(-6px);
+  padding: 4px 10px 4px 19px;
+  border-radius: 999px;
+  background:
+    radial-gradient(circle at 10px 50%, #2f6fed 3px, transparent 3.6px),
+    rgba(28, 28, 30, 0.86);
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+  color: #f2f2f7;
+  font: 600 11px/1.3 -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif;
   letter-spacing: 0.01em;
-  padding: 2px 7px;
-  border-radius: 6px;
   white-space: nowrap;
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.22);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25), 0 0 0 1px rgba(255, 255, 255, 0.08);
 }
 
+@keyframes ob-highlight-fade {
+  0%   { opacity: 0; transform: scale(1.03); }
+  15%  { opacity: 1; transform: scale(1); }
+  70%  { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+/* ── Cursor: the pointer that travels to each click ────────────────────────── */
+
 /*
- * The live cursor.
- *
- * Every other overlay marks *where* an action landed; this shows the pointer
+ * Every other mark shows *where* an action landed; this shows the pointer
  * travelling there, so a run reads as one hand moving rather than boxes
- * blinking on unrelated corners of the page. Two things make it different from
- * the rest of this file: it persists between actions — you can always find
- * where the agent last was — and it is positioned in top-level viewport pixels,
- * like a real pointer, so it lives only in the top frame.
+ * blinking on unrelated corners of the page. It persists between actions — you
+ * can always find where the agent last was — and it is positioned in top-level
+ * viewport pixels, like a real pointer, so it lives only in the top frame.
  *
- * The cascade rule the agent frame documents below applies here in force: the
- * translate that drives travel, and the opacity/scale the ripple, press, and
- * label animate, are the ONE set of properties left un-`!important`, because a
- * forced value outranks a transition or a keyframe and freezes it silently.
- * Everything static stays forced, so a page's own reset cannot blank the
- * pointer or, worse, leave it frozen in a corner looking broken.
+ * The translate that drives travel, and the opacity/scale the ripple, press,
+ * and label animate, are deliberately left un-`!important` (see the header).
  */
 .ob-cursor {
   position: fixed !important;
@@ -74,23 +105,17 @@
   /* Driven by JS through --ob-x/--ob-y; transitioned, so deliberately soft. */
   transform: translate3d(var(--ob-x, -100px), var(--ob-y, -100px), 0);
   /*
-   * NOT `!important`, and the duration is only a fallback: an `!important`
-   * transition here outranks the inline `transition: none` the script uses to
-   * place a fresh document's pointer silently — so every navigation had the
-   * cursor visibly flying in from off-screen — and it equally outranks the
-   * per-move `transition-duration` that scales travel time to distance. Same
-   * cascade trap as the animated properties below, same rule: anything the
-   * script or a keyframe drives stays unforced.
+   * NOT `!important`, and the duration is only a fallback: a forced transition
+   * would outrank the inline `transition: none` the script uses to place a
+   * fresh document's pointer silently, and the per-move duration that scales
+   * travel time to distance.
    */
   transition: transform 0.24s cubic-bezier(0.22, 0.61, 0.36, 1);
   will-change: transform !important;
 }
 
-/*
- * A soft halo behind the pointer. The arrow alone disappears against busy
- * pages; a translucent disc in the accent colour keeps the pointer findable
- * without shouting. Centred on the tip, i.e. the exact click point.
- */
+/* A soft halo behind the pointer, centred on the tip (the exact click point),
+   so the arrow stays findable on busy pages without shouting. */
 .ob-cursor-halo {
   position: absolute !important;
   top: 0 !important;
@@ -115,11 +140,11 @@
 
 /* A short squeeze on click, so a press is legible even without the ripple. */
 .ob-cursor-press .ob-cursor-arrow {
-  animation: ob-cursor-press 0.32s ease-out;
+  animation: ob-cursor-press 0.32s cubic-bezier(0.22, 0.61, 0.36, 1);
 }
 @keyframes ob-cursor-press {
-  0% { transform: scale(1); }
-  35% { transform: scale(0.78); }
+  0%   { transform: scale(1); }
+  35%  { transform: scale(0.78); }
   100% { transform: scale(1); }
 }
 
@@ -137,48 +162,59 @@
   opacity: 0;
 }
 .ob-cursor-ripple-go {
-  animation: ob-cursor-ripple 0.5s ease-out;
+  animation: ob-cursor-ripple 0.5s cubic-bezier(0.22, 0.61, 0.36, 1);
 }
 @keyframes ob-cursor-ripple {
-  0% { opacity: 0.55; transform: scale(0.4); }
+  0%   { opacity: 0.55; transform: scale(0.4); }
   100% { opacity: 0; transform: scale(4.2); }
 }
 
-/* A small pill naming the action, so a coordinate click — which has no target
- * box — still says what just happened. Fades on the same ~0.9s beat as the
- * highlight, so the two never disagree about how long an action is "showing". */
+/* The pill naming the action, so a coordinate click — which has no target box
+   — still says what just happened. Fades on the same 0.9s beat as the
+   highlight, so the two never disagree about how long an action is "showing". */
 .ob-cursor-label {
   position: absolute !important;
-  top: 18px !important;
+  top: 20px !important;
   left: 20px !important;
-  padding: 2px 7px !important;
-  border-radius: 6px !important;
-  background: #2f6fed !important;
-  color: #fff !important;
-  font: 600 11px/1.45 ui-sans-serif, system-ui, -apple-system, sans-serif !important;
+  padding: 4px 10px 4px 19px !important;
+  border-radius: 999px !important;
+  background:
+    radial-gradient(circle at 10px 50%, #2f6fed 3px, transparent 3.6px),
+    rgba(28, 28, 30, 0.86) !important;
+  -webkit-backdrop-filter: blur(10px) !important;
+  backdrop-filter: blur(10px) !important;
+  color: #f2f2f7 !important;
+  font: 600 11px/1.3 -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif !important;
   letter-spacing: 0.01em !important;
   white-space: nowrap !important;
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25) !important;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25), 0 0 0 1px rgba(255, 255, 255, 0.08) !important;
   opacity: 0;
 }
 .ob-cursor-label-show {
-  animation: ob-cursor-label 0.95s ease-out;
+  animation: ob-cursor-label 0.9s cubic-bezier(0.22, 0.61, 0.36, 1);
 }
 @keyframes ob-cursor-label {
-  0% { opacity: 0; }
-  14% { opacity: 1; }
-  70% { opacity: 1; }
+  0%   { opacity: 0; transform: translateY(3px); }
+  14%  { opacity: 1; transform: none; }
+  70%  { opacity: 1; }
   100% { opacity: 0; }
 }
 
+/* ── Frame: "an agent is driving this tab" ─────────────────────────────────── */
+
 /*
- * Persistent "an agent is driving this tab" frame.
- *
  * A tab group colour is only visible in the tab strip, and says nothing once
  * you are looking at the page — so a tab being driven was indistinguishable
- * from one you opened yourself. This is deliberately loud and deliberately
+ * from one you opened yourself. This is deliberately visible and deliberately
  * inert: `pointer-events: none` everywhere, so it can never take a click the
  * page should have had.
+ *
+ * It breathes rather than blinks. A static border is read once and then stops
+ * being seen; motion is what survives ten minutes into a long run. At 2.6s a
+ * cycle it reads as ambient rather than as a notification, and it is never
+ * fully dim, so the tab is unmistakable at any point in the cycle. Translucent
+ * blue rather than a solid colour of its own: it is the same accent as every
+ * other mark, at ambient weight.
  */
 .ob-agent-frame {
   position: fixed !important;
@@ -186,79 +222,62 @@
   z-index: 2147483646 !important;
   pointer-events: none !important;
   box-sizing: border-box !important;
-  border-width: 3px !important;
+  border-width: 2px !important;
   border-style: solid !important;
+  border-radius: 10px !important;
   background: none !important;
   margin: 0 !important;
   padding: 0 !important;
-  /*
-   * A slow breath, not a blink.
-   *
-   * A static border is read once and then stops being seen — which is a problem
-   * for a marker whose whole job is to still be saying "something else is
-   * driving this" ten minutes into a long run. Motion is what survives that.
-   *
-   * The rate is deliberately slower than anything a page animates: at 2.6s a
-   * cycle it reads as ambient rather than as a notification, and it never
-   * competes for attention with the page's own content. The border is never
-   * fully dim, so the tab is unmistakable at any point in the cycle.
-   */
-  animation: ob-agent-pulse 2.6s ease-in-out infinite !important;
-
-  /*
-   * The two properties the animation drives are deliberately *not* `!important`,
-   * which is the opposite of the rule the rest of this file follows.
-   *
-   * `!important` author declarations outrank CSS animations in the cascade, so
-   * forcing these here does not make them safer — it makes the keyframes do
-   * nothing at all, and the border sits at a fixed colour looking exactly like
-   * it works. That is precisely how this shipped once.
-   *
-   * Nothing is really given up. An animation already beats every *normal*
-   * declaration a page can write, and the only thing that could still win is a
-   * page marking `border-color` or `box-shadow` important against our own class
-   * — and if that ever happens the border is still a 3px solid box in the right
-   * place, which is the part that matters.
-   */
-  border-color: #f97316;
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.55);
+  animation: ob-agent-breathe 2.6s cubic-bezier(0.22, 0.61, 0.36, 1) infinite !important;
+  /* Driven by the keyframes, so NOT forced — see the header. */
+  border-color: rgba(47, 111, 237, 0.55);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.35), inset 0 0 18px rgba(47, 111, 237, 0.12);
 }
 
-@keyframes ob-agent-pulse {
+@keyframes ob-agent-breathe {
   0%, 100% {
-    border-color: rgba(249, 115, 22, 0.6);
-    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.45);
+    border-color: rgba(47, 111, 237, 0.45);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.3), inset 0 0 14px rgba(47, 111, 237, 0.08);
   }
   50% {
-    border-color: rgba(249, 115, 22, 1);
-    box-shadow:
-      inset 0 0 0 1px rgba(255, 255, 255, 0.6),
-      inset 0 0 12px rgba(249, 115, 22, 0.3);
+    border-color: rgba(47, 111, 237, 0.9);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.45), inset 0 0 22px rgba(47, 111, 237, 0.2);
   }
 }
 
+/* The agent's name, in the same pill every other label uses. */
 .ob-agent-frame::after {
   content: attr(data-ob-agent);
   position: absolute !important;
-  top: 0 !important;
+  top: 10px !important;
   right: 12px !important;
-  background: #f97316 !important;
-  color: #fff !important;
-  font: 600 11px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif !important;
-  letter-spacing: 0.02em !important;
-  padding: 3px 8px !important;
-  border-radius: 0 0 4px 4px !important;
+  padding: 4px 10px 4px 19px !important;
+  border-radius: 999px !important;
+  background:
+    radial-gradient(circle at 10px 50%, #2f6fed 3px, transparent 3.6px),
+    rgba(28, 28, 30, 0.86) !important;
+  -webkit-backdrop-filter: blur(10px) !important;
+  backdrop-filter: blur(10px) !important;
+  color: #f2f2f7 !important;
+  font: 600 11px/1.3 -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif !important;
+  letter-spacing: 0.01em !important;
   white-space: nowrap !important;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.28) !important;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25), 0 0 0 1px rgba(255, 255, 255, 0.08) !important;
+  animation: ob-rise 0.24s cubic-bezier(0.22, 0.61, 0.36, 1);
 }
 
+@keyframes ob-rise {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* ── Prompt: "an agent wants to work in this window" ───────────────────────── */
+
 /*
- * "An agent wants to work in this window."
- *
  * Shown in one tab per window when a session has to choose between several.
- * The only overlay here that takes pointer events — a prompt nobody can click
- * is not a prompt. Everything is still forced, for the same reason as the rest
- * of this file: a page's reset must not be able to hide the question or, worse,
+ * The only mark here that takes pointer events — a prompt nobody can click is
+ * not a prompt. Everything is still forced, for the same reason as the rest of
+ * this file: a page's reset must not be able to hide the question or, worse,
  * leave it visible but unclickable.
  */
 .ob-window-pick {
@@ -268,11 +287,7 @@
   /* The backdrop stays inert so the page underneath keeps working — this asks
      a question, it does not seize the browser. Only the card takes clicks. */
   pointer-events: none !important;
-  /*
-   * A column, because several agents can be asking at the same time. Three
-   * sessions starting together is the normal case for a hub, and one card
-   * covering another is a question the user cannot answer.
-   */
+  /* A column, because several agents can be asking at the same time. */
   display: flex !important;
   flex-direction: column !important;
   align-items: center !important;
@@ -285,6 +300,7 @@
   overflow: hidden !important;
 }
 
+/* The same glass as the pills, at card size. */
 .ob-window-pick-card {
   pointer-events: auto !important;
   box-sizing: border-box !important;
@@ -292,24 +308,40 @@
   flex: 0 0 auto !important;
   padding: 16px 18px !important;
   max-width: 420px !important;
-  border: 1px solid rgba(249, 115, 22, 0.55) !important;
+  border: 1px solid rgba(255, 255, 255, 0.1) !important;
   border-radius: 12px !important;
-  background: #1c1917 !important;
-  color: #fafaf9 !important;
-  font: 400 13px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif !important;
+  background: rgba(28, 28, 30, 0.92) !important;
+  -webkit-backdrop-filter: blur(16px) !important;
+  backdrop-filter: blur(16px) !important;
+  color: #f2f2f7 !important;
+  font: 400 13px/1.5 -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif !important;
   text-align: left !important;
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.06) !important;
-  animation: ob-window-pick-in 0.18s ease-out !important;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(47, 111, 237, 0.25) !important;
+  animation: ob-window-pick-in 0.24s cubic-bezier(0.22, 0.61, 0.36, 1) !important;
 }
 
 .ob-window-pick-title {
-  font: 600 14px/1.4 ui-sans-serif, system-ui, -apple-system, sans-serif !important;
-  color: #fafaf9 !important;
+  display: flex !important;
+  align-items: center !important;
+  gap: 8px !important;
+  font: 600 14px/1.4 -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif !important;
+  color: #f2f2f7 !important;
   margin: 0 0 4px 0 !important;
 }
 
+/* The same blue dot the pills carry. */
+.ob-window-pick-title::before {
+  content: '';
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #2f6fed;
+  box-shadow: 0 0 0 3px rgba(47, 111, 237, 0.2);
+}
+
 .ob-window-pick-sub {
-  color: #a8a29e !important;
+  color: #98989f !important;
   margin: 0 0 14px 0 !important;
   font-size: 12.5px !important;
 }
@@ -324,11 +356,11 @@
   pointer-events: auto !important;
   box-sizing: border-box !important;
   cursor: pointer !important;
-  border: 1px solid rgba(255, 255, 255, 0.16) !important;
-  border-radius: 7px !important;
-  background: rgba(255, 255, 255, 0.06) !important;
-  color: #fafaf9 !important;
-  font: 500 13px/1 ui-sans-serif, system-ui, -apple-system, sans-serif !important;
+  border: none !important;
+  border-radius: 8px !important;
+  background: rgba(255, 255, 255, 0.08) !important;
+  color: #f2f2f7 !important;
+  font: 500 12.5px/1 -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif !important;
   padding: 9px 14px !important;
   margin: 0 !important;
   text-transform: none !important;
@@ -337,49 +369,51 @@
   min-height: 0 !important;
   width: auto !important;
   height: auto !important;
+  box-shadow: none !important;
+  /* Hover/press are transitions, so not forced. */
+  transition: background-color 0.14s cubic-bezier(0.22, 0.61, 0.36, 1), transform 0.14s cubic-bezier(0.22, 0.61, 0.36, 1);
 }
 
 .ob-window-pick-btn:hover {
-  background: rgba(255, 255, 255, 0.12) !important;
+  background: rgba(255, 255, 255, 0.14) !important;
+}
+
+.ob-window-pick-btn:active {
+  transform: scale(0.97);
 }
 
 .ob-window-pick-yes {
-  background: #f97316 !important;
-  border-color: #f97316 !important;
-  color: #1c1917 !important;
+  background: #2f6fed !important;
+  color: #ffffff !important;
   font-weight: 600 !important;
 }
 
 .ob-window-pick-yes:hover {
-  background: #fb923c !important;
-  border-color: #fb923c !important;
+  background: #4f83f0 !important;
 }
 
 .ob-window-pick-btn:focus-visible {
-  outline: 2px solid #fdba74 !important;
-  outline-offset: 2px !important;
+  outline: none !important;
+  box-shadow: 0 0 0 2.5px rgba(47, 111, 237, 0.35), 0 0 0 1px #2f6fed !important;
 }
 
 @keyframes ob-window-pick-in {
-  from { opacity: 0; transform: translateY(-6px); }
-  to   { opacity: 1; transform: translateY(0); }
+  from { opacity: 0; transform: translateY(-6px) scale(0.98); }
+  to   { opacity: 1; transform: none; }
 }
 
 /* Printing a page should not print the chrome around it. */
 @media print {
   .ob-agent-frame,
-  .ob-window-pick { display: none !important; }
+  .ob-window-pick,
+  .ob-cursor,
+  .ob-highlight { display: none !important; }
 }
 
-@keyframes ob-highlight-fade {
-  0%   { opacity: 0; transform: scale(1.04); }
-  15%  { opacity: 1; transform: scale(1); }
-  70%  { opacity: 1; }
-  100% { opacity: 0; }
-}
+/* ── Motion preference ─────────────────────────────────────────────────────── */
 
-/* Respect the user's motion preference — the outline still appears, it just
-   does not animate. */
+/* Respect the user's motion preference — every mark still appears, it just
+   does not move. */
 @media (prefers-reduced-motion: reduce) {
   .ob-highlight {
     animation: ob-highlight-hold 0.9s steps(1, end) forwards !important;
@@ -393,11 +427,17 @@
      no longer draw the eye by moving. Only the motion is dropped. */
   .ob-agent-frame {
     animation: none !important;
-    border-color: #f97316 !important;
+    border-color: rgba(47, 111, 237, 0.9) !important;
+  }
+  .ob-agent-frame::after {
+    animation: none !important;
   }
 
   .ob-window-pick-card {
     animation: none !important;
+  }
+  .ob-window-pick-btn {
+    transition: none !important;
   }
 
   /* The cursor still moves — a pointer that does not track the action is
@@ -413,14 +453,14 @@
     animation: ob-cursor-ripple-hold 0.3s steps(1, end);
   }
   @keyframes ob-cursor-ripple-hold {
-    0% { opacity: 0.5; transform: scale(2.2); }
+    0%   { opacity: 0.5; transform: scale(2.2); }
     100% { opacity: 0; transform: scale(2.2); }
   }
   .ob-cursor-label-show {
-    animation: ob-cursor-label-hold 0.95s steps(1, end);
+    animation: ob-cursor-label-hold 0.9s steps(1, end);
   }
   @keyframes ob-cursor-label-hold {
     0%, 80% { opacity: 1; }
-    100% { opacity: 0; }
+    100%    { opacity: 0; }
   }
 }

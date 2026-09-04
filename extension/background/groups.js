@@ -6,17 +6,15 @@
  * which ones are safe to close. Chrome's tab groups solve exactly that, and
  * they cost nothing to maintain.
  *
- * Tabs are grouped by *workstream* rather than all lumped together, so three
- * parallel jobs read as three labelled, colour-coded groups. The name is the
- * agent's own choice of label, which means the tab strip ends up describing
- * the work in the agent's words.
+ * Every session gets one group named after it — "harbor" — and a session that
+ * splits its work with the `group` argument gets one group per sub-task, named
+ * "harbor · research". The session's name is always the first word, so a strip
+ * full of agents reads as a list of who is here, and "research" from two
+ * different agents can never look like one job.
  */
 
-/** Group title prefix, so agent groups are distinguishable at a glance. */
-const PREFIX = '⚡ ';
-
 /**
- * Colours cycle per workstream. Chrome offers eight; these are ordered to stay
+ * Colours cycle per group. Chrome offers eight; these are ordered to stay
  * distinguishable from each other and from the greys of ungrouped tabs.
  */
 const COLORS = ['blue', 'purple', 'cyan', 'green', 'orange', 'pink', 'yellow', 'red'];
@@ -25,12 +23,36 @@ const COLORS = ['blue', 'purple', 'cyan', 'green', 'orange', 'pink', 'yellow', '
 const groups = new Map();
 let colorCursor = 0;
 
-/** Durable groupId -> {sessionId, workstream} ownership metadata. */
+/**
+ * Durable groupId -> {sessionId, workstream, client} ownership metadata.
+ *
+ * This map is the *only* thing that makes a Chrome tab group an agent group.
+ * An earlier design marked agent groups with a lightning-bolt title prefix and found
+ * them by that; the title is a display string a human can edit and a model can
+ * imitate, and identity has no business living in it. Ownership is recorded
+ * here when a group is made and read from here everywhere — the panel included,
+ * which reads this same key from `chrome.storage.session`.
+ */
 const OWNERS_KEY = 'tabGroupOwnersV2';
 let ownersQueue = Promise.resolve();
 
-const scopeKey = (sessionId, workstream) => JSON.stringify([sessionId || null, workstream || sessionId || 'agent']);
-const displayName = (sessionId, workstream) => workstream || sessionId || 'agent';
+/** The workstream a session's plain tabs belong to: the session itself. */
+const workstreamName = (sessionId, workstream) => workstream || sessionId || 'agent';
+const scopeKey = (sessionId, workstream) => JSON.stringify([sessionId || null, workstreamName(sessionId, workstream)]);
+
+/**
+ * What the group is called on the tab strip.
+ *
+ * "harbor" for a session's ordinary tabs; "harbor · research" when the session
+ * named a sub-group. Always the session first — it is the one word that appears
+ * everywhere else (the on-page frame, the panel, every tool result), and the
+ * strip has to agree with all of them.
+ */
+export function titleFor(sessionId, workstream) {
+  const name = workstreamName(sessionId, workstream);
+  if (!sessionId || name === sessionId) return name;
+  return `${sessionId} · ${name}`;
+}
 
 async function readOwners() {
   try {
@@ -51,9 +73,16 @@ function mutateOwners(fn) {
   return run;
 }
 
-const rememberOwner = (groupId, sessionId, workstream) =>
+const rememberOwner = (groupId, sessionId, workstream, client) =>
   mutateOwners((owners) => {
-    owners[groupId] = { sessionId: sessionId || null, workstream: displayName(sessionId, workstream) };
+    const previous = owners[groupId] || {};
+    owners[groupId] = {
+      sessionId: sessionId || null,
+      workstream: workstreamName(sessionId, workstream),
+      // Which MCP client this session belongs to — display only. Kept if a
+      // later call did not carry it, so the panel never loses the name it had.
+      client: client || previous.client || null,
+    };
   });
 
 const forgetOwner = (groupId) =>
@@ -78,9 +107,8 @@ export function isSupported() {
  * one with the same title, splitting the workstream in two. Chrome is the
  * durable record; the map is only a cache in front of it.
  *
- * The title is compared here rather than passed to `query({title})`, whose
- * matching is a glob — a workstream called "checkout *" would collect its
- * neighbours.
+ * Matched on the durable owner record rather than the title, which is only
+ * presentation.
  */
 async function findGroups(sessionId, workstream, windowId) {
   const owners = await readOwners();
@@ -89,7 +117,7 @@ async function findGroups(sessionId, workstream, windowId) {
     const owner = owners[g.id];
     return (
       owner?.sessionId === (sessionId || null) &&
-      owner?.workstream === displayName(sessionId, workstream) &&
+      owner?.workstream === workstreamName(sessionId, workstream) &&
       (windowId == null || g.windowId === windowId)
     );
   });
@@ -123,6 +151,7 @@ async function findGroup(sessionId, workstream, preferWindowId) {
  * @param {number} tabId
  * @param {string} sessionId server-stamped authority boundary
  * @param {string} workstream display label, e.g. "checkout flow"
+ * @param {string} [client] the MCP client's name, recorded for the panel
  *
  * One `assign` at a time per workstream.
  *
@@ -140,17 +169,16 @@ async function findGroup(sessionId, workstream, preferWindowId) {
  */
 const assignQueues = new Map();
 
-export function assign(tabId, sessionId, workstream) {
+export function assign(tabId, sessionId, workstream, client) {
   const key = scopeKey(sessionId, workstream);
-  const run = (assignQueues.get(key) || Promise.resolve()).then(() => assignNow(tabId, sessionId, workstream));
+  const run = (assignQueues.get(key) || Promise.resolve()).then(() => assignNow(tabId, sessionId, workstream, client));
   assignQueues.set(key, run.then(() => {}, () => {}));
   return run;
 }
 
-async function assignNow(tabId, sessionId, workstream) {
+async function assignNow(tabId, sessionId, workstream, client) {
   if (!isSupported()) return null;
 
-  const name = displayName(sessionId, workstream);
   const key = scopeKey(sessionId, workstream);
 
   const tab = await chrome.tabs.get(tabId);
@@ -170,6 +198,7 @@ async function assignNow(tabId, sessionId, workstream) {
       await chrome.tabGroups.get(existing.groupId);
       await chrome.tabs.group({ tabIds: [tabId], groupId: existing.groupId });
       groups.set(key, existing);
+      if (client) await rememberOwner(existing.groupId, sessionId, workstream, client);
       return existing.groupId;
     } catch {
       groups.delete(key); // group was closed by the user; fall through
@@ -197,24 +226,24 @@ async function assignNow(tabId, sessionId, workstream) {
   const color = COLORS[colorCursor++ % COLORS.length];
 
   await chrome.tabGroups.update(groupId, {
-    title: PREFIX + name,
+    title: titleFor(sessionId, workstream),
     color,
     // Left expanded: a collapsed group hides exactly the thing this feature
     // exists to show.
     collapsed: false,
   });
 
-  await rememberOwner(groupId, sessionId, workstream);
+  await rememberOwner(groupId, sessionId, workstream, client);
   groups.set(key, { groupId, windowId: tab.windowId, color });
   return groupId;
 }
 
 /** Group several tabs into one workstream in a single call. */
-export async function assignMany(tabIds, sessionId, workstream) {
+export async function assignMany(tabIds, sessionId, workstream, client) {
   const ids = [];
   for (const tabId of tabIds) {
     try {
-      await assign(tabId, sessionId, workstream);
+      await assign(tabId, sessionId, workstream, client);
       ids.push(tabId);
     } catch {
       /* cosmetic; keep going */
@@ -232,7 +261,7 @@ export async function rename(sessionId, workstream, title) {
     const key = scopeKey(sessionId, workstream);
     const entry = groups.get(key) || (await findGroup(sessionId, workstream).then((g) => g && { groupId: g.id }));
     if (!entry) return false;
-    await chrome.tabGroups.update(entry.groupId, { title: PREFIX + title });
+    await chrome.tabGroups.update(entry.groupId, { title: titleFor(sessionId, title) });
     await rememberOwner(entry.groupId, sessionId, title);
     groups.delete(key);
     return true;
@@ -289,23 +318,29 @@ export async function closeWorkstream(sessionId, workstream) {
   }
 }
 
-/** Current workstreams and their tabs, for browser_tabs list and the panel. */
+/**
+ * Current agent groups and their tabs, for browser_tabs list and the panel.
+ *
+ * A group is an agent's if — and only if — the owner record says so. Reading
+ * the owner map rather than the `groups` cache matters for the same reason as
+ * everywhere else here: after an MV3 restart the cache is empty while the
+ * groups are still on screen, and a listing that silently omits them tells an
+ * agent its own tabs do not exist.
+ */
 export async function list() {
   if (!isSupported()) return [];
 
-  // Read from Chrome, not from the `groups` cache: after an MV3 restart the
-  // cache is empty while the groups are still on screen, and a listing that
-  // silently omits them tells an agent its own tabs do not exist.
   try {
     const out = [];
     const owners = await readOwners();
     for (const group of await chrome.tabGroups.query({})) {
-      if (!group.title?.startsWith(PREFIX)) continue; // someone else's group
+      const owner = owners[group.id];
+      if (!owner) continue; // someone else's group
       const tabs = await chrome.tabs.query({ groupId: group.id });
-      const owner = owners[group.id] || null;
       out.push({
-        name: owner?.workstream || group.title.slice(PREFIX.length),
-        sessionId: owner?.sessionId || null,
+        name: owner.workstream,
+        sessionId: owner.sessionId || null,
+        client: owner.client || null,
         title: group.title,
         color: group.color,
         groupId: group.id,
@@ -330,6 +365,9 @@ export async function list() {
  * the tab group itself does. Durable ownership metadata, not the visible title,
  * is the authority record: two sessions may use the same workstream label.
  *
+ * @param {string|null} workstream one of the session's groups, or null for every
+ *   tab the session has in any of them — which is what a call with no `group`
+ *   means: "my tab", not "my tab in the group that happens to share my name".
  * @param {number} [windowId] restrict to this window. A workstream can end up
  *   with a group in each of two windows — the user drags a tab out, or the
  *   session was rebound with `browser_window use` after it had already opened
@@ -392,7 +430,7 @@ export async function moveTo(sessionId, windowId, workstream) {
           // session's tabs along if it shares the window.
           await chrome.tabs.ungroup([tab.id]);
           await chrome.tabs.move(tab.id, { windowId, index: -1 });
-          await assign(tab.id, sessionId, owner?.workstream || workstream);
+          await assign(tab.id, sessionId, owner?.workstream || workstream, owner?.client);
           moved++;
         } catch {
           /* a pinned or otherwise immovable tab is not worth failing the bind */
@@ -406,7 +444,7 @@ export async function moveTo(sessionId, windowId, workstream) {
 }
 
 /**
- * Which workstream owns a tab, if any.
+ * Which session and workstream own a tab, if any.
  *
  * Read from Chrome for the same reason as everything else here: the in-memory
  * map is gone after an MV3 restart, and a wrong "nobody owns this" is exactly
@@ -422,6 +460,29 @@ export async function ownerFor(tabId) {
   } catch {
     return null;
   }
+}
+
+/**
+ * Owners of several tabs at once — one storage read, one groups query.
+ *
+ * For the batch forms of close/reload, which take a list of ids straight from a
+ * model and used to act on all of them unchecked. `tabId -> owner|null`; a tab
+ * that no longer exists is simply absent.
+ */
+export async function ownersFor(tabIds) {
+  const out = new Map();
+  if (!isSupported()) return out;
+  const owners = await readOwners();
+  for (const tabId of tabIds) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      const grouped = tab.groupId != null && tab.groupId !== NO_GROUP;
+      out.set(tabId, grouped ? owners[tab.groupId] || null : null);
+    } catch {
+      /* gone; the caller's own tabs.get will say so */
+    }
+  }
+  return out;
 }
 
 export async function workstreamFor(tabId) {

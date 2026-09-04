@@ -29,10 +29,21 @@ suite (73), and the overlay self-checks (12) all pass. Reload the extension at
   `!important` stylesheet transition silently disabled the silent-first-placement
   and per-move duration (`.ob-cursor` is also in `OWN_DECORATION` now, or every
   travelled click polluted the settling signal).
-- **Side panel + settings redesigned.** Panel leads with an Agents view (which
-  session drives which tabs, from the ⚡ tab groups), then Activity and Tools;
-  settings page is a System Settings-style grouped list. Both share one token
-  set in `panel.css`, light and dark.
+- **Side panel + settings redesigned.** Panel leads with an Agents view (one
+  card per agent, its client as a chip, its tabs split by sub-group — built
+  from the group-ownership map in `chrome.storage.session`), then Activity and
+  Tools; settings page is a System Settings-style grouped list. Panel, settings,
+  the toolbar badge and the on-page overlays share one palette and one motion
+  scale (`--ease`, `--dur-1/2/3` in `panel.css`), light and dark, reduced-motion
+  respected.
+- **Names are one word.** A session is `harbor`, not `claude-code · harbor`;
+  its tab group is `harbor` or `harbor · research`; no ⚡ prefix. Sixty-four
+  words, released when cleanup completes. See §5.
+- **Agents never raise a window.** `select`/`focus` switch the visible tab inside
+  an agent-only window and nothing more; `raiseWindowOnSelect` (default off) is
+  the only way back. Batch `close`/`reload`/`group` refuse another agent's tab
+  ids, and a call with no `group` resolves to the session's last tab across all
+  its groups instead of opening a blank one.
 
 ## 1. Native dialogs freeze everything ✅ fixed, verified live
 
@@ -152,16 +163,29 @@ Group labels used to read `opencode 5020`, `opencode a670` — a client name
 plus a hex slice of the pid. A human looking at the tab strip could not tell
 which was which, and the hex conveyed nothing about the work.
 
-**Fix (done).** The hub now hands out short, common, visually distinct words —
-`claude · harbor`, `opencode · meadow` — no two starting with the same letter
-so they stay separable in a narrow tab group. The identity and the label are
-separate jobs: the word is the display label, and uniqueness for tab ownership
-is guaranteed by reserving every label (whole and by its distinguishing half)
-against the browser's own record of names already in use (`__session_list`), so
-a restarted hub cannot drop a fresh session into a dead one's tabs. The agent's
-own `group` argument still wins for sub-workstreams (`opencode · reel
-uploads`). Exhausted the list? Numbered fallback (`session-2`) — ugly but
-unique, which is the property that actually matters.
+**Fix (done, reworked 2026-09-03).** The hub hands out short, common, visually
+distinct words, and the word *is* the session: `harbor`, not `claude-code ·
+harbor`. The composite was the next most confusing thing after the hex — the
+first half was the same for every session of one client and the second half was
+the only part that meant anything, and it appeared as the tab-group title, the
+frame caption, the "(you)" tag and every error at once. Now one word appears
+everywhere; the MCP client's name travels separately as `_client` and shows in
+the panel as a chip. A sub-group is `harbor · research` (agent first, so two
+agents' "research" never look like one). Sixty-four words instead of sixteen,
+and a word is released once the browser confirms the session's cleanup, so a
+day of short jobs no longer walks off the end into `session-17`. Uniqueness is
+still guaranteed by reserving every label — and the word half of any legacy
+`client · word` label — against the browser's own record of names in use
+(`__session_list`), so a restarted hub cannot drop a fresh session into a dead
+one's tabs.
+
+Windows got names too: `the agent window (id 1892374)`, `harbor's window
+(id …)`, `window 1892300 (the user's, focused)`. The id stays because `use`
+takes it; the role is what anyone actually reasons about. And `browser_tabs
+list` stopped being a flat dump of every tab: an agent sees `You are agent
+"harbor", working in the agent window`, its own tabs in full, other agents as
+`meadow (3 tabs)`, and the user's windows as counts — with twenty agents the
+old list was both expensive and the way tab ids got read off a neighbour.
 
 ### 6. Surface a "page is settling" signal ✅ fixed
 
@@ -402,7 +426,7 @@ tab silently drops CDP input".
 
 The tab-group colour only exists in the tab strip, so once you were looking at a
 page there was nothing to say whether an agent was driving it. There is now a
-persistent orange border and a caption naming the workstream
+persistent blue frame and a pill naming the agent
 (`OpenBrowser · <label>`), controlled by `showAgentBadge`.
 
 Three things about it are load-bearing:

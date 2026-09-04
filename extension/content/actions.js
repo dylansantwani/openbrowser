@@ -628,7 +628,7 @@ var OB = globalThis.OB || (globalThis.OB = {});
     title.className = 'ob-window-pick-title';
     // textContent throughout: the label is a session name, but it reaches here
     // from another process and this is a page the user is trusting.
-    title.textContent = `⚡ ${label || 'An agent'} wants to work in this window`;
+    title.textContent = `${label ? `Agent "${label}"` : 'An agent'} wants to work in this window`;
 
     const sub = document.createElement('div');
     sub.className = 'ob-window-pick-sub';

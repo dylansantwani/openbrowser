@@ -75,49 +75,106 @@ function renderStatus() {
 }
 
 /**
- * The Agents view: which sessions are driving which tabs, live.
+ * The Agents view: which agents are driving which tabs, live.
  *
- * Built from Chrome's own tab groups rather than a new message to the worker —
- * every agent workstream is a group titled with the `⚡ ` prefix (groups.js),
- * so the panel can answer "what is happening in my browser" from the tab strip
- * the agent already maintains, and stays correct even while the worker sleeps.
+ * One card per *agent* — "harbor" — with its tabs beneath, split by sub-group
+ * when it made any. Built from Chrome's own tab groups plus the ownership map
+ * `groups.js` keeps in `chrome.storage.session` (which is what makes a group an
+ * agent's — not its title), so the panel needs no worker round-trip and stays
+ * right while the worker sleeps.
  */
-const AGENT_PREFIX = '⚡ ';
+const OWNERS_KEY = 'tabGroupOwnersV2';
+const AGENT_POOL_KEY = 'agentWindowPoolV1';
 
 /** Chrome tab-group colors → swatches that read on both themes. */
 const GROUP_COLORS = {
   grey: '#8e8e93',
   blue: '#2f6fed',
-  red: '#ff453a',
-  yellow: '#ffd60a',
-  green: '#30d158',
-  pink: '#ff6482',
-  purple: '#bf5af2',
-  cyan: '#64d2ff',
-  orange: '#ff9f0a',
+  red: '#ff3b30',
+  yellow: '#ffcc00',
+  green: '#34c759',
+  pink: '#ff2d55',
+  purple: '#af52de',
+  cyan: '#32ade6',
+  orange: '#ff9500',
 };
+
+async function readSession(key) {
+  try {
+    return (await chrome.storage.session.get(key))[key];
+  } catch {
+    return undefined;
+  }
+}
+
+/** "claude-code" → "Claude Code"; what the MCP client calls itself, made readable. */
+function prettyClient(name) {
+  if (!name) return '';
+  return String(name)
+    .split(/[-_\s]+/)
+    .filter(Boolean)
+    .map((w) => (w.length <= 3 ? w.toUpperCase() : w[0].toUpperCase() + w.slice(1)))
+    .join(' ');
+}
 
 async function renderAgents() {
   const list = $('#agents-list');
   const empty = $('#agents-empty');
+  const summary = $('#agents-summary');
 
-  let groups = [];
+  let owners = {};
+  let chromeGroups = [];
+  let poolId = null;
   try {
-    groups = (await chrome.tabGroups.query({})).filter((g) => g.title?.startsWith(AGENT_PREFIX));
+    [owners, chromeGroups, poolId] = await Promise.all([
+      readSession(OWNERS_KEY).then((o) => o || {}),
+      chrome.tabGroups.query({}),
+      readSession(AGENT_POOL_KEY).then((id) => id ?? null),
+    ]);
   } catch {
     /* tabGroups can be briefly unavailable during startup */
   }
 
-  if (!groups.length) {
+  // Agent groups only, folded into one entry per session.
+  const sessions = new Map(); // sessionId -> {client, groups: [{group, owner, tabs}]}
+  await Promise.all(
+    chromeGroups.map(async (group) => {
+      const owner = owners[group.id];
+      if (!owner?.sessionId) return;
+      const tabs = await chrome.tabs.query({ groupId: group.id }).catch(() => []);
+      if (!sessions.has(owner.sessionId)) sessions.set(owner.sessionId, { client: null, groups: [] });
+      const entry = sessions.get(owner.sessionId);
+      entry.client ||= owner.client || null;
+      entry.groups.push({ group, owner, tabs });
+    })
+  );
+
+  if (!sessions.size) {
     empty.hidden = false;
+    summary.hidden = true;
     list.replaceChildren();
     return;
   }
   empty.hidden = true;
 
-  const cards = await Promise.all(
-    groups.map(async (group) => {
-      const tabs = await chrome.tabs.query({ groupId: group.id }).catch(() => []);
+  // The one-line picture: how many agents, how many tabs, where.
+  const allTabs = [...sessions.values()].flatMap((s) => s.groups.flatMap((g) => g.tabs));
+  const inPool = poolId != null && allTabs.length && allTabs.every((t) => t.windowId === poolId);
+  summary.hidden = false;
+  summary.textContent =
+    `${sessions.size} agent${sessions.size === 1 ? '' : 's'} · ${allTabs.length} tab${allTabs.length === 1 ? '' : 's'}` +
+    (inPool ? ' · in the agent window' : poolId != null ? ' · across windows' : '');
+
+  const cards = [...sessions.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([sessionId, entry]) => {
+      // The session's plain group first, then sub-groups alphabetically.
+      const ordered = entry.groups.sort((a, b) => {
+        const ap = a.owner.workstream === sessionId ? 0 : 1;
+        const bp = b.owner.workstream === sessionId ? 0 : 1;
+        return ap - bp || a.owner.workstream.localeCompare(b.owner.workstream);
+      });
+      const tabCount = ordered.reduce((n, g) => n + g.tabs.length, 0);
 
       const card = document.createElement('div');
       card.className = 'agent-card';
@@ -127,69 +184,103 @@ async function renderAgents() {
 
       const dot = document.createElement('span');
       dot.className = 'agent-dot';
-      dot.style.background = GROUP_COLORS[group.color] || GROUP_COLORS.grey;
+      dot.style.background = GROUP_COLORS[ordered[0]?.group.color] || GROUP_COLORS.grey;
 
       const name = document.createElement('span');
       name.className = 'agent-name';
-      name.textContent = group.title.slice(AGENT_PREFIX.length);
+      name.textContent = sessionId;
 
+      const meta = document.createElement('span');
+      meta.className = 'agent-meta';
+      const client = prettyClient(entry.client);
+      if (client) {
+        const chip = document.createElement('span');
+        chip.className = 'chip';
+        chip.textContent = client;
+        meta.appendChild(chip);
+      }
       const count = document.createElement('span');
       count.className = 'agent-count';
-      count.textContent = `${tabs.length} tab${tabs.length === 1 ? '' : 's'}`;
+      count.textContent = `${tabCount} tab${tabCount === 1 ? '' : 's'}`;
+      meta.appendChild(count);
 
-      head.append(dot, name, count);
+      head.append(dot, name, meta);
+      card.appendChild(head);
 
-      const ul = document.createElement('ul');
-      ul.className = 'agent-tabs';
-
-      for (const tab of tabs) {
-        const li = document.createElement('li');
-        li.className = 'agent-tab';
-        li.title = tab.url || '';
-
-        const host = shortUrl(tab.url || tab.pendingUrl || '');
-        let fav;
-        if (tab.favIconUrl && /^https?:/.test(tab.favIconUrl)) {
-          fav = document.createElement('img');
-          fav.className = 'tab-fav';
-          fav.src = tab.favIconUrl;
-          fav.alt = '';
-        } else {
-          fav = document.createElement('span');
-          fav.className = 'tab-fav tab-fav--letter';
-          fav.textContent = (host[0] || '?').toUpperCase();
+      for (const { group, owner, tabs } of ordered) {
+        if (owner.workstream !== sessionId) {
+          const sub = document.createElement('div');
+          sub.className = 'agent-subgroup';
+          const subDot = document.createElement('span');
+          subDot.className = 'agent-dot agent-dot--sm';
+          subDot.style.background = GROUP_COLORS[group.color] || GROUP_COLORS.grey;
+          const subName = document.createElement('span');
+          subName.textContent = owner.workstream;
+          sub.append(subDot, subName);
+          card.appendChild(sub);
         }
 
-        const text = document.createElement('div');
-        text.className = 'tab-text';
-
-        const title = document.createElement('div');
-        title.className = 'tab-title';
-        title.textContent = tab.title || '(untitled)';
-
-        const url = document.createElement('div');
-        url.className = 'tab-host';
-        url.textContent = host;
-
-        text.append(title, url);
-        li.append(fav, text);
-
-        // A human clicking a row is the deliberate "show me" — the one case
-        // where bringing an agent's window forward is the point.
-        li.addEventListener('click', async () => {
-          await chrome.tabs.update(tab.id, { active: true }).catch(() => {});
-          await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
-        });
-
-        ul.appendChild(li);
+        const ul = document.createElement('ul');
+        ul.className = 'agent-tabs';
+        for (const tab of tabs) ul.appendChild(tabRow(tab));
+        card.appendChild(ul);
       }
 
-      card.append(head, ul);
       return card;
-    })
-  );
+    });
 
   list.replaceChildren(...cards);
+}
+
+function tabRow(tab) {
+  const li = document.createElement('li');
+  li.className = 'agent-tab';
+  li.title = tab.url || '';
+
+  const host = shortUrl(tab.url || tab.pendingUrl || '');
+  let fav;
+  if (tab.favIconUrl && /^https?:/.test(tab.favIconUrl)) {
+    fav = document.createElement('img');
+    fav.className = 'tab-fav';
+    fav.src = tab.favIconUrl;
+    fav.alt = '';
+  } else {
+    fav = document.createElement('span');
+    fav.className = 'tab-fav tab-fav--letter';
+    fav.textContent = (host[0] || '?').toUpperCase();
+  }
+
+  const text = document.createElement('div');
+  text.className = 'tab-text';
+
+  const title = document.createElement('div');
+  title.className = 'tab-title';
+  title.textContent = tab.title || '(untitled)';
+
+  const url = document.createElement('div');
+  url.className = 'tab-host';
+  url.textContent = host || 'blank';
+
+  text.append(title, url);
+  li.append(fav, text);
+
+  if (tab.active) {
+    const showing = document.createElement('span');
+    showing.className = 'tab-showing';
+    showing.textContent = 'showing';
+    showing.title = 'The visible tab in its window';
+    li.appendChild(showing);
+  }
+
+  // A human clicking a row is the deliberate "show me" — the one case where
+  // bringing an agent's window forward is the point. Agents themselves can
+  // never do this (see `raiseWindowOnSelect` in settings.js).
+  li.addEventListener('click', async () => {
+    await chrome.tabs.update(tab.id, { active: true }).catch(() => {});
+    await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
+  });
+
+  return li;
 }
 
 /** Coalesce the burst of tab events an agent produces into one re-render. */
@@ -321,6 +412,7 @@ async function withOutput(title, fn) {
   const panel = $('#output-panel');
   panel.hidden = false;
   panel.classList.remove('is-error');
+  panel.classList.add('is-busy');
   $('#output-title').textContent = title;
   $('#output-meta').textContent = '';
   $('#output-image').hidden = true;
@@ -343,6 +435,8 @@ async function withOutput(title, fn) {
     panel.classList.add('is-error');
     $('#output').textContent = err.message;
     $('#output-meta').textContent = 'failed';
+  } finally {
+    panel.classList.remove('is-busy');
   }
 
   panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
@@ -353,7 +447,16 @@ async function withOutput(title, fn) {
 // -----------------------------------------------------------------------------
 
 function wire() {
-  // View switching.
+  // View switching. The segmented control's thumb is one element that slides
+  // to the active segment, so switching reads as one motion rather than two
+  // buttons swapping styles.
+  const segmented = $('.segmented');
+  const moveThumb = () => {
+    const active = $('.seg.is-active');
+    if (!active || !segmented) return;
+    segmented.style.setProperty('--thumb-x', `${active.offsetLeft}px`);
+    segmented.style.setProperty('--thumb-w', `${active.offsetWidth}px`);
+  };
   $$('.seg').forEach((seg) => {
     seg.addEventListener('click', () => {
       $$('.seg').forEach((s) => {
@@ -361,9 +464,21 @@ function wire() {
         s.classList.toggle('is-active', on);
         s.setAttribute('aria-selected', String(on));
       });
-      $$('.view').forEach((v) => v.classList.toggle('is-active', v.id === `view-${seg.dataset.view}`));
+      $$('.view').forEach((v) => {
+        const on = v.id === `view-${seg.dataset.view}`;
+        v.classList.toggle('is-active', on);
+        // Restart the enter animation on the view that just became visible.
+        if (on) {
+          v.style.animation = 'none';
+          void v.offsetWidth;
+          v.style.animation = '';
+        }
+      });
+      moveThumb();
     });
   });
+  addEventListener('resize', moveThumb);
+  requestAnimationFrame(moveThumb);
 
   $('#connection').addEventListener('click', async () => {
     const connected = state.bridge.status === 'connected';
@@ -466,12 +581,18 @@ function wire() {
 
   chrome.tabs?.onCreated?.addListener(scheduleAgents);
   chrome.tabs?.onRemoved?.addListener(scheduleAgents);
+  chrome.tabs?.onActivated?.addListener(scheduleAgents);
   chrome.tabs?.onUpdated?.addListener((_id, info) => {
-    if (info.status === 'complete' || info.title || info.groupId != null) scheduleAgents();
+    if (info.status === 'complete' || info.title || info.groupId != null || info.favIconUrl) scheduleAgents();
   });
   chrome.tabGroups?.onCreated?.addListener(scheduleAgents);
   chrome.tabGroups?.onUpdated?.addListener(scheduleAgents);
   chrome.tabGroups?.onRemoved?.addListener(scheduleAgents);
+  // Ownership is what makes a group an agent's, so a change there is a change
+  // to what this view shows even when no tab moved.
+  chrome.storage?.onChanged?.addListener((changes, area) => {
+    if (area === 'session' && (changes[OWNERS_KEY] || changes[AGENT_POOL_KEY])) scheduleAgents();
+  });
 }
 
 // -----------------------------------------------------------------------------
@@ -481,6 +602,7 @@ function wire() {
 function shortUrl(url) {
   try {
     const u = new URL(url);
+    if (u.protocol === 'about:') return '';
     return `${u.hostname.replace(/^www\./, '')}${u.pathname === '/' ? '' : u.pathname}`;
   } catch {
     return url;

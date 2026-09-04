@@ -151,9 +151,9 @@ export async function boundWindowId(label) {
  * The window this session was given for itself, or null if it is working in one
  * that belongs to somebody else.
  *
- * The caller that matters is `ensureForeground`: activating a tab is invisible
- * inside a window the session owns and is a takeover anywhere else, and this is
- * the only thing that can tell those apart.
+ * Distinguishes a window opened *for* this one session from every other kind,
+ * the shared agent window included. See `agentWindowIdFor` for the question
+ * most callers actually have.
  */
 export async function ownWindowId(label) {
   if (!label) return null;
@@ -170,7 +170,54 @@ export async function ownWindowId(label) {
 }
 
 /**
- * Normal browser windows, each with the tabs it holds.
+ * The session's window, if no human is in it — its own, or the shared agent
+ * window. Null when the session is sharing a window with the user.
+ *
+ * This is the question `select` and `focus` ask: switching the visible tab is
+ * invisible in a window that holds only agents and is a takeover in one a
+ * person is reading, and nothing about a window id says which kind it is. The
+ * pooled agent window is recorded as `agent` rather than `own` because it holds
+ * several sessions, but for this purpose it is the same kind of place: nobody
+ * is typing into it.
+ */
+export async function agentWindowIdFor(label) {
+  if (!label) return null;
+  const entry = (await readBindings())[label];
+  if (!isOwn(entry) && !isAgent(entry)) return null;
+  const id = idOf(entry);
+  try {
+    await chrome.windows.get(id);
+    return id;
+  } catch {
+    await unbind(label);
+    return null;
+  }
+}
+
+const isAgent = (entry) => !!(entry && typeof entry === 'object' && entry.agent);
+
+/**
+ * The shared agent window, if it exists right now. Null otherwise.
+ *
+ * Verified against Chrome like every other id read from storage — the user can
+ * close the agent window at any moment, and the next session simply opens a
+ * fresh one.
+ */
+export async function agentWindowId() {
+  try {
+    const id = (await chrome.storage.session.get(AGENT_POOL_KEY))[AGENT_POOL_KEY];
+    if (id == null) return null;
+    await chrome.windows.get(id);
+    return id;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Normal browser windows, each with the tabs it holds and what kind of window
+ * it is: the shared `agent` window, a window `own`ed by one session, or one of
+ * the user's.
  *
  * Filtered here rather than by `getAll({windowTypes})`, which is deprecated —
  * and the filter matters either way: devtools windows and popups are windows as
@@ -178,14 +225,41 @@ export async function ownWindowId(label) {
  * agent inside a devtools panel is offering them a mistake.
  */
 export async function listWindows() {
-  const wins = await chrome.windows.getAll({ populate: true });
+  const [wins, poolId, bindings] = await Promise.all([
+    chrome.windows.getAll({ populate: true }),
+    agentWindowId(),
+    readBindings(),
+  ]);
+  const ownedBy = new Map();
+  for (const [label, entry] of Object.entries(bindings)) {
+    if (isOwn(entry)) ownedBy.set(idOf(entry), label);
+  }
   return wins
     .filter((w) => w.type == null || w.type === 'normal')
     .map((w) => ({
       windowId: w.id,
       focused: !!w.focused,
       tabs: w.tabs || [],
+      agent: poolId != null && w.id === poolId,
+      own: ownedBy.get(w.id) || null,
     }));
+}
+
+/**
+ * What a window is called in prose — the one thing that made window output
+ * unreadable was a bare Chrome id and nothing else.
+ *
+ *   "the agent window (id 1892374)"   the shared background window
+ *   "harbor's window (id 1892375)"    a window opened for one session
+ *   "window 1892300 (the user's)"     anything else
+ *
+ * The id stays, because it is what `action:"use" windowId:` takes; the role is
+ * what a human or a model actually reasons about.
+ */
+export function windowName(win) {
+  if (win.agent) return `the agent window (id ${win.windowId})`;
+  if (win.own) return `${win.own}'s window (id ${win.windowId})`;
+  return `window ${win.windowId} (the user's${win.focused ? ', focused' : ''})`;
 }
 
 /** One line per window: enough for a human to recognise which is which. */
@@ -195,8 +269,8 @@ function describe(win, index) {
     .map((t) => (t.title || t.url || '').replace(/\s+/g, ' ').slice(0, 28))
     .filter(Boolean);
   const more = win.tabs.length > 4 ? `, +${win.tabs.length - 4} more` : '';
-  return `  ${index} · window ${win.windowId}${win.focused ? ' (focused)' : ''}  ` +
-    `(${win.tabs.length} tab${win.tabs.length === 1 ? '' : 's'}) ${titles.join(', ')}${more}`;
+  return `  ${index} · ${windowName(win)} · ` +
+    `${win.tabs.length} tab${win.tabs.length === 1 ? '' : 's'}${titles.length ? `: ${titles.join(', ')}${more}` : ''}`;
 }
 
 /**
@@ -209,7 +283,7 @@ function describe(win, index) {
  */
 function chooserError(label, wins) {
   return new Error(
-    `${wins.length} browser windows are open — ask the user which one "${label}" should work in. ` +
+    `${wins.length} browser windows are open — ask the user which one agent "${label}" should work in. ` +
       'Nothing has been opened yet.\n' +
       wins.map((w, i) => describe(w, i + 1)).join('\n') +
       `\n  ${wins.length + 1} · a new window, so this session shares none of them  →  browser_window action:"new"` +
@@ -366,7 +440,7 @@ export async function use(label, windowId) {
   } catch {
     const wins = await listWindows();
     throw new Error(
-      `there is no window ${windowId}. Open windows:\n${wins.map((w, i) => describe(w, i + 1)).join('\n')}`
+      `there is no window with id ${windowId}. Open windows:\n${wins.map((w, i) => describe(w, i + 1)).join('\n')}`
     );
   }
   await bind(label, windowId);
@@ -671,7 +745,10 @@ chrome.windows.onRemoved.addListener((windowId) => {
   }).catch(() => {});
 });
 
-/** Bound windows, for the side panel and `browser_window action:"list"`. */
+/**
+ * Every window with the sessions bound to it, for the side panel and
+ * `browser_window action:"list"`.
+ */
 export async function summary() {
   const all = await readBindings();
   const wins = await listWindows();

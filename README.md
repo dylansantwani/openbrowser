@@ -314,9 +314,10 @@ Server flags (`node mcp-server/src/index.js …`, or the matching env var):
 
 The MCP server speaks stdio to your client and WebSocket to the extension. The
 first server to start binds the hub port; later ones join it. So several agents
-can share one browser — an editor agent and a CLI agent can work in the same
-session without fighting over it, because each session is bound to its own window
-and tab group.
+can share one browser — an editor agent and a CLI agent can work side by side
+without fighting over it, because each session gets a name of its own (`harbor`),
+owns only the tabs in its own tab group, and works in a shared background agent
+window that nothing it does can bring in front of you.
 
 Everything is local. Nothing leaves your machine except the pages you ask it to
 visit.

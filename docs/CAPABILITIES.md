@@ -27,31 +27,45 @@ that would normally be a dozen sequential calls is one.
 
 **Reading parallelises; typing and clicking do not.** Snapshots, finds, evals and
 screenshots all work on hidden tabs, so the example above is genuinely
-concurrent. Trusted input is different: Chrome silently discards mouse and key
-events aimed at a tab that is not visible, so `browser_act` and `browser_input`
-foreground their tab first — and only one tab per window can be foreground.
-Input across several tabs therefore serialises. That is a Chrome constraint, not
-a design choice; the alternative is clicks that report success and do nothing,
-which is what happened before it was found. Put the tabs in separate windows if
-you genuinely need concurrent input.
+concurrent. Trusted input is addressed to a tab directly through the debugger
+and lands on a background tab without bringing anything forward; mutations on
+one tab are serialised so two agents cannot interleave keystrokes on it, and
+different tabs stay parallel. When a tab is genuinely hidden — a fully covered
+window, a native-fullscreen app on its own Space — Chrome drops the input, and
+the result says `UNVERIFIED … dispatched` rather than claiming success.
 
 Each tab an agent **opens** goes into a coloured Chrome tab group named after
-the workstream, so a human watching the tab strip sees three labelled jobs
-rather than an undifferentiated wall — and can tell at a glance which group is
-safe to close. Several agents can share one browser and stay legible to each
-other.
+the agent, so a human watching the tab strip sees three named agents rather
+than an undifferentiated wall — and can tell at a glance which group is safe to
+close. Several agents can share one browser and stay legible to each other.
 
-Groups are named `client · word` — `claude · harbor`, `opencode · meadow`. The
-word is allocated by the hub, which is the only place that can see every live
-session, so two sessions can never be handed the same one. That matters for
-more than readability: the label is also what scopes a session to its own tabs.
+**An agent is its name.** The hub hands each session one short word — `harbor`,
+`meadow`, `falcon` — from a list of sixty-four, and that word is what appears on
+the tab group, in the caption on every page it drives, in the side panel, and in
+every tool result the agent reads. An agent that splits its work with `group`
+gets a sub-group titled `harbor · research`: the agent first, always, so two
+agents both calling something "research" never look like one job. The hub is
+the only place that can see every live session, so two can never be handed the
+same word, and a word is given back only once the browser confirms that
+session's tabs are tidied. Which MCP client an agent belongs to (Claude Code,
+opencode, Cursor) shows in the side panel as a chip; it is not part of the name.
 
-**A session owns only the tabs it opened. Yours stay yours.** A call that omits
-`tabId` goes to the tab that session is already working on. Failing that it uses
-the active tab — but if another session *opened* that tab for its own task, the
-call is refused rather than silently taking it over. Tabs you opened are never
-labelled or claimed, so any session can work on the page you are looking at, and
-a finished session never leaves one locked.
+**Agents work in one shared background "agent window".** It is opened once,
+unfocused, and put back behind whatever you were looking at. Every agent's tabs
+go there; your own windows are never used unless you turn the background window
+off. Nothing an agent can call brings that window in front of you —
+`browser_tabs action:"select"` and `browser_window focus` only change which tab
+is showing *inside* it. Click a tab in the side panel when you want to look.
+
+**An agent owns only its tabs, and sees only its tabs.** A call that omits
+`tabId` goes to the tab that agent last worked on, in any of its groups, and
+opens one if it has none — never the tab you happen to be looking at, and never
+another agent's. `browser_tabs action:"list"` shows an agent its own tabs in
+full and everyone else as counts (`meadow (3 tabs)`); the user's windows are
+counted, not listed. Passing another agent's tab id — to act on it, close it,
+reload it, or group it — is refused. To hand an agent one of *your* pages, pass
+its `tabId` explicitly; it then joins that agent's tabs, and goes back to being
+an ordinary tab of yours when the agent is done.
 
 **A session tidies up after itself.** When its MCP client disconnects, the tabs
 that session *opened* are closed. Tabs it adopted from you are never closed —

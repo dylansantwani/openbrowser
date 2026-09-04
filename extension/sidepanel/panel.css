@@ -2,9 +2,22 @@
  * OpenBrowser side panel.
  *
  * Design language: Apple HIG-flavored — system font stack, inset grouped
- * cards, hairline separators, one accent. The accent is the same blue the
- * on-page overlays use (#2f6fed → #4f83f0 in dark), so the panel and the
- * marks an agent draws on pages read as one product.
+ * cards, hairline separators, one accent. Every surface OpenBrowser draws —
+ * this panel, the settings page, the toolbar badge, and the marks it puts on
+ * pages (content/overlay.css) — shares the palette and the motion scale
+ * declared in the token block below, so the whole thing reads as one product
+ * rather than three.
+ *
+ *   accent  #2f6fed  the one hue: cursor, ripple, highlight, the on-page
+ *                    frame and its caption, the window prompt, primary buttons,
+ *                    focus rings, links. On the page, weight carries meaning —
+ *                    translucent for the ambient frame, solid for "here, now".
+ *   ok/warn/err  #34c759 / #ff9500 / #ff3b30  connection status only.
+ *
+ * Motion: one easing curve and three durations. 140ms for hover/press, 240ms
+ * for anything that moves or appears, 900ms for a mark that fades on its own.
+ * `overlay.css` uses the same numbers (it cannot read these variables — it is
+ * injected into other people's pages).
  *
  * Light and dark follow the OS. Every color is a token; nothing is hardcoded
  * below the token block, so the theme stays coherent when it changes.
@@ -12,7 +25,10 @@
 
 :root {
   --accent: #2f6fed;
+  --accent-2: #4f83f0;
+  --accent-3: #2456c4;
   --accent-tint: rgba(47, 111, 237, 0.12);
+  --accent-glow: rgba(47, 111, 237, 0.3);
   --on-accent: #ffffff;
 
   --bg: #f2f2f7;
@@ -26,20 +42,32 @@
 
   --ok: #34c759;
   --warn: #ff9500;
+  --warn-tint: rgba(255, 149, 0, 0.14);
   --err: #ff3b30;
 
-  --seg-bg: rgba(118, 118, 128, 0.12);
+  --fill: rgba(118, 118, 128, 0.12);
+  --fill-hover: rgba(118, 118, 128, 0.2);
+  --seg-bg: var(--fill);
   --seg-active: #ffffff;
   --seg-shadow: 0 1px 4px rgba(0, 0, 0, 0.12), 0 0 1px rgba(0, 0, 0, 0.04);
 
   --radius: 12px;
+  --radius-sm: 8px;
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+
+  --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --dur-1: 140ms;
+  --dur-2: 240ms;
+  --dur-3: 900ms;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
     --accent: #4f83f0;
+    --accent-2: #6f9bf3;
+    --accent-3: #2f6fed;
     --accent-tint: rgba(79, 131, 240, 0.18);
+    --accent-glow: rgba(79, 131, 240, 0.35);
 
     --bg: #1c1c1e;
     --card: #2c2c2e;
@@ -52,9 +80,11 @@
 
     --ok: #30d158;
     --warn: #ff9f0a;
+    --warn-tint: rgba(255, 159, 10, 0.18);
     --err: #ff453a;
 
-    --seg-bg: rgba(118, 118, 128, 0.24);
+    --fill: rgba(118, 118, 128, 0.24);
+    --fill-hover: rgba(118, 118, 128, 0.34);
     --seg-active: #636366;
     --seg-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
 
@@ -82,6 +112,52 @@ body {
   flex-direction: column;
 }
 
+/* ── Shared motion ───────────────────────────────────────────────────────── */
+
+/* Everything interactive transitions the same properties on the same clock. */
+button,
+.status,
+.agent-tab,
+input[type='text'],
+input[type='number'],
+select,
+textarea {
+  transition:
+    background-color var(--dur-1) var(--ease),
+    color var(--dur-1) var(--ease),
+    border-color var(--dur-1) var(--ease),
+    box-shadow var(--dur-1) var(--ease),
+    opacity var(--dur-1) var(--ease),
+    transform var(--dur-1) var(--ease);
+}
+
+button:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+button:focus-visible,
+.status:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2.5px var(--accent-tint), 0 0 0 1px var(--accent);
+}
+
+@keyframes ob-rise {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes ob-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
 /* ── Header ──────────────────────────────────────────────────────────────── */
 
 .topbar {
@@ -104,7 +180,7 @@ body {
   height: 22px;
   flex: none;
   border-radius: 6px;
-  background: linear-gradient(135deg, #4f83f0, #2f6fed 60%, #2456c4);
+  background: linear-gradient(135deg, var(--accent-2), var(--accent) 60%, var(--accent-3));
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.18);
   position: relative;
 }
@@ -144,13 +220,13 @@ body {
   font: 500 11.5px/1 inherit;
   font-family: inherit;
   color: var(--text-2);
-  background: var(--seg-bg);
+  background: var(--fill);
   cursor: pointer;
   white-space: nowrap;
 }
 
 .status:hover {
-  filter: brightness(0.97);
+  background: var(--fill-hover);
 }
 
 .status-dot {
@@ -159,11 +235,15 @@ body {
   border-radius: 50%;
   background: var(--text-3);
   flex: none;
+  transition: background-color var(--dur-2) var(--ease);
 }
 
 .status--connected {
   color: var(--ok);
   background: color-mix(in srgb, var(--ok) 14%, transparent);
+}
+.status--connected:hover {
+  background: color-mix(in srgb, var(--ok) 22%, transparent);
 }
 .status--connected .status-dot {
   background: var(--ok);
@@ -171,17 +251,11 @@ body {
 
 .status--connecting {
   color: var(--warn);
-  background: color-mix(in srgb, var(--warn) 14%, transparent);
+  background: var(--warn-tint);
 }
 .status--connecting .status-dot {
   background: var(--warn);
-  animation: ob-pulse 1.1s ease-in-out infinite;
-}
-
-@keyframes ob-pulse {
-  50% {
-    opacity: 0.35;
-  }
+  animation: ob-pulse 1.1s var(--ease) infinite;
 }
 
 .icon-btn {
@@ -192,7 +266,7 @@ body {
   height: 28px;
   border: none;
   border-radius: 50%;
-  background: var(--seg-bg);
+  background: var(--fill);
   color: var(--text-2);
   cursor: pointer;
   padding: 0;
@@ -200,12 +274,17 @@ body {
 
 .icon-btn:hover {
   color: var(--text);
+  background: var(--fill-hover);
 }
 
 .icon-btn--sm {
   width: 22px;
   height: 22px;
   background: transparent;
+}
+
+.icon-btn--sm:hover {
+  background: var(--fill);
 }
 
 /* ── Callout (server missing) ────────────────────────────────────────────── */
@@ -217,6 +296,7 @@ body {
   background: color-mix(in srgb, var(--warn) 10%, var(--card));
   border: 0.5px solid color-mix(in srgb, var(--warn) 35%, transparent);
   font-size: 12px;
+  animation: ob-rise var(--dur-2) var(--ease);
 }
 
 .callout p {
@@ -236,14 +316,35 @@ body {
 /* ── Segmented control ───────────────────────────────────────────────────── */
 
 .segmented {
+  position: relative;
   display: flex;
   margin: 2px 16px 12px;
   padding: 2px;
   border-radius: 9px;
   background: var(--seg-bg);
+  isolation: isolate;
+}
+
+/* One thumb that slides, rather than two segments swapping paint. */
+.segmented::before {
+  content: '';
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  left: var(--thumb-x, 2px);
+  width: var(--thumb-w, 0);
+  border-radius: 7px;
+  background: var(--seg-active);
+  box-shadow: var(--seg-shadow);
+  transition:
+    left var(--dur-2) var(--ease),
+    width var(--dur-2) var(--ease);
+  z-index: 0;
 }
 
 .seg {
+  position: relative;
+  z-index: 1;
   flex: 1;
   border: none;
   border-radius: 7px;
@@ -253,14 +354,19 @@ body {
   color: var(--text-2);
   background: transparent;
   cursor: pointer;
-  transition: background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.seg:hover {
+  color: var(--text);
 }
 
 .seg.is-active {
-  background: var(--seg-active);
   color: var(--text);
-  box-shadow: var(--seg-shadow);
   font-weight: 600;
+}
+
+.seg:active:not(:disabled) {
+  transform: none;
 }
 
 /* ── Layout ──────────────────────────────────────────────────────────────── */
@@ -281,6 +387,7 @@ main {
 
 .view.is-active {
   display: flex;
+  animation: ob-rise var(--dur-2) var(--ease);
 }
 
 /* ── Cards ───────────────────────────────────────────────────────────────── */
@@ -323,6 +430,16 @@ main {
   white-space: nowrap;
 }
 
+.chip {
+  display: inline-block;
+  font: 500 10.5px/1 inherit;
+  color: var(--text-2);
+  background: var(--fill);
+  border-radius: 999px;
+  padding: 3px 7px;
+  white-space: nowrap;
+}
+
 .muted {
   color: var(--text-2);
   font-size: 12px;
@@ -334,6 +451,7 @@ main {
   text-align: center;
   padding: 44px 24px 8px;
   color: var(--text-2);
+  animation: ob-rise var(--dur-2) var(--ease);
 }
 
 .empty-icon {
@@ -354,6 +472,12 @@ main {
   max-width: 240px;
 }
 
+.agents-summary {
+  margin: -4px 2px 0;
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+
 #agents-list {
   display: flex;
   flex-direction: column;
@@ -365,6 +489,7 @@ main {
   border-radius: var(--radius);
   box-shadow: var(--shadow);
   overflow: hidden;
+  animation: ob-rise var(--dur-2) var(--ease);
 }
 
 .agent-head {
@@ -379,10 +504,16 @@ main {
   height: 9px;
   border-radius: 50%;
   flex: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, currentColor 0%, var(--card));
+}
+
+.agent-dot--sm {
+  width: 6px;
+  height: 6px;
 }
 
 .agent-name {
-  font-size: 13px;
+  font-size: 13.5px;
   font-weight: 600;
   letter-spacing: -0.01em;
   flex: 1;
@@ -392,10 +523,30 @@ main {
   white-space: nowrap;
 }
 
+.agent-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+
 .agent-count {
   font-size: 11px;
   color: var(--text-3);
   flex: none;
+}
+
+.agent-subgroup {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 14px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--text-2);
+  border-top: 0.5px solid var(--sep);
 }
 
 .agent-tabs {
@@ -413,8 +564,16 @@ main {
   border-top: 0.5px solid var(--sep);
 }
 
+.agent-subgroup + .agent-tabs > .agent-tab:first-child {
+  border-top: none;
+}
+
 .agent-tab:hover {
   background: var(--accent-tint);
+}
+
+.agent-tab:active {
+  background: color-mix(in srgb, var(--accent) 20%, transparent);
 }
 
 .tab-fav {
@@ -431,7 +590,7 @@ main {
   justify-content: center;
   font: 600 9px/1 inherit;
   color: var(--text-2);
-  background: var(--seg-bg);
+  background: var(--fill);
 }
 
 .tab-text {
@@ -454,6 +613,15 @@ main {
   white-space: nowrap;
 }
 
+.tab-showing {
+  flex: none;
+  font: 500 10px/1 inherit;
+  color: var(--accent);
+  background: var(--accent-tint);
+  border-radius: 999px;
+  padding: 3px 6px;
+}
+
 /* ── Rows (activity, macros) ─────────────────────────────────────────────── */
 
 .rows {
@@ -472,6 +640,10 @@ main {
 
 .rows > li:first-child {
   border-top: none;
+}
+
+.activity-item {
+  animation: ob-rise var(--dur-2) var(--ease);
 }
 
 .empty-row {
@@ -518,6 +690,7 @@ main {
   font-size: 10.5px;
   color: var(--text-3);
   flex: none;
+  font-variant-numeric: tabular-nums;
 }
 
 .macro-item-body {
@@ -571,18 +744,18 @@ main {
 
 .btn {
   border: none;
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   padding: 7px 13px;
   font: 500 12.5px/1.2 inherit;
   font-family: inherit;
   color: var(--text);
-  background: var(--seg-bg);
+  background: var(--fill);
   cursor: pointer;
   white-space: nowrap;
 }
 
 .btn:hover {
-  filter: brightness(0.97);
+  background: var(--fill-hover);
 }
 
 .btn--primary {
@@ -592,7 +765,7 @@ main {
 }
 
 .btn--primary:hover {
-  filter: brightness(1.06);
+  background: var(--accent-2);
 }
 
 .link-btn {
@@ -603,6 +776,15 @@ main {
   font-family: inherit;
   color: var(--accent);
   cursor: pointer;
+}
+
+.link-btn:hover {
+  color: var(--accent-3);
+}
+
+.link-btn:active:not(:disabled) {
+  transform: none;
+  opacity: 0.7;
 }
 
 .row-btn {
@@ -708,6 +890,10 @@ textarea {
 
 /* ── Output ──────────────────────────────────────────────────────────────── */
 
+.output {
+  animation: ob-rise var(--dur-2) var(--ease);
+}
+
 .output pre {
   margin: 0;
   font: 400 11px/1.5 ui-monospace, 'SF Mono', SFMono-Regular, Menlo, monospace;
@@ -716,6 +902,11 @@ textarea {
   max-height: 300px;
   overflow: auto;
   color: var(--text);
+  transition: opacity var(--dur-1) var(--ease);
+}
+
+.output.is-busy pre {
+  opacity: 0.55;
 }
 
 .output.is-error pre {
@@ -724,7 +915,7 @@ textarea {
 
 #output-image {
   max-width: 100%;
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   margin-bottom: 8px;
   border: 0.5px solid var(--hairline);
 }
@@ -740,7 +931,19 @@ textarea {
 
 code {
   font: 500 11px/1.4 ui-monospace, 'SF Mono', SFMono-Regular, Menlo, monospace;
-  background: var(--seg-bg);
+  background: var(--fill);
   border-radius: 4px;
   padding: 1px 4px;
+}
+
+/* ── Motion preference ───────────────────────────────────────────────────── */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }
