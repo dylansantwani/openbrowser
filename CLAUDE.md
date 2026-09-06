@@ -138,7 +138,7 @@ of every task.
 
 Guard rails already in place:
 
-- `test/run.mjs` asserts the tool schemas stay under 14.1KB. They ship on every
+- `test/run.mjs` asserts the tool schemas stay under 17.4KB. They ship on every
   request. Raise it only for guidance that demonstrably prevents a failed call —
   never to make room for prose. The comment there records every time it moved
   and what failure each raise bought.
@@ -709,14 +709,64 @@ was reported `UNVERIFIED: no page change was detected` while the result header
 being "fixed and verified live", because the fix was still a read-back with a
 smaller window. The verdict now consults an event record instead: a top-level
 `webNavigation.onCommitted` listener stamps `navCommits` per tab, `withDelta`
-checks it (`navSince`) with no timing window at all, and `browser_act` rechecks
-it once more after the settling probe's 500ms wait before calling anything
-unverified. If you touch outcome reporting, keep both checks; `test/run.mjs`
-asserts they exist.
+checks it (`navSince`) with no timing window at all, and `awaitSettled` waits
+for a commit whenever `onBeforeNavigate` says one is coming before any verdict
+is formed. If you touch outcome reporting, keep both; `test/run.mjs` asserts
+they exist.
 
 **`element.click()` is ignored by serious sites.** It produces `isTrusted:
 false`. Everything pointer-related goes through CDP's Input domain for this
 reason. If you are tempted to "simplify" by using `.click()`, don't.
+
+**A fixed sleep after a click is wrong in both directions, and it was most of
+the click's cost.** `settle(350)` after every pointer action plus a 500ms
+`settling` probe when nothing changed made a dead click cost ~900ms and a live
+one wait long after the app had finished — and a slow server still committed
+its navigation after the window closed, which is how a real navigation got
+reported UNVERIFIED. `awaitSettled` (router.js) replaces both: the page's
+`settled` handler (content/main.js) resolves when the DOM has mutated and gone
+quiet for 120ms, when nothing has mutated within 250ms, or at a 700ms ceiling
+with the page still moving — driven by the tree's own mutation counter, so the
+cursor ripple and highlight box do not count and typed input does. In parallel
+`webNavigation.onBeforeNavigate` records that a click sent the browser
+somewhere, and a start with no commit yet is waited for (bounded) rather than
+called "nothing". Measured live: a dead click 900ms → ~300ms; a link click
+returns the moment its document commits. The three windows are settings. If
+you are tempted to add a sleep after an action, the settle already waited; put
+the expectation in `expect` instead.
+
+**Trusted input to a hidden tab is not just dropped, it is slow.** A tab that
+is not the visible one in its window (the agent window's other tabs, above all)
+acks `Input.dispatchMouseEvent` about three seconds late per event — a click
+took six seconds and a wheel event hung a batch for ninety — and the input
+mostly does not land. Nothing in this project can fix that from outside; what
+it does is report `UNVERIFIED` honestly. When driving or measuring several
+tabs, `browser_tabs action:"select"` the one you are about to act on (it raises
+no window). A session whose first tab was left blank makes every later tab
+hidden, which is exactly how one verification run measured everything wrong.
+
+**Every step of a batch used to pay for a delta nobody read.** `withDelta` built
+the interactive tree after every action so the result could say what changed;
+inside a batch only the last result is returned, so the intermediate diffs were
+computed and discarded — up to the 3s budget each on a large app. The planner
+(`batch.js`) stamps `_quiet` on every step but the last and `withDelta` skips
+the diff for it; navigation and new-tab detection stay on, because the next
+step needs them. `returnEach` turns quiet off.
+
+**Batch control flow is declarative on purpose.** `when` / `unless` / `repeat`
+/ nested `steps` give a model loops and branches inside one call — the shape
+Astra's code-execution path gets from letting the model write Playwright — but
+nothing a model writes is ever evaluated here: conditions are browser_wait's
+vocabulary answered by the page's `check` handler, and the planner is a pure
+function with hard ceilings (50 repeats, 500 tool calls, 3 levels). It is
+tested without Chrome for that reason; keep it pure.
+
+**A job is a promise in this worker and nothing more.** `browser_batch
+async:true` registers the running batch in `jobs.js` — in memory, deliberately:
+the worker's socket heartbeat keeps it alive while a job runs, and a record in
+storage would only ever describe a job that no longer exists after a recycle.
+Jobs are scoped to the session that started them, and `for:"job"` runs before
+tab resolution so collecting one never opens a blank tab.
 
 ---
 
@@ -726,6 +776,8 @@ reason. If you are tempted to "simplify" by using `.click()`, don't.
 extension/
   background/         service worker — no durable state
     router.js         tool dispatch; every MCP call lands here
+    batch.js          the batch planner — when/unless/repeat/steps, pure, tested
+    jobs.js           background batches (async:true) — in-memory job registry
     cdp.js            Chrome DevTools Protocol: trusted input, screenshots, uploads
     a11y.js  (content/) the accessibility tree — the token budget lives here
     format.js         rendering — the other half of the token budget
@@ -752,12 +804,12 @@ mcp-server/src/
   tools.js            the 14 tool schemas — token-critical
 
 test/
-  run.mjs             333 tests, no browser needed — incl. the parallel-session
+  run.mjs             417 tests, no browser needed — incl. the parallel-session
                       stress (`testParallelSessions`): a Chrome stub faithful
                       enough to drive the real `dispatch`, N sessions opening
                       tabs at once, asserting named/backgrounded/isolated over
                       40 storms up to 10 sessions each
-  a11y-browser.html   88 tests, needs a browser (npm run preview)
+  a11y-browser.html   125 tests, needs a browser (npm run preview)
   overlay-preview.html the on-page overlays, self-checking (same server)
 ```
 
@@ -813,8 +865,8 @@ presence — a `.value` can be empty while the control visibly shows a value
 ## Testing
 
 ```bash
-npm test          # 333 tests — run before and after every change
-npm run preview   # then open /test/a11y-browser.html for 88 DOM tests
+npm test          # 417 tests — run before and after every change
+npm run preview   # then open /test/a11y-browser.html for 125 DOM tests
 ```
 
 The DOM tests need a **real viewport**. In a zero-sized or not-yet-laid-out
@@ -852,9 +904,8 @@ If you must:
 ## Known rough edges
 
 `TODO.md` lists them with reproduction details, and marks each as not started,
-built-but-unverified, or verified live. The highest-value open ones: session
-labels are opaque hex that tells a human nothing about the work, and there is
-no explicit "page is settling" signal after a click that changed nothing.
+built-but-unverified, or verified live. The "page is settling" signal after a
+click is done (`awaitSettled`); session labels are one word now.
 Native-dialog handling (`browser_act action:"dialog"`), the tall-page
 `full_page` fail-fast, and the `find` href-ranking fix are done and verified
 live.
@@ -863,9 +914,16 @@ live.
 
 ## Changes that need a reload
 
-Chrome caches extension files. Anything under `extension/` needs
-`chrome://extensions` → reload before it takes effect. Anything under
-`mcp-server/` is picked up when the MCP client next starts the server.
+Chrome caches extension files. Anything under `extension/` needs a reload
+before it takes effect. Anything under `mcp-server/` is picked up when the MCP
+client next starts the server.
+
+For an unpacked install there is a hook: call the internal `__reload` tool on
+the hub (not published over MCP, so a model cannot; your own script can — join
+with `createTransport` from `mcp-server/src/hub.js` and
+`transport.call('__reload', {})`). It refuses store installs. Before it
+existed the only way was `chrome://extensions` by hand, and UI-scripting that
+page takes two minutes and clicks the toolbar's "Reload this page" by mistake.
 
 This trips people up constantly — if a fix "didn't work", check this first.
 

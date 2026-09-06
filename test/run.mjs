@@ -285,8 +285,44 @@ async function main() {
   // that would mean the model falling back to clicking account rows blind, which
   // is exactly the identity-picking-for-the-user this prevents. The gating logic
   // is pure and separately tested (testOAuth); this is only the syntax for it.
+  //
+  // Raised to 16.0KB for Set-of-Marks (`browser_screenshot marks` + `browser_act
+  // mark`). This is the syntax for the one clicking method that does not go
+  // through a coordinate at all: badges are numbered, the model passes a number,
+  // and it resolves to a ref — so the whole image↔CSS rescaling that makes
+  // pixel clicks land at a fraction of the intended offset simply never applies.
+  // On a canvas app (Docs, Figma) the document body carries no refs, so before
+  // this the only way to click into it was a guessed pixel off a downscaled
+  // shot — the exact silent-wrong-click `space:"image"` was raised for, but with
+  // nothing to convert against. A capability the model cannot name is one it
+  // cannot use; without `marks`/`mark` it falls back to guessing pixels. Trimmed
+  // twice before raising.
+  //
+  // Raised to 17.4KB for the round-trip cutters: `expect` on browser_act and
+  // browser_input, `when`/`unless`/`repeat`/`steps` on batch steps, `async` on
+  // browser_batch with `for:"job"` on browser_wait, and `mode:"outline"` on
+  // browser_snapshot. Every one of these is syntax for doing in one call what
+  // took two or three — act-then-verify, dismiss-if-present, click-until-gone,
+  // run-while-I-read-elsewhere — and a model turn sits between every call, so
+  // each round trip removed is worth several seconds and thousands of tokens of
+  // re-sent context; measured against a live Chrome, a ten-step flow went from
+  // ten turns to two. The 1.4KB is ~350 tokens per request. Trimmed twice
+  // before raising (17452 → 17295): descriptions shortened, the shared
+  // condition fragment stripped to its type.
   const schemaBytes = JSON.stringify(tools).length;
-  check('tool schemas stay under 15.6KB', schemaBytes < 15_600, `${schemaBytes} bytes`);
+  check('tool schemas stay under 17.4KB', schemaBytes < 17_400, `${schemaBytes} bytes`);
+
+  // The round-trip cutters have to stay advertised: a capability the model
+  // cannot name is one it cannot use, and each of these replaces a whole turn.
+  const byName = (n) => tools.find((t) => t.name === n)?.inputSchema?.properties || {};
+  check('browser_act advertises expect', byName('browser_act').expect?.type === 'object');
+  check('browser_input advertises expect', byName('browser_input').expect?.type === 'object');
+  const stepProps = byName('browser_batch').steps?.items?.properties || {};
+  check('batch steps advertise when/unless/repeat/steps',
+    ['when', 'unless', 'repeat', 'steps'].every((k) => k in stepProps), Object.keys(stepProps).join());
+  check('batch advertises async', byName('browser_batch').async?.type === 'boolean');
+  check('browser_wait advertises job collection', byName('browser_wait').for?.enum?.includes('job'));
+  check('browser_snapshot advertises outline', byName('browser_snapshot').mode?.enum?.includes('outline'));
 
   // A screenshot's pixels are in neither coordinate space every other argument
   // uses; `space:"image"` is the only syntax for converting them back, so it has
@@ -329,6 +365,21 @@ async function main() {
     shotTool?.inputSchema?.properties?.selector?.type === 'string' &&
       shotTool?.inputSchema?.properties?.mode?.enum?.includes('element'),
     JSON.stringify(Object.keys(shotTool?.inputSchema?.properties || {}))
+  );
+
+  // Set-of-Marks is only reachable if both halves are advertised: `marks` to
+  // paint the badges and `mark` to click one. A model that cannot name them
+  // falls back to guessing a pixel off the image — the exact failure marks fix.
+  check(
+    'browser_screenshot advertises marks',
+    shotTool?.inputSchema?.properties?.marks?.type === 'boolean',
+    JSON.stringify(Object.keys(shotTool?.inputSchema?.properties || {}))
+  );
+  const actTool = tools.find((t) => t.name === 'browser_act');
+  check(
+    'browser_act advertises mark',
+    actTool?.inputSchema?.properties?.mark?.type === 'number',
+    JSON.stringify(Object.keys(actTool?.inputSchema?.properties || {}))
   );
 
   const ping = await server.request('ping');
@@ -695,6 +746,9 @@ async function main() {
   await testBackgroundInputInvariants();
 
   // ── Hub-to-hub federation ────────────────────────────────────────────────
+  section('Round-trip cutters: batch control flow, jobs, outline, expect');
+  await testSpeedHarness();
+
   section('Federation between hubs');
   await testFederation();
 
@@ -1251,6 +1305,41 @@ async function testFormatting() {
 
   // No viewport, no honest mapping — better than a guessed one.
   check('mapping is null without a viewport', fmt.captureMapping({ mode: 'viewport', meta: {}, image: { width: 500 } }) === null);
+
+  // ── Set-of-Marks: badge resolution and its freshness rules ─────────────────
+  // markDecision is the pure core of router.markToRef: number in, ref out — but
+  // only while the picture the badges were drawn on still describes the page. A
+  // badge resolved against a page that navigated or resized would click whatever
+  // now sits where the old element was, silently, which is the whole failure the
+  // feature removes. So freshness is tested as hard as presence.
+  const markRec = {
+    marks: [
+      { n: 1, ref: 'e7', box: { x: 10, y: 10, w: 40, h: 20 }, label: 'button Bold' },
+      { n: 2, ref: 'e9', box: { x: 60, y: 10, w: 40, h: 20 }, label: 'button Italic' },
+    ],
+    url: 'https://docs.example/d/1',
+    vw: 1280,
+    vh: 800,
+  };
+  const sameMeta = { url: 'https://docs.example/d/1', viewport: { w: 1280, h: 800 } };
+  check('a badge resolves to its ref on the same page', fmt.markDecision(markRec, sameMeta, 2)?.ref === 'e9');
+  check('no table yet is a distinct, recoverable error', fmt.markDecision(null, sameMeta, 1)?.error === 'no-record');
+  check(
+    'a badge past the table is reported with the real range',
+    (() => { const d = fmt.markDecision(markRec, sameMeta, 5); return d.error === 'no-mark' && d.max === 2; })()
+  );
+  check(
+    'a navigation invalidates the badges and asks to clear them',
+    (() => { const d = fmt.markDecision(markRec, { url: 'https://docs.example/d/2', viewport: { w: 1280, h: 800 } }, 1); return d.error === 'navigated' && d.clear === true; })()
+  );
+  check(
+    'a resize invalidates the badges',
+    fmt.markDecision(markRec, { url: 'https://docs.example/d/1', viewport: { w: 1000, h: 800 } }, 1)?.error === 'resized'
+  );
+  // No meta to compare against (the page read failed) is not proof of staleness,
+  // so the badge still resolves — refusing there would strand a live table on a
+  // transient read error.
+  check('an unreadable page does not invalidate a badge', fmt.markDecision(markRec, null, 1)?.ref === 'e7');
 
   // ── Coordinate stress: many sessions, the whole parameter space ────────────
   // "Stress test with a bunch of different sessions until it is perfect." The
@@ -2463,8 +2552,45 @@ async function testBackgroundInputInvariants() {
   // is formed: the withDelta fallback and the post-settling-probe recheck.
   check('withDelta consults the navigation-commit record',
     /const nav = navSince\(tabId, startedAt\);/.test(router) && /onCommitted/.test(router));
-  check('an UNVERIFIED verdict is rechecked against late commits',
-    /\/\^UNVERIFIED\/\.test\(note\)/.test(router));
+  // The fixed post-click sleep and the 500ms settling probe are gone: every
+  // pointer action, in-page action, typing call and scroll waits on the page's
+  // own verdict (`awaitSettled`), which also watches navigation starts so a slow
+  // server cannot turn a real navigation into an UNVERIFIED click.
+  check('no fixed post-click sleep remains', !/settle\(action === 'hover' \? 120 : 350\)/.test(router) && !/await settle\(350\)/.test(router));
+  check('the settling probe is gone', !/settlingNote/.test(router));
+  check('pointer, in-page, typing and scroll paths all wait on the page',
+    (router.match(/await awaitSettled\(tabId, startedAt/g) || []).length >= 4, `${(router.match(/await awaitSettled\(/g) || []).length} sites`);
+  check('a navigation that has started is waited for, then reported',
+    /onBeforeNavigate/.test(router) && /navStartedSince\(tabId, startedAt\)/.test(router) && /function settleVerdict/.test(router));
+  check('the verdict distinguishes navigated / still changing / text-only / nothing',
+    /navigated to \$\{fmt\.shortUrl\(settled\.navigated\.url\)\}/.test(router) &&
+      /still changing/.test(router) && /text-only update/.test(router) && /UNVERIFIED: no page change was detected/.test(router));
+  // Intermediate batch steps must not pay for a delta nobody will read.
+  check('withDelta skips the diff for quiet steps', /if \(!quiet\) changed = await deltaFor\(tabId\);/.test(router));
+  check('act, input and in-page actions pass the quiet flag through', (router.match(/\{ quiet: args\._quiet \}/g) || []).length >= 3);
+  check('batch planning is delegated to the pure planner', /import \{ runPlan \} from '\.\/batch\.js'/.test(router) && /return runPlan\(steps, \{/.test(router));
+  // Verify-in-the-same-call: a failed expectation is an error that still says
+  // the action was dispatched, so the model neither retries blindly nor
+  // believes the click worked.
+  check('expect defaults to 5s and fails as an error naming the dispatch',
+    /expect\.timeout \?\? 5000/.test(router) && /the action was dispatched, but \$\{fmt\.expectLine\(expected\)\}/.test(router));
+  // A job needs no tab, so the branch has to run before tab resolution — or
+  // collecting a job would open a blank tab for a session that has none.
+  const waitBody = router.slice(router.indexOf('async browser_wait(args)'), router.indexOf('async browser_eval(args)'));
+  check('job collection happens before a tab is resolved',
+    waitBody.indexOf("if (kind === 'job') return collectJob") > 0 && waitBody.indexOf("if (kind === 'job')") < waitBody.indexOf('await resolveTab(args)'));
+  check('jobs are scoped to the session that started them', /jobs\.getJob\(String\(args\.value\), session\)/.test(router) && /jobs\.startJob\(\s*\{ session,/.test(router));
+  // A truncated whole-page read carries the outline, so the next call scopes
+  // instead of paging; a scoped read does not repeat the choice.
+  check('a truncated snapshot appends an outline unless already scoped',
+    /if \(!args\.selector\) \{\s*const outline = await snapshotText\(tabId, \{\s*mode: 'outline'/.test(router));
+  check('the developer reload hook refuses store installs', /getManifest\(\)\.update_url\)[\s\S]{0,120}throw new Error\('reload is only available/.test(router));
+
+  const content = readFileSync(join(ROOT, 'extension', 'content', 'main.js'), 'utf8');
+  check('the page answers settled and check', /settled\(\{ idleMs = 250, quietMs = 120, maxMs = 700 \}/.test(content) && /check\(\{ for: kind, value \}\)/.test(content));
+  check('wait and check share one predicate table', (content.match(/predicateFor\(kind, value\)/g) || []).length === 3);
+  check('snapshot budget default is 8000', /maxSnapshotChars: 8000/.test(settings));
+  check('settle timings are settings', /settleIdleMs: 250/.test(settings) && /settleQuietMs: 120/.test(settings) && /settleMaxMs: 700/.test(settings));
   // The driving frame and the live cursor go down with every old document; the
   // redraw listener puts them back so a tab does not look undriven (and the
   // pointer does not vanish) between a navigation and the next tool call.
@@ -2507,6 +2633,245 @@ async function testBackgroundInputInvariants() {
     }),
   ]);
   check('different tabs still mutate in parallel', overlap);
+}
+
+/**
+ * The pieces that turn a ten-turn flow into two: the batch planner (pure), the
+ * job registry (pure), the outline renderer, and the validator letting the new
+ * syntax through to the extension.
+ */
+async function testSpeedHarness() {
+  // ── Planner ────────────────────────────────────────────────────────────────
+  const { runPlan, MAX_REPEAT, MAX_OPS, MAX_NESTING } = await importFrom('extension', 'background', 'batch.js');
+
+  // A fake dispatcher that records every call, and a condition table that can
+  // be flipped from the test.
+  const makeRunner = (cond = {}) => {
+    const calls = [];
+    const state = { cond, calls };
+    state.run = async (tool, args) => {
+      calls.push({ tool, args });
+      if (tool === 'boom') throw new Error('kaboom');
+      if (tool === 'counter') state.cond.count = (state.cond.count || 0) + 1;
+      return { text: `${tool} ok #${calls.length}` };
+    };
+    state.test = async (c, args) => {
+      state.tests = (state.tests || []).concat([{ c, args }]);
+      if (c.for === 'count_reached') return (state.cond.count || 0) >= Number(c.value);
+      return !!state.cond[`${c.for}:${c.value}`];
+    };
+    return state;
+  };
+
+  let r = makeRunner();
+  let out = await runPlan(
+    [{ tool: 'browser_navigate', args: { url: 'a' } }, { tool: 'browser_act', args: { ref: 'e1' } }, { tool: 'browser_snapshot' }],
+    { run: r.run, test: r.test, defaults: { tabId: 7, _session: 's' } }
+  );
+  check('steps run in order with defaults merged under their args',
+    r.calls.map((c) => c.tool).join() === 'browser_navigate,browser_act,browser_snapshot' && r.calls.every((c) => c.args.tabId === 7 && c.args._session === 's'));
+  check('every step but the last runs quiet', r.calls[0].args._quiet === true && r.calls[1].args._quiet === true && r.calls[2].args._quiet === undefined);
+  check('the default result is the trail plus the last step', /^✓ browser_navigate → ✓ browser_act → ✓ browser_snapshot\n\nbrowser_snapshot ok #3$/.test(out.text), out.text);
+
+  r = makeRunner();
+  out = await runPlan([{ tool: 'a' }, { tool: 'b' }], { run: r.run, test: r.test, returnEach: true });
+  check('returnEach turns quiet off and labels each result', r.calls.every((c) => !c.args._quiet) && /\[1\] a\na ok #1\n\n\[2\] b\nb ok #2/.test(out.text), out.text);
+
+  // when / unless
+  r = makeRunner({ 'text:Accept cookies': false, 'selector:.modal': true });
+  out = await runPlan(
+    [
+      { tool: 'dismiss', when: { for: 'text', value: 'Accept cookies' } },
+      { tool: 'close', unless: { for: 'selector', value: '.modal' } },
+      { tool: 'open', when: { for: 'selector', value: '.modal' } },
+      { tool: 'done' },
+    ],
+    { run: r.run, test: r.test, defaults: { tabId: 3 } }
+  );
+  check('when:false and unless:true skip the step', r.calls.map((c) => c.tool).join() === 'open,done', r.calls.map((c) => c.tool).join());
+  check('the trail says what was skipped and why', /– dismiss \(skipped: text "Accept cookies" was false\) → – close \(skipped: selector "\.modal" was true\) → ✓ open → ✓ done/.test(out.text), out.text);
+  check('conditions are evaluated against the step\'s merged args', r.tests.every((t) => t.args.tabId === 3));
+
+  // repeat until
+  r = makeRunner();
+  out = await runPlan(
+    [{ tool: 'counter', repeat: { until: { for: 'count_reached', value: 3 }, max: 10 } }, { tool: 'snap' }],
+    { run: r.run, test: r.test }
+  );
+  check('repeat until runs until the condition holds', r.calls.filter((c) => c.tool === 'counter').length === 3);
+  check('iterations collapse into one trail entry with a count', /^✓ counter ×3 → ✓ snap\n/.test(out.text), out.text);
+  check('a repeated intermediate step stays quiet', r.calls.filter((c) => c.tool === 'counter').every((c) => c.args._quiet === true));
+
+  // repeat while, false from the start
+  r = makeRunner({ 'selector:.more': false });
+  out = await runPlan([{ tool: 'load_more', repeat: { while: { for: 'selector', value: '.more' } } }, { tool: 'snap' }], { run: r.run, test: r.test });
+  check('repeat while runs zero times when already false', !r.calls.some((c) => c.tool === 'load_more') && /✓ snap/.test(out.text));
+
+  // repeat count
+  r = makeRunner();
+  await runPlan([{ tool: 'scroll', repeat: 4 }], { run: r.run, test: r.test });
+  check('a numeric repeat is a plain count', r.calls.length === 4);
+
+  // exhausted
+  r = makeRunner({ 'text:Done': false });
+  let err = await runPlan([{ tool: 'next', repeat: { until: { for: 'text', value: 'Done' }, max: 3 } }], { run: r.run, test: r.test }).catch((e) => e);
+  check('an unmet until at max is an error that names the count and condition',
+    err instanceof Error && /repeat hit max 3 with text "Done" still false/.test(err.message) && r.calls.length === 3, err?.message);
+  r = makeRunner({ 'text:Done': false });
+  out = await runPlan([{ tool: 'next', repeat: { until: { for: 'text', value: 'Done' }, max: 2 } }, { tool: 'after' }], { run: r.run, test: r.test, stopOnError: false });
+  check('with stopOnError:false the exhaustion is recorded and the batch continues', /✗ next: repeat hit max 2/.test(out.text) && r.calls.some((c) => c.tool === 'after'), out.text);
+
+  // groups
+  r = makeRunner();
+  out = await runPlan(
+    [{ repeat: { until: { for: 'count_reached', value: 2 } }, steps: [{ tool: 'open' }, { tool: 'counter' }, { tool: 'back' }] }, { tool: 'snap' }],
+    { run: r.run, test: r.test }
+  );
+  check('a group repeats as one unit', r.calls.map((c) => c.tool).join() === 'open,counter,back,open,counter,back,snap', r.calls.map((c) => c.tool).join());
+  check('group members are labelled by path and collapsed per iteration', /✓ open ×2 → ✓ counter ×2 → ✓ back ×2 → ✓ snap/.test(out.text), out.text);
+  check('a group\'s members are never the final step', r.calls.filter((c) => c.tool !== 'snap').every((c) => c.args._quiet === true) && r.calls.at(-1).args._quiet === undefined);
+
+  // ceilings
+  err = await runPlan([{ tool: 'x', repeat: { until: { for: 'text', value: 'never' }, max: 999 } }], makeRunner({ 'text:never': false })).catch((e) => e);
+  check(`repeat max is capped at ${MAX_REPEAT}`, /repeat hit max 50/.test(err?.message), err?.message);
+  r = makeRunner();
+  const wide = Array.from({ length: 11 }, () => ({ tool: 'x' }));
+  err = await runPlan([{ repeat: 50, steps: wide }], { run: r.run, test: r.test }).catch((e) => e);
+  check(`total tool calls are capped at ${MAX_OPS}`, /exceeded 500 tool calls/.test(err?.message) && r.calls.length === MAX_OPS, `${r.calls.length} calls; ${err?.message?.slice(0, 60)}`);
+  const deep = { steps: [{ steps: [{ steps: [{ steps: [{ tool: 'x' }] }] }] }] };
+  err = await runPlan([deep], makeRunner()).catch((e) => e);
+  check(`groups nest at most ${MAX_NESTING} deep`, /nest at most 3 deep/.test(err?.message), err?.message);
+
+  // validation
+  const bad = async (steps) => (await runPlan(steps, makeRunner()).catch((e) => e))?.message || '';
+  check('a nested browser_batch is refused', /cannot nest/.test(await bad([{ tool: 'browser_batch' }])));
+  check('tool and steps together are refused', /both tool and steps/.test(await bad([{ tool: 'a', steps: [{ tool: 'b' }] }])));
+  check('a condition without `for` explains the shape', /needs \{for, value\}/.test(await bad([{ tool: 'a', when: { value: 'x' } }])));
+  check('a repeat with nothing to repeat on explains itself', /repeat needs until, while, or max/.test(await bad([{ tool: 'a', repeat: {} }])));
+  check('an empty group is refused', /empty group/.test(await bad([{ steps: [] }])));
+
+  // failure trail
+  r = makeRunner();
+  err = await runPlan([{ tool: 'ok' }, { tool: 'boom' }, { tool: 'never' }], { run: r.run, test: r.test }).catch((e) => e);
+  check('a failing step stops the batch with a trail', /step 2 \(boom\) failed: kaboom[\s\S]*✓ ok → ✗ boom: kaboom/.test(err?.message) && !r.calls.some((c) => c.tool === 'never'), err?.message);
+
+  // ── Jobs ───────────────────────────────────────────────────────────────────
+  const jobs = await importFrom('extension', 'background', 'jobs.js');
+  jobs._resetJobs();
+  let release;
+  const gate = new Promise((res) => (release = res));
+  const { id } = jobs.startJob({ session: 'harbor', tool: 'browser_batch', steps: 3 }, async (progress) => {
+    progress({ i: 1, tool: 'browser_navigate', label: '1' });
+    await gate;
+    return { text: 'all done' };
+  });
+  check('a job gets an id and starts running', id === 'job1' && jobs.getJob(id, 'harbor')?.status === 'running');
+  check('another session cannot see it', jobs.getJob(id, 'meadow') === null);
+  check('the owner can list it', jobs.listJobs('harbor').length === 1 && jobs.listJobs('meadow').length === 0);
+  let waited = await jobs.waitForJob(jobs.getJob(id, 'harbor'), 30);
+  check('waiting past the timeout reports it still running, with progress', waited.status === 'running' && /job1 running \d+s — at step 1 \(browser_navigate\)/.test(jobs.describeJob(waited)), jobs.describeJob(waited));
+  const collecting = jobs.waitForJob(jobs.getJob(id, 'harbor'), 5000);
+  release();
+  waited = await collecting;
+  check('a waiter is woken the moment the job finishes', waited.status === 'done' && waited.result.text === 'all done');
+  check('a finished job is described as done', /^job1 done after \d+s$/.test(jobs.describeJob(waited)), jobs.describeJob(waited));
+  const failing = jobs.startJob({ session: 'harbor', tool: 'browser_batch', steps: 1 }, async () => {
+    throw new Error('step 1 (browser_act) failed: nope');
+  });
+  const failed = await jobs.waitForJob(jobs.getJob(failing.id, 'harbor'), 1000);
+  check('a throwing job is failed with its message kept', failed.status === 'failed' && /nope/.test(failed.error));
+  check('a session-less job is visible to any caller', (() => { const j = jobs.startJob({ tool: 't' }, async () => 1); return jobs.getJob(j.id, 'anyone') !== null; })());
+  jobs._resetJobs();
+
+  // ── Outline ────────────────────────────────────────────────────────────────
+  stubChrome();
+  const fmt = await importFrom('extension', 'background', 'format.js');
+  const page = [
+    { role: 'banner', name: '', depth: 0, sel: 'header', children: [
+      { role: 'link', name: 'Home', ref: 'e1', depth: 1, children: [] },
+      { role: 'navigation', name: 'Main', depth: 1, sel: 'header > nav', children: [
+        { role: 'link', name: 'A', ref: 'e2', depth: 2, children: [] },
+        { role: 'link', name: 'B', ref: 'e3', depth: 2, children: [] },
+        { role: 'button', name: 'Menu', ref: 'e4', depth: 2, children: [] },
+      ] },
+    ] },
+    { role: 'main', name: '', depth: 0, sel: 'main', children: [
+      { role: 'heading', name: 'Welcome to the very long heading that keeps going and going past eighty characters for sure', depth: 1, state: ['h1'], children: [] },
+      { role: 'generic', name: '', depth: 1, children: [
+        { role: 'form', name: 'Search', depth: 2, sel: '#search', children: [
+          { role: 'searchbox', name: 'Query', ref: 'e5', depth: 3, children: [] },
+          { role: 'checkbox', name: 'Exact', ref: 'e6', depth: 3, children: [] },
+          { role: 'checkbox', name: 'Recent', ref: 'e7', depth: 3, children: [] },
+          { role: 'button', name: 'Go', ref: 'e8', depth: 3, children: [] },
+        ] },
+      ] },
+      { role: 'heading', name: 'Results', depth: 1, state: ['h2'], children: [] },
+      { role: 'list', name: '', depth: 1, children: Array.from({ length: 30 }, (_, i) => ({ role: 'listitem', name: '', depth: 2, children: [{ role: 'link', name: `r${i}`, ref: `e${10 + i}`, depth: 3, children: [] }] })) },
+      { role: 'iframe', name: '', depth: 1, src: 'ads.example/x', children: [] },
+    ] },
+  ];
+  const outline = fmt.renderOutline(page);
+  const lines = outline.text.split('\n');
+  check('outline: one line per landmark, indented by nesting',
+    lines[0] === 'banner (1 link) selector:"header"' && lines[1] === '  navigation "Main" (2 links, 1 button) selector:"header > nav"', outline.text);
+  check('outline: a landmark counts its own controls, not a nested landmark\'s',
+    /^main \(30 links\) selector:"main"$/m.test(outline.text), outline.text);
+  check('outline: headings appear with their level, truncated', /^  h1 "Welcome to the very long heading[^"]*…"$/m.test(outline.text) && /^  h2 "Results"$/m.test(outline.text), outline.text);
+  check('outline: a form is a landmark with its own counts, most common first', /^ {2}form "Search" \(2 checkboxes, 1 searchbox, 1 button\) selector:"#search"$/m.test(outline.text), outline.text);
+  check('outline: lists and items are not lines', !/list/.test(outline.text.replace(/listitem/g, '')) || !/^\s*list\b/m.test(outline.text));
+  check('outline: iframes are named by source', /^  iframe ads\.example\/x$/m.test(outline.text), outline.text);
+  check('outline: no refs, no per-control lines', !/\[e\d+\]/.test(outline.text) && !/link "r1"/.test(outline.text));
+  check('outline: counts every control on the page', outline.refCount === 38, `${outline.refCount}`);
+  check('outline: is a fraction of the tree', outline.text.length < fmt.renderTree(page).text.length / 3, `${outline.text.length} vs ${fmt.renderTree(page).text.length}`);
+  const tight = fmt.renderOutline(page, { maxChars: 60 });
+  check('outline: respects its budget and says so', tight.truncated === true && tight.text.length <= 60);
+  check('outline: a landmark without a selector still gets a line',
+    /^navigation "Old" \(1 link\)$/m.test(fmt.renderOutline([{ role: 'navigation', name: 'Old', depth: 0, children: [{ role: 'link', name: 'x', ref: 'e1', depth: 1, children: [] }] }]).text));
+
+  // ── Expect verdict line ────────────────────────────────────────────────────
+  check('expect: a met condition reports its timing',
+    fmt.expectLine({ ok: true, ms: 340, cond: { for: 'text', value: 'Order placed' } }) === 'expect text "Order placed": met after 340ms');
+  check('expect: a miss is loud and names the budget',
+    fmt.expectLine({ ok: false, timeout: 5000, error: 'timed out after 5000ms', cond: { for: 'url', value: '/thanks' } }) === 'EXPECT FAILED: url "/thanks" not met after 5000ms');
+  check('expect: a non-timeout error is carried',
+    /\(bad selector\)$/.test(fmt.expectLine({ ok: false, timeout: 5000, error: 'bad selector', cond: { for: 'selector', value: 'x' } })));
+
+  // ── The validator lets the new syntax through to the extension ────────────
+  const PORT9 = PORT + 9;
+  const server = startServer(PORT9);
+  await server.request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '1' } });
+  server.notify('notifications/initialized');
+  const ext = await fakeExtension(PORT9, { onCall: async (msg) => ({ text: `handled ${msg.tool}` }) });
+  await sleep(300);
+
+  const batchArgs = {
+    tabId: 5,
+    async: true,
+    steps: [
+      { tool: 'browser_act', args: { action: 'click', ref: 'e1' }, when: { for: 'text', value: 'Accept' } },
+      { tool: 'browser_act', args: { action: 'click', ref: 'e2' }, repeat: { until: { for: 'no_selector', value: '.next' }, max: 20 } },
+      { steps: [{ tool: 'browser_snapshot' }], unless: { for: 'url', value: '/done' } },
+    ],
+  };
+  const batchRes = await server.request('tools/call', { name: 'browser_batch', arguments: batchArgs });
+  const batchSeen = ext.seen.find((c) => c.tool === 'browser_batch');
+  check('batch control flow survives validation and the trip intact',
+    batchRes.result?.isError === false && JSON.stringify(batchSeen?.args.steps) === JSON.stringify(batchArgs.steps) && batchSeen?.args.async === true,
+    JSON.stringify(batchRes.result).slice(0, 200));
+  const actRes = await server.request('tools/call', { name: 'browser_act', arguments: { action: 'click', ref: 'e1', expect: { for: 'text', value: 'Saved', timeout: 3000 } } });
+  check('expect on browser_act is accepted and forwarded', actRes.result?.isError === false && ext.seen.find((c) => c.tool === 'browser_act')?.args.expect?.value === 'Saved');
+  const inputRes = await server.request('tools/call', { name: 'browser_input', arguments: { ref: 'e1', text: 'hi', expect: { for: 'url', value: '/results' } } });
+  check('expect on browser_input is accepted and forwarded', inputRes.result?.isError === false && ext.seen.find((c) => c.tool === 'browser_input')?.args.expect?.for === 'url');
+  const waitRes = await server.request('tools/call', { name: 'browser_wait', arguments: { for: 'job', value: 'job1' } });
+  check('for:"job" is accepted by browser_wait', waitRes.result?.isError === false && ext.seen.find((c) => c.tool === 'browser_wait')?.args.for === 'job');
+  const outlineRes = await server.request('tools/call', { name: 'browser_snapshot', arguments: { mode: 'outline' } });
+  check('mode:"outline" is accepted by browser_snapshot', outlineRes.result?.isError === false && ext.seen.find((c) => c.tool === 'browser_snapshot')?.args.mode === 'outline');
+  const init2 = await server.request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '1' } });
+  const instr = init2.result?.instructions || '';
+  check('instructions teach expect, control flow, async jobs and outline',
+    /expect:\{for, value\}/.test(instr) && /repeat/.test(instr) && /async:true/.test(instr) && /mode:"outline"/.test(instr));
+  server.proc.kill();
+  ext.conn.close?.();
 }
 
 main().catch((err) => {

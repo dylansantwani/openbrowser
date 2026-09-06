@@ -128,6 +128,103 @@ function renderNode(node, pad) {
 }
 
 // -----------------------------------------------------------------------------
+// Outline
+// -----------------------------------------------------------------------------
+
+/** Roles that anchor an outline line even on a tree built before `sel` existed. */
+const OUTLINE_ROLES = new Set([
+  'main', 'navigation', 'banner', 'contentinfo', 'complementary', 'form', 'search',
+  'region', 'dialog', 'alertdialog', 'article', 'table', 'tablist', 'iframe',
+]);
+
+/**
+ * The page as a table of contents.
+ *
+ * A big page's interactive tree is thousands of characters, most of them links
+ * the model will never touch; reading it whole is the largest single token cost
+ * of a task and it grows with every page. The outline is the cheap first look
+ * instead: every landmark with how many controls it holds and the selector that
+ * scopes a snapshot to it, plus the headings in between for orientation. Ten to
+ * forty lines for a page whose full tree is four hundred, and the next call can
+ * go straight to `selector:"…"` without a round trip to discover it.
+ *
+ * @returns {{text: string, refCount: number, truncated: boolean}}
+ */
+export function renderOutline(nodes, { maxChars = 4000, indent = '  ' } = {}) {
+  const lines = [];
+  let chars = 0;
+  let truncated = false;
+  let refCount = 0;
+
+  const push = (line) => {
+    if (truncated) return;
+    if (chars + line.length > maxChars) {
+      truncated = true;
+      return;
+    }
+    lines.push(line);
+    chars += line.length + 1;
+  };
+
+  const isLandmark = (node) => !node.ref && (node.sel || OUTLINE_ROLES.has(node.role));
+
+  // Controls a landmark holds directly — a nested landmark's controls are its
+  // own line's business, so nothing is counted twice and `banner (1 link)` next
+  // to its `navigation (12 links)` reads as the two regions they are.
+  const countControls = (node, acc) => {
+    for (const child of node.children || []) {
+      if (child.ref) acc[child.role] = (acc[child.role] || 0) + 1;
+      if (!isLandmark(child)) countControls(child, acc);
+    }
+    return acc;
+  };
+
+  const countAll = (list) => {
+    for (const node of list) {
+      if (node.ref) refCount++;
+      if (node.children?.length) countAll(node.children);
+    }
+  };
+  countAll(nodes);
+
+  const walk = (list, depth) => {
+    for (const node of list) {
+      const pad = indent.repeat(depth);
+      if (node.role === 'heading' && node.name) {
+        const level = node.state?.find((s) => /^h[1-6]$/.test(s)) || 'heading';
+        push(`${pad}${level} "${truncate(node.name, 80)}"`);
+        continue;
+      }
+      if (!isLandmark(node)) {
+        if (node.children?.length) walk(node.children, depth);
+        continue;
+      }
+      const counts = countControls(node, {});
+      const summary = Object.entries(counts)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 4)
+        .map(([role, n]) => `${n} ${plural(role, n)}`)
+        .join(', ');
+      const parts = [node.role];
+      if (node.name) parts.push(`"${truncate(node.name, 60)}"`);
+      if (node.src) parts.push(node.src);
+      if (summary) parts.push(`(${summary})`);
+      if (node.sel) parts.push(`selector:${JSON.stringify(node.sel)}`);
+      push(pad + parts.join(' '));
+      if (node.children?.length) walk(node.children, depth + 1);
+    }
+  };
+  walk(nodes, 0);
+
+  return { text: lines.join('\n'), refCount, truncated };
+}
+
+function plural(role, n) {
+  if (n === 1) return role;
+  return /(x|s|ch|sh)$/.test(role) ? `${role}es` : `${role}s`;
+}
+
+// -----------------------------------------------------------------------------
 // Diffing
 // -----------------------------------------------------------------------------
 
@@ -505,6 +602,34 @@ export function captureGeometry({ mode, clip, meta = {}, image }) {
   return `${sized}\n${convert}${note}`;
 }
 
+/**
+ * Resolve a Set-of-Marks badge number against the saved table — the pure core
+ * of `router.markToRef`, factored out so its freshness rules can be tested
+ * without a browser, exactly as `captureMapping` is.
+ *
+ * A badge number is a promise the picture made: "click this and hit that
+ * element". The promise holds only while the picture still describes the page,
+ * so a table taken before a navigation or a resize is refused rather than
+ * resolved against a layout that has moved — the same "an error beats a silent
+ * wrong click" stance the coordinate story rests on. Returns a tagged result the
+ * caller turns into a live ref or a recovery message; never throws.
+ *
+ * @returns {{ref:string} | {error:'no-record'|'navigated'|'resized'|'no-mark', max?:number, clear?:boolean}}
+ */
+export function markDecision(record, meta, n) {
+  if (!record) return { error: 'no-record' };
+  if (meta) {
+    const navigated = !!(record.url && meta.url && record.url !== meta.url);
+    const resized = !!(record.vw && meta.viewport?.w && (record.vw !== meta.viewport.w || record.vh !== meta.viewport.h));
+    if (navigated) return { error: 'navigated', clear: true };
+    if (resized) return { error: 'resized', clear: true };
+  }
+  const marks = record.marks || [];
+  const hit = marks.find((m) => m.n === n);
+  if (!hit) return { error: 'no-mark', max: marks.length };
+  return { ref: hit.ref };
+}
+
 export function truncate(str, max) {
   const s = String(str ?? '');
   return s.length > max ? `${s.slice(0, max - 1)}…` : s;
@@ -520,6 +645,16 @@ export function actionResult(summary, { meta, tabId, changed } = {}) {
   if (meta) lines.push(pageHeader(meta, tabId));
   if (changed) lines.push(changed);
   return lines.join('\n');
+}
+
+/**
+ * One line for an `expect` verdict — the action's own verification, so the
+ * model does not spend a round trip asking whether its click worked.
+ */
+export function expectLine(r) {
+  const what = r.cond?.value != null ? `${r.cond.for} ${JSON.stringify(String(r.cond.value))}` : r.cond?.for;
+  if (r.ok) return `expect ${what}: met${r.ms != null ? ` after ${r.ms}ms` : ''}`;
+  return `EXPECT FAILED: ${what} not met after ${r.timeout}ms${r.error && !/timed out/.test(r.error) ? ` (${r.error})` : ''}`;
 }
 
 chrome.tabs.onRemoved.addListener((tabId) => lastSnapshots.delete(tabId));

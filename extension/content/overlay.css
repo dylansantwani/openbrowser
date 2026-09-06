@@ -464,3 +464,42 @@
     100%    { opacity: 0; }
   }
 }
+
+/* ── Marks: numbered badges for Set-of-Marks clicking ──────────────────────── */
+/*
+ * A badge per clickable element, so a model working from the screenshot passes
+ * back a number (browser_act mark:N) instead of a guessed pixel. Static — no
+ * keyframe touches them — so every property is forced, the same reset armour the
+ * rest of this file wears. The layer is inert to the pointer; the badges are the
+ * only agent mark that is a solid, filled chip rather than an outline, because a
+ * number has to stay legible over whatever it sits on.
+ */
+.ob-mark-layer {
+  position: fixed !important;
+  inset: 0 !important;
+  z-index: 2147483646 !important;
+  pointer-events: none !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border: 0 !important;
+  background: transparent !important;
+}
+
+.ob-mark {
+  position: fixed !important;
+  transform: translate(-2px, -2px) !important;
+  box-sizing: border-box !important;
+  min-width: 17px !important;
+  height: 16px !important;
+  padding: 0 4px !important;
+  border-radius: 5px !important;
+  border: 1px solid rgba(255, 255, 255, 0.85) !important;
+  background: #2f6fed !important;
+  color: #ffffff !important;
+  font: 700 11px/14px -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif !important;
+  text-align: center !important;
+  letter-spacing: 0 !important;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4) !important;
+  pointer-events: none !important;
+  white-space: nowrap !important;
+}

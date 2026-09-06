@@ -200,15 +200,15 @@ single-purpose ones — models pick an enum value far more reliably.
 |---|---|
 | `browser_tabs` | list / new / close / select / reload / duplicate |
 | `browser_navigate` | go to a URL, back, forward, reload |
-| `browser_snapshot` | read the page as an accessibility tree with `[ref=eN]` handles |
+| `browser_snapshot` | read the page as an accessibility tree with `[ref=eN]` handles, or as an outline of its regions |
 | `browser_find` | find elements by description, ranked |
-| `browser_act` | click, hover, drag, select, check, answer native dialogs — trusted input events |
-| `browser_input` | type text, fill many fields at once, press keys |
+| `browser_act` | click, hover, drag, select, check, answer native dialogs — trusted input events, with `expect` to verify in the same call |
+| `browser_input` | type text, fill many fields at once, press keys, `expect` the result |
 | `browser_screenshot` | viewport / full page / element / region, or record a GIF |
-| `browser_wait` | block on text, selector, URL, network idle, load |
+| `browser_wait` | block on text, selector, URL, network idle, load, or a background job |
 | `browser_eval` | run JavaScript in the page |
 | `browser_inspect` | console, network, cookies, storage, downloads, frames |
-| `browser_batch` | run many calls as one request, optionally across many tabs |
+| `browser_batch` | run many calls as one request — with `when`/`repeat` control flow, across many tabs, or in the background |
 | `browser_upload` | attach local files to a file input |
 | `browser_window` | pick the window/browser, attach a hub on another machine, resize, emulate a device, throttle network |
 | `browser_macro` | save and replay step sequences |
@@ -226,10 +226,19 @@ The design assumes tokens are the scarce resource:
 2. **`mode: "diff"` in loops.** After the first snapshot, ask only what changed.
 3. **Actions return their own delta.** After a click you usually already know
    what changed, so no follow-up snapshot is needed.
-4. **`selector` to scope.** On a dense page, read the one region you care about.
-5. **`browser_batch` for known flows.** Collapses N round-trips into one.
-6. **`browser_macro` for repeated flows.** Derive the flow once, replay for the
+4. **`selector` to scope, `mode:"outline"` to choose.** On a dense page, the
+   outline lists every region with its control count and selector for a few
+   hundred characters; then read the one region you care about.
+5. **`browser_batch` for known flows.** Collapses N round-trips into one, and
+   `when` / `unless` / `repeat` handle the "if there is a banner" and "until
+   the button is gone" cases that used to force one call per step.
+6. **`expect` on actions.** Verify the click in the same call instead of
+   spending a turn on wait-then-snapshot.
+7. **`browser_macro` for repeated flows.** Derive the flow once, replay for the
    cost of a single call.
+
+And the tool never sleeps: every action waits for the page to react, or to
+prove it will not, and returns at that moment.
 
 ---
 

@@ -6,10 +6,12 @@
 npm test
 ```
 
-75 tests covering the WebSocket framing, the MCP protocol, the full round trip
+417 tests covering the WebSocket framing, the MCP protocol, the full round trip
 (including two clients sharing one browser and the disconnected case), output
-formatting, and macro substitution. No browser required — a fake extension
-stands in for Chrome.
+formatting, macro substitution, the batch planner (`when`/`unless`/`repeat`,
+ceilings, trails), the job registry, the outline renderer, and source-level
+invariants on the router (no fixed post-click sleeps, the window-raise guard).
+No browser required — a fake extension stands in for Chrome.
 
 Run it a few times when touching `ws.js` or `hub.js`. The greeting race
 documented in [ARCHITECTURE.md](ARCHITECTURE.md#framing-and-the-greeting-race)
@@ -22,8 +24,10 @@ node scripts/serve-preview.mjs
 # open http://localhost:8850/test/a11y-browser.html
 ```
 
-41 assertions against a real DOM, covering the file that decides what a model
-sees. The fixture is deliberately awkward — five levels of wrapper divs, labels
+125 assertions against a real DOM, covering the file that decides what a model
+sees, the event-driven `settled` handler (idle / quiet / still-changing, with
+our own overlays and typed input classified correctly), the instant `check`
+conditions batch steps gate on, and the outline's landmark selectors. The fixture is deliberately awkward — five levels of wrapper divs, labels
 associated three different ways, an open shadow root, a `div` acting as a
 button, and four flavours of hidden element. Results render in the page, with
 the resulting tree at the bottom.

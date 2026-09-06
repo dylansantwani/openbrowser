@@ -3,6 +3,9 @@
   <head>
     <meta charset="utf-8" />
     <title>OpenBrowser — accessibility tree tests</title>
+    <!-- The same stylesheet the extension injects in production, so the marks
+         overlay is positioned here exactly as it is on a real page. -->
+    <link rel="stylesheet" href="../extension/content/overlay.css" />
     <style>
       body { font: 13px ui-monospace, monospace; margin: 0; display: flex; height: 100vh; }
       #fixture { width: 40%; padding: 16px; overflow: auto; border-right: 1px solid #ccc; font-family: system-ui, sans-serif; }
@@ -265,6 +268,43 @@
       const before = new Map(refs.map((r) => [r, OB.a11y.resolveRef(r)]));
       OB.a11y.buildTree({ mode: 'interactive', selector: '#fixture' });
       check('refs are stable across snapshots', [...before].every(([r, el]) => OB.a11y.resolveRef(r) === el));
+
+      // --- Set-of-Marks ------------------------------------------------------
+      // Every badge must stand for a real, resolvable element with a live box in
+      // top-level viewport coordinates — a mark that resolves to nothing is a
+      // click into the void, the exact failure the feature removes. viewportOnly
+      // is off so the assertion does not depend on how the fixture happens to
+      // scroll in the harness window.
+      const marked = OB.__handlers.markBoxes({ viewportOnly: false });
+      check('markBoxes finds the clickable elements', marked.marks.length >= 12, `got ${marked.marks.length}`);
+      check('every mark carries a resolvable ref', marked.marks.every((m) => OB.a11y.resolveRef(m.ref)?.isConnected));
+      check('every mark has a real box', marked.marks.every((m) => m.box.w > 0 && m.box.h > 0));
+      check('every mark has a label', marked.marks.every((m) => typeof m.label === 'string' && m.label.length > 0));
+      check('mark refs are unique', new Set(marked.marks.map((m) => m.ref)).size === marked.marks.length);
+
+      // The badges are painted, countable, and — being in OWN_DECORATION —
+      // invisible to the very snapshot they are meant to help a model act on.
+      const numbered = marked.marks.slice(0, 5).map((m, i) => ({ n: i + 1, ...m }));
+      OB.__handlers.drawMarks({ marks: numbered });
+      const badgeEls = [...document.querySelectorAll('.ob-mark')];
+      check('drawMarks paints one badge per mark', badgeEls.length === numbered.length);
+      // With the production stylesheet loaded the badge is position:fixed and
+      // lands on its element's top-left corner — the whole point, and the thing
+      // that silently broke without the CSS present. Allow the deliberate few-px
+      // nudge that lifts the number just over the corner.
+      check('badges are positioned, not stacked', badgeEls.every((b) => getComputedStyle(b).position === 'fixed'));
+      check(
+        'each badge sits on its element',
+        numbered.every((m) => {
+          const b = badgeEls.find((el) => el.textContent === String(m.n));
+          const r = b.getBoundingClientRect();
+          return Math.abs(r.left - m.box.x) <= 6 && Math.abs(r.top - m.box.y) <= 6;
+        })
+      );
+      const withBadges = fmt.renderTree(OB.a11y.buildTree({ mode: 'full', selector: '#fixture' }).nodes).text;
+      check('badges never enter the tree the model reads', !/ob-mark/.test(withBadges));
+      OB.__handlers.clearMarks();
+      check('clearMarks removes every badge', document.querySelectorAll('.ob-mark, .ob-mark-layer').length === 0);
 
       // --- Mutation counting -------------------------------------------------
       // The settling signal reads this counter to tell "the app has not reacted
@@ -549,6 +589,101 @@
 
       g.remove();
       fixtureEl.style.display = savedDisplay;
+
+      // --- Event-driven settle -----------------------------------------------
+      // `settled` replaces a fixed 350ms sleep + 500ms probe after every action.
+      // Three verdicts, each timed: nothing happened (fast), something happened
+      // and finished (as soon as it is quiet), still happening (at the ceiling).
+      await quiesce();
+      const t0 = performance.now();
+      const idle = await OB.__handlers.settled({ idleMs: 120, quietMs: 60, maxMs: 500 });
+      const idleTook = performance.now() - t0;
+      check('settled: a page that does not react reports so at the idle window',
+        idle.mutated === false && idle.quiet === true && idleTook >= 100 && idleTook < 400,
+        `${JSON.stringify(idle)} in ${Math.round(idleTook)}ms`);
+
+      const t1 = performance.now();
+      const reacting = OB.__handlers.settled({ idleMs: 300, quietMs: 80, maxMs: 1000 });
+      setTimeout(() => {
+        const p = document.createElement('p');
+        p.textContent = 'reaction';
+        document.querySelector('#fixture main').appendChild(p);
+        setTimeout(() => p.remove(), 20);
+      }, 30);
+      const reacted = await reacting;
+      const reactTook = performance.now() - t1;
+      check('settled: a reaction that finishes resolves once quiet, before the ceiling',
+        reacted.mutated === true && reacted.quiet === true && reacted.changes >= 1 && reactTook < 600,
+        `${JSON.stringify(reacted)} in ${Math.round(reactTook)}ms`);
+
+      const t2 = performance.now();
+      const churning = OB.__handlers.settled({ idleMs: 200, quietMs: 150, maxMs: 400 });
+      const churn = setInterval(() => {
+        const p = document.createElement('i');
+        document.querySelector('#fixture main').appendChild(p);
+        p.remove();
+      }, 40);
+      const churned = await churning;
+      clearInterval(churn);
+      const churnTook = performance.now() - t2;
+      check('settled: a page still changing reports quiet:false at the ceiling',
+        churned.mutated === true && churned.quiet === false && churnTook >= 350 && churnTook < 800,
+        `${JSON.stringify(churned)} in ${Math.round(churnTook)}ms`);
+
+      // Our own decoration must not read as a reaction, or every click with a
+      // travelling cursor would report "the page is still changing".
+      await quiesce();
+      const decorated = OB.__handlers.settled({ idleMs: 150, quietMs: 60, maxMs: 500 });
+      setTimeout(() => OB.actions.highlight(document.getElementById('email'), 'click'), 20);
+      const deco = await decorated;
+      check('settled: the tool\'s own highlight is not a reaction', deco.mutated === false, JSON.stringify(deco));
+
+      // Typing reflects to no attribute, so it queues no mutation record — but
+      // it is the reaction a browser_input call is waiting for.
+      const typing = OB.__handlers.settled({ idleMs: 300, quietMs: 60, maxMs: 800 });
+      setTimeout(() => {
+        const f = document.getElementById('email');
+        f.value = 'typed';
+        f.dispatchEvent(new InputEvent('input', { bubbles: true }));
+      }, 30);
+      const typed = await typing;
+      check('settled: typed input counts as a reaction', typed.mutated === true && typed.quiet === true, JSON.stringify(typed));
+      document.getElementById('email').value = '';
+
+      // --- Instant conditions (batch when/unless/repeat) ----------------------
+      const chk = OB.__handlers.check;
+      check('check text: present', chk({ for: 'text', value: 'Create your account' }).ok === true);
+      check('check text: absent', chk({ for: 'text', value: 'zebra crossing' }).ok === false);
+      check('check no_text inverts', chk({ for: 'no_text', value: 'zebra crossing' }).ok === true);
+      check('check selector: visible match', chk({ for: 'selector', value: '#signup button[type=submit]' }).ok === true);
+      check('check selector: hidden match does not count', chk({ for: 'selector', value: '#adv input' }).ok === false);
+      check('check no_selector', chk({ for: 'no_selector', value: '.does-not-exist' }).ok === true);
+      check('check url substring', chk({ for: 'url', value: 'a11y-browser' }).ok === true);
+      check('check url regex', chk({ for: 'url', value: '/a11y-BROWSER\\.html$/i' }).ok === true);
+      check('check ref_gone on a live ref is false', chk({ for: 'ref_gone', value: refs[0] }).ok === false);
+      check('check load', chk({ for: 'load' }).ok === true);
+      check('check unknown kind is an error, not false', /unknown/.test(chk({ for: 'nope' }).error || ''));
+      check('check never throws on a bad selector', chk({ for: 'selector', value: ':::bad' }).ok === false);
+
+      // --- Outline -------------------------------------------------------------
+      // Landmarks carry a selector so mode:"outline" can hand the model something
+      // to scope by; headings and lists do not, or an article would list hundreds.
+      const outlineTree = OB.a11y.buildTree({ mode: 'interactive', selector: '#fixture' });
+      const flatNodes = [];
+      (function flat(list) { for (const n of list) { flatNodes.push(n); if (n.children?.length) flat(n.children); } })(outlineTree.nodes);
+      const navNode = flatNodes.find((n) => n.role === 'navigation');
+      const formNode = flatNodes.find((n) => n.role === 'form');
+      check('landmarks carry a selector', typeof navNode?.sel === 'string' && typeof formNode?.sel === 'string', JSON.stringify({ nav: navNode?.sel, form: formNode?.sel }));
+      check('the landmark selector resolves to the landmark', document.querySelector(formNode?.sel || 'x')?.id === 'signup', formNode?.sel);
+      check('headings carry no selector', flatNodes.filter((n) => n.role === 'heading').every((n) => !n.sel));
+      check('controls carry no selector', flatNodes.filter((n) => n.ref).every((n) => !n.sel));
+      const outline = fmt.renderOutline(outlineTree.nodes);
+      check('outline names the navigation with its link count', /navigation "Main" \(2 links\) selector:"[^"]+"/.test(outline.text), outline.text);
+      check('outline lists the form with its control counts', /form \([^)]*textbox[^)]*\) selector:"#signup"/.test(outline.text), outline.text);
+      check('outline keeps headings for orientation', /h1 "Create your account"/.test(outline.text));
+      check('outline has no refs', !/\[e\d+\]/.test(outline.text));
+      check('outline counts every control', outline.refCount === refs.length, `${outline.refCount} vs ${refs.length}`);
+      check('outline is much smaller than the tree', outline.text.length < text.length / 2, `${outline.text.length} vs ${text.length}`);
 
       // --- Token cost --------------------------------------------------------
       const domBytes = document.getElementById('fixture').innerHTML.length;

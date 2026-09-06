@@ -169,8 +169,29 @@ const DEFAULTS = {
   /** Record request/response bodies. Off by default — they are large. */
   captureBodies: false,
 
-  /** Default snapshot truncation budget, in characters. */
-  maxSnapshotChars: 20000,
+  /**
+   * Default snapshot truncation budget, in characters.
+   *
+   * Was 20,000 — about 5,000 tokens of prefill on every first look at a page
+   * like a Wikipedia article, most of it links the model never touches. A
+   * truncated snapshot now carries an outline of the whole page with a selector
+   * per region, so the next call scopes instead of paging; 8,000 keeps the
+   * common page whole and makes the large one cheap to approach.
+   */
+  maxSnapshotChars: 8000,
+
+  /**
+   * How long an action waits for the page to react before it reports.
+   *
+   * `settleIdleMs`: no DOM change within this → the click went nowhere, say so
+   * now. `settleQuietMs`: a change was seen, and this long has passed without
+   * another → the app is done reacting. `settleMaxMs`: still changing after
+   * this → report what is there and say it is still moving. Replaces a fixed
+   * 350ms sleep plus a 500ms probe; see `awaitSettled` in router.js.
+   */
+  settleIdleMs: 250,
+  settleQuietMs: 120,
+  settleMaxMs: 700,
 
   /** Log every tool call to the side panel activity feed. */
   logActivity: true,

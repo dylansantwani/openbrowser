@@ -396,6 +396,52 @@ var OB = globalThis.OB || (globalThis.OB = {});
   }
 
   // ---------------------------------------------------------------------------
+  // Set-of-Marks overlay
+  // ---------------------------------------------------------------------------
+
+  // The marks layer is held so a second draw replaces the first cleanly and a
+  // clear can find every badge in one shot. Position:fixed badges sit in the
+  // viewport coordinate space the boxes are already in, so a control three
+  // iframes deep is still labelled at the right pixel from the top frame.
+  let markLayer = null;
+
+  /**
+   * Paint a numbered badge at the top-left of each box. The number, not a pixel,
+   * is what the model passes back — so the click resolves through the ref the
+   * badge stands for, with all of `clickPoint`'s obstruction and scroll handling,
+   * instead of a raw coordinate read off a rescaled image.
+   *
+   * In `OWN_DECORATION`, so the badges never enter a snapshot and no agent can
+   * find their way into the tree it reads.
+   */
+  function drawMarks(marks = []) {
+    clearMarks();
+    const layer = document.createElement('div');
+    layer.className = 'ob-mark-layer';
+    for (const m of marks) {
+      const badge = document.createElement('div');
+      badge.className = 'ob-mark';
+      // Anchor the badge just inside the box's top-left, clamped into view so a
+      // control flush against an edge still shows its number.
+      const x = Math.max(2, Math.min(m.box.x, innerWidth - 20));
+      const y = Math.max(2, Math.min(m.box.y, innerHeight - 16));
+      badge.style.cssText = `left:${x}px;top:${y}px;`;
+      badge.textContent = String(m.n);
+      layer.appendChild(badge);
+    }
+    (document.body || document.documentElement).appendChild(layer);
+    markLayer = layer;
+  }
+
+  function clearMarks() {
+    markLayer?.remove();
+    markLayer = null;
+    // Belt and braces: a prior worker may have painted a layer this one never
+    // held a handle to (MV3 tears the script's parent down, not the DOM).
+    for (const el of document.querySelectorAll('.ob-mark-layer')) el.remove();
+  }
+
+  // ---------------------------------------------------------------------------
   // Live cursor
   // ---------------------------------------------------------------------------
 
@@ -701,6 +747,8 @@ var OB = globalThis.OB || (globalThis.OB = {});
     waitFor,
     textPresent,
     highlight,
+    drawMarks,
+    clearMarks,
     cursor,
     hideCursor,
     agentFrame,

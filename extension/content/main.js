@@ -208,6 +208,67 @@ var OB = globalThis.OB || (globalThis.OB = {});
     },
 
     /**
+     * Collect every clickable element with a live box, for the Set-of-Marks
+     * overlay: a numbered badge on each, so a model working from the screenshot
+     * clicks a *number* — which resolves to a real ref — instead of guessing a
+     * pixel off a downscaled image and landing at half the intended offset.
+     *
+     * Built from the same interactive tree and ref registry the snapshot uses,
+     * so a mark's number and a ref name point at the same element. Boxes are in
+     * top-level viewport coordinates (frameOffset added), the space the trusted
+     * click speaks. Off-viewport controls are dropped — a badge for something the
+     * shot cannot show is noise — and marks are capped so a pathological page
+     * cannot paint thousands of badges over the picture it is meant to clarify.
+     */
+    markBoxes({ viewportOnly = true, limit = 120 } = {}) {
+      const { nodes } = a11y.buildTree({ mode: 'interactive', viewportOnly });
+      const off = actions.frameOffset;
+      const marks = [];
+      const seen = new Set();
+
+      const collect = (list) => {
+        for (const node of list) {
+          if (marks.length >= limit) return;
+          if (node.ref && !seen.has(node.ref)) {
+            const el = a11y.resolveRef(node.ref);
+            if (el && a11y.isVisible(el)) {
+              const r = el.getBoundingClientRect();
+              const onScreen = r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth;
+              if (r.width > 0 && r.height > 0 && (!viewportOnly || onScreen)) {
+                seen.add(node.ref);
+                marks.push({
+                  ref: node.ref,
+                  box: {
+                    x: Math.round(r.x + off.x),
+                    y: Math.round(r.y + off.y),
+                    w: Math.round(r.width),
+                    h: Math.round(r.height),
+                  },
+                  label: node.name ? `${node.role} ${node.name}`.slice(0, 40) : node.role,
+                });
+              }
+            }
+          }
+          if (node.children?.length) collect(node.children);
+        }
+      };
+      collect(nodes);
+      return { marks };
+    },
+
+    /** Paint the numbered badges. Top frame only; boxes are already top-level. */
+    drawMarks({ marks }) {
+      actions.drawMarks(marks || []);
+      return { ok: true, count: (marks || []).length };
+    },
+
+    /** Remove the badges before the next snapshot or action reads the page. */
+    clearMarks() {
+      actions.clearMarks();
+      return { ok: true };
+    },
+
+    /**
      * Read a Google sign-in page in this frame: which stage it is at, and the
      * accounts it offers with the point to click each. Pure observation — it
      * clicks nothing. The router (`googleLogin`) decides what, if anything, may
@@ -313,9 +374,80 @@ var OB = globalThis.OB || (globalThis.OB = {});
      * is the one answer that helps with neither.
      */
     async settling({ ms = 500 }) {
+      a11y.watch();
       const before = a11y.mutationCount();
       await new Promise((resolve) => setTimeout(resolve, ms));
       return { mutated: a11y.mutationCount() > before };
+    },
+
+    /**
+     * Wait for the page to finish reacting to an action — or to report that it
+     * never started.
+     *
+     * Replaces a fixed sleep. A click used to cost 350ms of unconditional wait
+     * plus a 500ms probe when nothing changed, so a dead button took ~900ms to
+     * report and a live one waited long after the app had finished. This
+     * resolves at the first of three moments:
+     *
+     *   - the page mutated and has then been quiet for `quietMs` (it reacted,
+     *     and is done);
+     *   - nothing mutated within `idleMs` (it did not react — the fast path
+     *     for the click that went nowhere);
+     *   - `maxMs` elapsed with the page still churning (an animation, a
+     *     spinner: the caller reads what is there and says so).
+     *
+     * Driven by the tree's own mutation counter, so the tool's decoration —
+     * cursor ripple, highlight box — does not count as a reaction, and typed
+     * input counts even though it queues no mutation record. Observer-driven
+     * rather than polled: a background tab's timers may be aligned to coarse
+     * ticks, and a chain of short polls is the shape that throttling hits.
+     */
+    settled({ idleMs = 250, quietMs = 120, maxMs = 700 } = {}) {
+      a11y.watch();
+      return new Promise((resolve) => {
+        const started = performance.now();
+        const base = a11y.mutationCount();
+        let last = base;
+        let idleTimer = null;
+        let quietTimer = null;
+        let capTimer = null;
+        let observer = null;
+
+        const finish = (quiet) => {
+          clearTimeout(idleTimer);
+          clearTimeout(quietTimer);
+          clearTimeout(capTimer);
+          observer?.disconnect();
+          for (const type of ['input', 'change']) removeEventListener(type, bump, true);
+          const n = a11y.mutationCount();
+          resolve({ mutated: n > base, changes: n - base, quiet, ms: Math.round(performance.now() - started) });
+        };
+
+        // The tree's observer and listeners were registered first, so by the
+        // time these fire the counter already reflects the same records.
+        const bump = () => {
+          const n = a11y.mutationCount();
+          if (n === last) return; // our own decoration, or nothing new
+          last = n;
+          clearTimeout(idleTimer);
+          clearTimeout(quietTimer);
+          quietTimer = setTimeout(() => finish(true), quietMs);
+        };
+
+        observer = new MutationObserver(bump);
+        observer.observe(document.documentElement, {
+          subtree: true, childList: true, attributes: true, characterData: true,
+        });
+        for (const type of ['input', 'change']) addEventListener(type, bump, { capture: true, passive: true });
+
+        idleTimer = setTimeout(() => finish(true), idleMs);
+        capTimer = setTimeout(() => finish(false), maxMs);
+        // Records queued before the observer attached — the action's own
+        // immediate effect — arrive at the next microtask; look once now so a
+        // reaction that already happened starts the quiet clock instead of the
+        // idle one.
+        queueMicrotask(bump);
+      });
     },
 
     /** Read a control's current value, for verifying that typing landed. */
@@ -410,32 +542,32 @@ var OB = globalThis.OB || (globalThis.OB = {});
     },
 
     async wait({ for: kind, value, timeout = 15000 }) {
-      switch (kind) {
-        case 'text':
-          return actions.waitFor(() => actions.textPresent(value), timeout);
-        case 'no_text':
-          return actions.waitFor(() => !actions.textPresent(value), timeout);
-        case 'selector':
-          return actions.waitFor(() => {
-            const el = document.querySelector(value);
-            return el && a11y.isVisible(el) ? { found: true } : false;
-          }, timeout);
-        case 'no_selector':
-          return actions.waitFor(() => !document.querySelector(value), timeout);
-        case 'ref_gone':
-          return actions.waitFor(() => !a11y.resolveRef(value)?.isConnected, timeout);
-        case 'url':
-          return actions.waitFor(() => location.href.includes(value) || safeRegex(value)?.test(location.href), timeout);
-        case 'load':
-          return actions.waitFor(() => document.readyState === 'complete', timeout);
-        case 'time': {
-          const ms = Math.min(Number(value) || 1000, timeout);
-          await new Promise((r) => setTimeout(r, ms));
-          return { ok: true, ms };
-        }
-        default:
-          return { error: `unknown wait condition: ${kind}` };
+      if (kind === 'time') {
+        const ms = Math.min(Number(value) || 1000, timeout);
+        await new Promise((r) => setTimeout(r, ms));
+        return { ok: true, ms };
       }
+      const predicate = predicateFor(kind, value);
+      if (!predicate) return { error: `unknown wait condition: ${kind}` };
+      return actions.waitFor(predicate, timeout);
+    },
+
+    /**
+     * Evaluate a wait condition once, right now. This is what a batch step's
+     * `when` / `unless` / `repeat.until` reads: the same vocabulary as
+     * browser_wait, so a model learns one set of conditions, but answered
+     * instantly instead of blocking.
+     */
+    check({ for: kind, value }) {
+      const predicate = predicateFor(kind, value);
+      if (!predicate) return { error: `unknown condition: ${kind}` };
+      let result;
+      try {
+        result = predicate();
+      } catch {
+        result = false;
+      }
+      return { ok: !!result };
     },
 
     pageInfo() {
@@ -590,6 +722,35 @@ var OB = globalThis.OB || (globalThis.OB = {});
     return /verify you are human|are you a robot|complete the security check|pardon our interruption/i.test(
       document.body?.innerText?.slice(0, 3000) || ''
     );
+  }
+
+  /**
+   * The predicate behind a wait condition, shared by `wait` (block until true)
+   * and `check` (answer now). A `selector` counts only when visible; a page that
+   * keeps a hidden dialog in the DOM would otherwise satisfy it forever.
+   */
+  function predicateFor(kind, value) {
+    switch (kind) {
+      case 'text':
+        return () => actions.textPresent(value);
+      case 'no_text':
+        return () => !actions.textPresent(value);
+      case 'selector':
+        return () => {
+          const el = document.querySelector(value);
+          return el && a11y.isVisible(el) ? { found: true } : false;
+        };
+      case 'no_selector':
+        return () => !document.querySelector(value);
+      case 'ref_gone':
+        return () => !a11y.resolveRef(value)?.isConnected;
+      case 'url':
+        return () => location.href.includes(value) || safeRegex(value)?.test(location.href);
+      case 'load':
+        return () => document.readyState === 'complete';
+      default:
+        return null;
+    }
   }
 
   function safeRegex(source) {

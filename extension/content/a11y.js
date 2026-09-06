@@ -65,6 +65,17 @@ var OB = globalThis.OB || (globalThis.OB = {});
    */
   const MEANINGFUL_WHEN_EMPTY = new Set(['iframe', 'canvas', 'video', 'audio', 'img']);
 
+  /**
+   * Landmarks that anchor an outline. Each gets a selector so a model reading
+   * `mode:"outline"` can scope its next snapshot to the region it wants without
+   * another round trip to discover how to address it. Lists and headings are
+   * deliberately absent: a long article has hundreds of both.
+   */
+  const OUTLINE_ROLES = new Set([
+    'main', 'navigation', 'banner', 'contentinfo', 'complementary', 'form',
+    'search', 'region', 'dialog', 'alertdialog', 'article', 'table', 'tablist',
+  ]);
+
   /** Structural roles worth keeping for orientation, without a ref. */
   const LANDMARK_ROLES = new Set([
     'main', 'navigation', 'banner', 'contentinfo', 'complementary', 'form',
@@ -488,7 +499,7 @@ var OB = globalThis.OB || (globalThis.OB = {});
    * which lands inside the settling probe's window: without this entry, every
    * click with a travel distance reports "the page is still changing".
    */
-  const OWN_DECORATION = '.ob-highlight, .ob-agent-frame, .ob-window-pick, .ob-cursor';
+  const OWN_DECORATION = '.ob-highlight, .ob-agent-frame, .ob-window-pick, .ob-cursor, .ob-mark-layer, .ob-mark';
 
   function isDecoration(node) {
     const el = node?.nodeType === 1 ? node : node?.parentElement;
@@ -697,6 +708,12 @@ var OB = globalThis.OB || (globalThis.OB = {});
       }
 
       const node = { role, name, depth, children: kids };
+
+      // Addressable landmarks, for the outline. Cheap: a page has a handful.
+      if (landmark && !interactive && OUTLINE_ROLES.has(role)) {
+        const sel = cssPath(el);
+        if (sel) node.sel = sel;
+      }
 
       if (interactive) {
         node.ref = refFor(el, role, name);
@@ -928,6 +945,8 @@ var OB = globalThis.OB || (globalThis.OB = {});
     buildTree,
     invalidate,
     mutationCount: () => mutations,
+    /** Start counting mutations now, without building a tree first. */
+    watch: watchForChanges,
     findElements,
     resolveRef,
     refFor,

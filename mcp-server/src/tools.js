@@ -35,6 +35,20 @@ const COORD = {
   description: 'Viewport CSS pixels [x,y]. Prefer ref; use coords only for canvas/maps/PDF.',
 };
 
+/**
+ * Verify-in-the-same-call. "Did it work?" used to be its own round trip (act,
+ * wait, snapshot); folding the wait into the action removes a model turn from
+ * nearly every click that matters.
+ */
+const EXPECT = {
+  type: 'object',
+  description:
+    'Verify in this call: {for, value, timeout?}, a browser_wait condition, e.g. {for:"text", value:"Order placed"}. Blocks until met (default 5s); a miss is an error, so a batch stops there.',
+};
+
+/** A browser_wait condition, answered instantly — the gate on a batch step. */
+const COND = { type: 'object' };
+
 export const TOOLS = [
   {
     name: 'browser_tabs',
@@ -101,15 +115,15 @@ export const TOOLS = [
         tabId: TAB,
         mode: {
           type: 'string',
-          enum: ['interactive', 'full', 'text', 'diff'],
+          enum: ['interactive', 'full', 'text', 'diff', 'outline'],
           description:
-            'interactive (default): controls + structure. full: adds static text. text: plain text, no refs. diff: only what changed since the last snapshot — use in loops.',
+            'interactive (default): controls + structure. full: adds static text. text: plain text, no refs. diff: only what changed since the last snapshot — use in loops. outline: landmarks + headings with control counts and a selector each — the cheap first look at a big page; then scope with selector.',
         },
         selector: {
           type: 'string',
           description: 'CSS selector to scope the snapshot to one region. Big token saver on dense pages.',
         },
-        maxChars: { type: 'number', description: 'Truncation budget. Default 20000.' },
+        maxChars: { type: 'number', description: 'Truncation budget. Default 8000; a truncated read ends with an outline to scope by.' },
         frames: {
           type: 'boolean',
           description: 'Include same- and cross-origin iframes. Default true.',
@@ -182,6 +196,10 @@ export const TOOLS = [
           enum: ['css', 'image'],
           description: '"image": coords read off the last browser_screenshot (auto-converted to viewport px). Default "css".',
         },
+        mark: {
+          type: 'number',
+          description: 'Click badge N from the last marks:true screenshot (resolves to that element; no pixel math).',
+        },
         direction: {
           type: 'string',
           enum: ['down', 'up', 'left', 'right'],
@@ -203,6 +221,7 @@ export const TOOLS = [
           type: 'boolean',
           description: 'Skip the visible/enabled precheck and click anyway. For overlay-covered targets.',
         },
+        expect: EXPECT,
       },
       required: ['action'],
     },
@@ -246,6 +265,7 @@ export const TOOLS = [
         },
         submit: { type: 'boolean', description: 'Press Enter when done. Default false.' },
         delay: { type: 'number', description: 'ms between keystrokes. Raise for inputs with aggressive JS masking.' },
+        expect: EXPECT,
       },
     },
   },
@@ -280,6 +300,10 @@ export const TOOLS = [
         format: { type: 'string', enum: ['png', 'jpeg'], description: 'Default jpeg (much smaller).' },
         quality: { type: 'number', description: 'jpeg only, 1-100. Default 70.' },
         maxWidth: { type: 'number', description: 'Downscale to this width. Default 1280.' },
+        marks: {
+          type: 'boolean',
+          description: 'Number every clickable element with a badge; click one via browser_act mark:N. Reliable on canvas apps (Docs, Figma) and dense UIs — no pixel guessing.',
+        },
         animate: {
           type: 'object',
           description: 'Record an animated GIF instead of a still.',
@@ -302,9 +326,10 @@ export const TOOLS = [
         tabId: TAB,
         for: {
           type: 'string',
-          enum: ['text', 'no_text', 'selector', 'no_selector', 'ref_gone', 'url', 'network_idle', 'load', 'time'],
+          enum: ['text', 'no_text', 'selector', 'no_selector', 'ref_gone', 'url', 'network_idle', 'load', 'time', 'job'],
+          description: '"job": collect an async batch by id; no value lists your jobs.',
         },
-        value: { type: 'string', description: 'The text, selector, ref, or URL substring/regex to wait for.' },
+        value: { type: 'string', description: 'The text, selector, ref, URL substring/regex, or job id to wait for.' },
         timeout: { type: 'number', description: 'ms. Default 15000.' },
       },
       required: ['for'],
@@ -371,22 +396,32 @@ export const TOOLS = [
   {
     name: 'browser_batch',
     description:
-      'Run several tool calls as one request — a login flow becomes one call, not eight. Steps run in order; use "parallel" to fan them across tabs.',
+      'Prefer this to one call at a time whenever you can name the next 2+ steps — each call is a full round-trip. Steps run in order with when/unless/repeat control flow; "parallel" fans them across tabs; async:true returns at once.',
     inputSchema: {
       type: 'object',
       properties: {
         tabId: { ...TAB, description: 'Default tab for every step. A step may still set its own.' },
         steps: {
           type: 'array',
-          description: 'Each step is {tool, args}. Refs from one step are visible to later steps.',
+          description: 'Each step is {tool, args} plus optional when/unless/repeat. Refs from one step are visible to later steps.',
           items: {
             type: 'object',
             properties: {
               tool: { type: 'string', description: 'Any browser_* tool name except browser_batch.' },
               args: { type: 'object' },
+              when: { ...COND, description: 'Run only if this browser_wait-style condition {for, value} holds now.' },
+              unless: { ...COND, description: 'Run only if it does not hold now.' },
+              repeat: {
+                type: ['object', 'number'],
+                description: 'Rerun: {until|while: cond, max?} (default 10, cap 50) or a count. "click Next until gone" is one step.',
+              },
+              steps: { type: 'array', description: 'Sub-steps run as one unit under this step\'s when/unless/repeat.' },
             },
-            required: ['tool'],
           },
+        },
+        async: {
+          type: 'boolean',
+          description: 'Return a job id at once and run in the background; collect with browser_wait for:"job" value:<id>.',
         },
         parallel: {
           type: 'array',
@@ -493,11 +528,18 @@ export const SERVER_INSTRUCTIONS = `Drive a real Chrome browser through the Open
 
 Workflow that works: browser_snapshot to see the page -> act on [ref=eN] handles -> browser_wait for the result. Only screenshot when you need to see pixels.
 
-Token discipline:
-- browser_snapshot mode:"interactive" is the default view of a page. mode:"diff" in loops.
-- Scope with the "selector" param on dense pages.
-- Batch multi-step flows with browser_batch instead of one call per step.
+Token discipline — every tool call is a full model round-trip, so the number of calls is what makes a task slow, far more than what each call costs:
+- Default to browser_batch whenever you can name the next two or more steps. navigate -> wait -> snapshot is ONE call, not three; the same steps repeated across a list of items is ONE call, not four per item. Refs from earlier steps are visible to later ones, and "parallel" fans the steps across tabs. Doing this by hand, one call at a time in a loop, is the single biggest waste there is — reach for browser_batch first, not as an afterthought.
+- Re-reading a page inside a loop: use browser_snapshot mode:"diff", which returns only what changed since your last snapshot. Re-snapshotting the whole page every pass is what makes context, and therefore latency, grow without bound.
+- browser_snapshot mode:"interactive" is the default first view of a page. Scope with the "selector" param on dense pages.
 - Screenshots cost roughly 20x a snapshot. Use them to verify, not for routine navigation.
+
+Fewer round-trips, per step:
+- browser_act / browser_input take expect:{for, value} — the same conditions as browser_wait — and verify in the same call. "click Place order, expect text 'Order placed'" is one call, and a batch stops at a failed expectation, so it is a gate, not a note.
+- browser_batch steps take when / unless (run only if a condition holds) and repeat ({until|while, max} or a count), and a step may hold sub-steps. "dismiss the cookie banner if there is one, then click Next until it disappears, then snapshot" is one call. Conditions are checked instantly, never waited for — put a browser_wait step before one that depends on a load.
+- browser_batch async:true returns a job id at once; browser_wait for:"job" value:<id> collects it (or reports progress). Use it for a slow flow on one tab while you read another.
+- browser_snapshot mode:"outline" is the cheap first look at a big page: landmarks and headings, each with its control count and a selector to scope by. A truncated snapshot ends with the same outline, so the next call scopes instead of paging.
+- Every action already waits for the page to react (or to prove it will not) before returning; do not add browser_wait for:"time" after a click.
 
 Stuck? Use your eyes. After two actions with no visible progress, take ONE browser_screenshot — overlays, modals, cookie banners, and canvas UIs may be invisible to snapshots. Then act on what you see with browser_act space:"image".
 

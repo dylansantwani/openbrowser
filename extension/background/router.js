@@ -22,6 +22,8 @@ import * as oauth from './oauth.js';
 import { encodeGif } from './gif.js';
 import { getSettings, checkUrlAllowed } from './settings.js';
 import { serializeTabMutation, clearTabMutation } from './mutation-queue.js';
+import { runPlan } from './batch.js';
+import * as jobs from './jobs.js';
 
 /** Emitted for the side panel's activity log. */
 const activityListeners = new Set();
@@ -462,6 +464,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   // The saved screenshot mapping dies with the tab; without this its
   // session-storage entry would leak for the life of the browser.
   clearCaptureGeometry(tabId);
+  clearMarks(tabId);
   // So does the pointer's remembered position.
   mutateStored(CURSOR_POS_KEY, (all) => {
     delete all[tabId];
@@ -494,6 +497,112 @@ chrome.webNavigation?.onCommitted?.addListener((details) => {
 function navSince(tabId, t) {
   const nav = navCommits.get(tabId);
   return nav && nav.at >= t ? nav : null;
+}
+
+/**
+ * Main-frame navigation *starts*, newest per tab.
+ *
+ * A click that navigates commits its new document anywhere from a few
+ * milliseconds to a few seconds later, depending on the server. The old fixed
+ * sleep papered over that with 350ms and got it wrong both ways: too long for
+ * every click that did not navigate, too short for a slow one, which was then
+ * reported UNVERIFIED and retried on a page that was already changing. The
+ * start event fires the instant the click sends the browser somewhere, so the
+ * settle can tell "nothing happened" from "the answer is in flight" and wait
+ * only in the second case.
+ */
+const navStarts = new Map();
+
+chrome.webNavigation?.onBeforeNavigate?.addListener((details) => {
+  if (details.frameId !== 0) return;
+  navStarts.set(details.tabId, { url: details.url, at: Date.now() });
+});
+
+function navStartedSince(tabId, t) {
+  const nav = navStarts.get(tabId);
+  return nav && nav.at >= t ? nav : null;
+}
+
+/** How long to wait for a navigation that has started to commit. */
+const COMMIT_WAIT_MS = 2500;
+
+/**
+ * Wait for the page to finish reacting to an action.
+ *
+ * Replaces `settle(350)` after every click and the 500ms `settling` probe that
+ * followed when nothing changed — 850ms of fixed cost on the most common call
+ * there is, most of it spent waiting for a page that had either finished long
+ * ago or was never going to react. The page reports the moment it knows: it
+ * mutated and went quiet, or it did not mutate within the idle window
+ * (`settled` in main.js). In parallel, the navigation records above catch the
+ * one reaction the page cannot report on — its own replacement.
+ *
+ * Returns what happened, so the caller can say the right thing: `navigated`
+ * (the URL), `mutated` (true/false, or null when the page went away before it
+ * could answer), `quiet` (false when it hit the ceiling still changing).
+ */
+async function awaitSettled(tabId, startedAt, { idle, quiet, max } = {}) {
+  const settings = await getSettings();
+  const opts = {
+    idleMs: idle ?? settings.settleIdleMs ?? 250,
+    quietMs: quiet ?? settings.settleQuietMs ?? 120,
+    maxMs: max ?? settings.settleMaxMs ?? 700,
+  };
+  const t0 = Date.now();
+
+  let resolveCommit;
+  const committed = new Promise((r) => {
+    resolveCommit = r;
+  });
+  const onCommit = (details) => {
+    if (details.tabId === tabId && details.frameId === 0) resolveCommit({ url: details.url, at: Date.now() });
+  };
+  chrome.webNavigation?.onCommitted?.addListener(onCommit);
+
+  try {
+    let page = null;
+    let nav = navSince(tabId, startedAt);
+    if (!nav) {
+      // The page's verdict, unless the document is replaced first — in which
+      // case its answer is moot and the commit is the answer.
+      page = await Promise.race([
+        frames.sendToTab(tabId, 'settled', opts).catch(() => null),
+        committed.then(() => null),
+      ]);
+      nav = navSince(tabId, startedAt);
+    }
+    if (!nav && navStartedSince(tabId, startedAt)) {
+      // Started but not committed: the server has not answered yet. Wait for
+      // it — bounded, because a hung request must not hang the tool.
+      nav = await Promise.race([committed, settle(COMMIT_WAIT_MS).then(() => null)]);
+    }
+    return {
+      navigated: nav || null,
+      mutated: page ? !!page.mutated : null,
+      changes: page?.changes ?? 0,
+      quiet: page ? page.quiet !== false : true,
+      ms: Date.now() - t0,
+    };
+  } finally {
+    chrome.webNavigation?.onCommitted?.removeListener(onCommit);
+  }
+}
+
+/**
+ * What to tell a model when an action produced no visible delta. The settle
+ * watched the page while the input landed, so it can say which of the four
+ * things this is — and each needs a different next move.
+ */
+function settleVerdict(settled) {
+  if (settled?.navigated) return `navigated to ${fmt.shortUrl(settled.navigated.url)}`;
+  if (settled?.mutated && !settled.quiet) {
+    return 'no change in the controls yet, but the page is still changing — browser_wait or snapshot again in a moment';
+  }
+  if (settled?.mutated) {
+    const n = settled.changes;
+    return `the page reacted (${n} DOM change${n === 1 ? '' : 's'}) but no control changed — likely a text-only update; browser_snapshot mode:"full" reads it`;
+  }
+  return 'UNVERIFIED: no page change was detected — the input was dispatched, but it may have missed or this control may do nothing on its own. Verify the expected state before continuing.';
 }
 
 /**
@@ -854,7 +963,7 @@ async function pageMeta(tabId) {
 /** A delta is a convenience. Past this, it is cheaper to let the model ask. */
 const DELTA_BUDGET_MS = 3000;
 
-async function withDelta(tabId, fn) {
+async function withDelta(tabId, fn, { quiet = false } = {}) {
   // When the action began, so a navigation that commits during it — however
   // late — is attributable to it via the `navCommits` record.
   const startedAt = Date.now();
@@ -868,38 +977,15 @@ async function withDelta(tabId, fn) {
   // return).
   const beforeUrl = (await chrome.tabs.get(tabId).catch(() => null))?.url;
 
-  const result = await fn();
+  const result = await fn({ startedAt });
   let changed;
 
   const opened = await newTabsSince(before);
-  try {
-    // Must use the same shape as a plain browser_snapshot: this both reads and
-    // replaces the stored baseline, and a baseline captured under a different
-    // budget or scope would make the next mode:"diff" report the mismatch as
-    // page changes. Only the diff is returned, so the full read costs nothing
-    // in tokens.
-    const settings = await getSettings();
-
-    // On a large app the tree can take longer to build than the action itself
-    // took to perform — a click in Gmail should not cost 45 seconds because we
-    // volunteered a diff nobody asked for. Race it and drop it if slow.
-    const { text } = await Promise.race([
-      snapshotText(tabId, { mode: 'interactive', maxChars: settings.maxSnapshotChars }),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('delta budget exceeded')), DELTA_BUDGET_MS)),
-    ]);
-
-    const diff = fmt.diffSnapshot(tabId, text);
-    if (!diff.unchanged && !diff.isFirst) {
-      changed = diff.replaced ? 'page changed substantially — snapshot for detail' : `changes:\n${diff.text}`;
-    }
-  } catch (err) {
-    // Either the page is mid-navigation, or it is too big to diff cheaply.
-    // Say so for the latter, so the omission is not mistaken for "nothing
-    // changed". Never fail the action over a diff.
-    if (/delta budget/.test(err.message)) {
-      changed = 'page too large to diff quickly — call browser_snapshot if you need to see the result';
-    }
-  }
+  // Inside a batch every step but the last runs quiet: its delta would be
+  // discarded with the intermediate result, and on a large app building it
+  // costs more than the action did. The navigation and new-tab checks below
+  // are cheap and stay on — they are what the next step needs to know.
+  if (!quiet) changed = await deltaFor(tabId);
   // A same-tab navigation is a real change even when the diff missed it: a
   // cross-origin click lands the new document after the settle window, so the
   // snapshot above runs before its content script is ready and throws, leaving
@@ -928,6 +1014,39 @@ async function withDelta(tabId, fn) {
   }
 
   return { result, changed, startedAt };
+}
+
+/** The interactive-tree diff since the last stored snapshot, or undefined. */
+async function deltaFor(tabId) {
+  try {
+    // Must use the same shape as a plain browser_snapshot: this both reads and
+    // replaces the stored baseline, and a baseline captured under a different
+    // budget or scope would make the next mode:"diff" report the mismatch as
+    // page changes. Only the diff is returned, so the full read costs nothing
+    // in tokens.
+    const settings = await getSettings();
+
+    // On a large app the tree can take longer to build than the action itself
+    // took to perform — a click in Gmail should not cost 45 seconds because we
+    // volunteered a diff nobody asked for. Race it and drop it if slow.
+    const { text } = await Promise.race([
+      snapshotText(tabId, { mode: 'interactive', maxChars: settings.maxSnapshotChars }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('delta budget exceeded')), DELTA_BUDGET_MS)),
+    ]);
+
+    const diff = fmt.diffSnapshot(tabId, text);
+    if (!diff.unchanged && !diff.isFirst) {
+      return diff.replaced ? 'page changed substantially — snapshot for detail' : `changes:\n${diff.text}`;
+    }
+  } catch (err) {
+    // Either the page is mid-navigation, or it is too big to diff cheaply.
+    // Say so for the latter, so the omission is not mistaken for "nothing
+    // changed". Never fail the action over a diff.
+    if (/delta budget/.test(err.message)) {
+      return 'page too large to diff quickly — call browser_snapshot if you need to see the result';
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -990,22 +1109,6 @@ async function showTab(tabId, settings) {
   return `tab ${tabId} is now the visible tab in ${windows.windowName(win)}; the window was not raised`;
 }
 
-/**
- * Tell "the app has not reacted yet" from "the click went nowhere".
- *
- * Both look identical from the outside — no delta, no error — and they need
- * opposite responses. Several clicks on Meta's "Create post" registered but did
- * not navigate and needed a second attempt, which is indistinguishable from a
- * click that missed unless something reports the difference.
- */
-async function settlingNote(tabId) {
-  const result = await frames.sendToTab(tabId, 'settling', { ms: 500 }).catch(() => null);
-  if (!result) return null;
-  return result.mutated
-    ? 'no diff yet, but the page is still changing — browser_wait or snapshot again in a moment'
-    : 'UNVERIFIED: no page change was detected — the input was dispatched, but it may have missed or this control may do nothing on its own. Verify the expected state before continuing.';
-}
-
 /** Ids of every open tab, for spotting ones an action creates. */
 async function tabIdSet() {
   try {
@@ -1026,12 +1129,15 @@ async function newTabsSince(before) {
 
 /** Build the merged snapshot text for a tab across all its frames. */
 async function snapshotText(tabId, opts) {
-  const { mode = 'interactive', selector, viewportOnly, maxChars = 20000, includeFrames = true } = opts;
+  const { mode = 'interactive', selector, viewportOnly, maxChars = 8000, includeFrames = true } = opts;
 
+  // An outline is a different rendering of the interactive tree, not a
+  // different walk — so the page-side cache serves both from one build.
+  const wire = mode === 'outline' ? 'interactive' : mode;
   const { frames: results, failed } = await frames.broadcast(
     tabId,
     'snapshot',
-    { mode, selector, viewportOnly, maxChars },
+    { mode: wire, selector, viewportOnly, maxChars },
     { includeSubframes: includeFrames }
   );
 
@@ -1046,6 +1152,7 @@ async function snapshotText(tabId, opts) {
 
   const sections = [];
   let budget = maxChars;
+  let refCount = 0;
   // Two independent ways to lose content: the page was too big to walk, or the
   // walked tree was too big to render within maxChars. Both must be reported —
   // a partial page that looks complete is worse than an obvious error.
@@ -1065,7 +1172,9 @@ async function snapshotText(tabId, opts) {
     const nodes = frames.qualifyRefs(result.nodes || [], frame.index);
     if (!nodes.length) continue;
 
-    const rendered = fmt.renderTree(nodes, { maxChars: budget });
+    const rendered =
+      mode === 'outline' ? fmt.renderOutline(nodes, { maxChars: budget }) : fmt.renderTree(nodes, { maxChars: budget });
+    refCount += rendered.refCount || 0;
     if (rendered.truncated) truncated = true;
     if (!rendered.text) continue;
 
@@ -1077,7 +1186,7 @@ async function snapshotText(tabId, opts) {
     );
   }
 
-  return { text: sections.join('\n'), truncated };
+  return { text: sections.join('\n'), truncated, refCount };
 }
 
 function indent(text, pad = '  ') {
@@ -1158,6 +1267,22 @@ const HANDLERS = {
       }
     }
     return { names: [...names] };
+  },
+
+  /**
+   * Internal, developer installs only: reload the extension so edits under
+   * `extension/` take effect. Not an MCP tool — the server never publishes it,
+   * so a model cannot call it; a developer's own script on the hub can, which
+   * replaces the chrome://extensions round trip that every edit used to need.
+   * A store install has an `update_url` and refuses; there is nothing to
+   * reload from disk there.
+   */
+  async __reload() {
+    if (chrome.runtime.getManifest().update_url) {
+      throw new Error('reload is only available for an unpacked (developer) install');
+    }
+    setTimeout(() => chrome.runtime.reload(), 150);
+    return 'reloading the extension';
   },
 
   // ---------------------------------------------------------------- tabs ----
@@ -1341,6 +1466,7 @@ const HANDLERS = {
     // stray space:"image" click cannot convert against the old page. The
     // freshness check in imageToViewport is the backstop, this is the tidy path.
     clearCaptureGeometry(tabId);
+    clearMarks(tabId);
 
     const waitUntil = args.waitUntil || 'load';
     if (waitUntil !== 'none') {
@@ -1384,7 +1510,7 @@ const HANDLERS = {
 
     if (args.frames !== false) await frames.refreshFrameOffsets(tabId);
 
-    const { text, truncated } = await snapshotText(tabId, {
+    const { text, truncated, refCount } = await snapshotText(tabId, {
       mode: mode === 'diff' ? 'interactive' : mode,
       selector: args.selector,
       viewportOnly: args.viewportOnly,
@@ -1398,6 +1524,18 @@ const HANDLERS = {
     if (mode === 'diff') {
       const diff = fmt.diffSnapshot(tabId, text);
       return `${header}\n${diff.text}`;
+    }
+
+    // The cheap first look at a big page: where things are and how to scope to
+    // them, so the next call reads one region instead of paging through all.
+    if (mode === 'outline') {
+      const body = text.trim()
+        ? text
+        : '(no landmarks — this page has no structure to outline; use mode:"interactive", viewportOnly:true)';
+      const hint =
+        `${refCount} control${refCount === 1 ? '' : 's'} on the page · next: browser_snapshot selector:"<one of the selectors above>", ` +
+        'or viewportOnly:true for what is on screen';
+      return [header, body, hint].join('\n');
     }
 
     // Only a full-page interactive read is a valid diff baseline. Storing a
@@ -1423,6 +1561,20 @@ const HANDLERS = {
         `NOTE: output truncated — this page is larger than the ${maxChars}-character budget, so content below is missing. ` +
           'Scope with selector:"<css>", or raise maxChars. Anything late in the page (dialogs, footers, modals) is the first to be cut.'
       );
+      // Save the round trip the note would otherwise cost: a truncated read of
+      // the whole page carries the whole page's outline, so the next call can
+      // scope to the right region straight away. A scoped read is already
+      // scoped; the outline would just repeat the choice.
+      if (!args.selector) {
+        const outline = await snapshotText(tabId, {
+          mode: 'outline',
+          maxChars: 1500,
+          includeFrames: args.frames !== false,
+        }).catch(() => null);
+        if (outline?.text?.trim()) {
+          notes.push(`Outline of the whole page — pick a selector and re-snapshot:\n${outline.text}`);
+        }
+      }
     }
 
     if (!text.trim()) {
@@ -1521,17 +1673,23 @@ const HANDLERS = {
     const IN_PAGE = ['focus', 'blur', 'scroll_to', 'select_option', 'check', 'uncheck', 'clear', 'submit'];
     if (IN_PAGE.includes(action)) {
       const route = args.ref ? await frames.routeRef(tabId, args.ref) : { frameId: 0, localRef: undefined };
-      const { result, changed } = await withDelta(tabId, async () => {
-        const r = await frames.sendToFrame(tabId, route.frameId, 'act', {
-          action,
-          ref: route.localRef,
-          value: args.value,
-        });
-        if (r.error) throw new Error(r.error);
-        await settle(150);
-        return r;
-      });
-      return fmt.actionResult(`${action} ok`, { changed, meta: await pageMeta(tabId), tabId });
+      let expected = null;
+      const { changed } = await withDelta(
+        tabId,
+        async ({ startedAt }) => {
+          const r = await frames.sendToFrame(tabId, route.frameId, 'act', {
+            action,
+            ref: route.localRef,
+            value: args.value,
+          });
+          if (r.error) throw new Error(r.error);
+          await awaitSettled(tabId, startedAt);
+          if (args.expect) expected = await expectAfter(tabId, args.expect);
+          return r;
+        },
+        { quiet: args._quiet }
+      );
+      return finishAction(`${action} ok`, { changed, expected, meta: await pageMeta(tabId), tabId });
     }
 
     if (action === 'scroll') {
@@ -1572,7 +1730,8 @@ const HANDLERS = {
       click: action !== 'hover',
     });
 
-    const { changed, startedAt } = await withDelta(tabId, async () => {
+    let expected = null;
+    const { changed, result: settled } = await withDelta(tabId, async ({ startedAt }) => {
       const { x, y } = target.point;
       const opts = { modifiers: args.modifiers || [] };
 
@@ -1607,34 +1766,30 @@ const HANDLERS = {
         default:
           throw new Error(`unknown action: ${action}`);
       }
-      // Clicks commonly start a navigation; give it a chance to commit.
-      await settle(action === 'hover' ? 120 : 350);
-    });
+      // Wait for the page to react — or to prove it will not — instead of a
+      // fixed sleep. Hover gets a shorter idle window: a menu that is going to
+      // open does so at once, and no change is its normal outcome.
+      const settled = await awaitSettled(tabId, startedAt, action === 'hover' ? { idle: 100, max: 300 } : {});
+      if (args.expect) expected = await expectAfter(tabId, args.expect);
+      return settled;
+    }, { quiet: args._quiet });
 
     const label = args.ref
       ? `dispatched ${action} ${args.ref}${target.name ? ` ("${fmt.truncate(target.name, 40)}")` : ''}`
       : `dispatched ${action} at ${Math.round(target.point.x)},${Math.round(target.point.y)}`;
 
-    // A click that changed nothing is ambiguous, and the two possibilities need
-    // opposite responses: wait, or try something else. "Nothing" includes a
-    // delta that is only the focus ring moving, which is what a click on a dead
-    // button produces. Hover is excluded — no change is its normal outcome.
+    // A click that changed nothing is ambiguous, and the possibilities need
+    // opposite responses: wait, read the text, or try something else.
+    // "Nothing" includes a delta that is only the focus ring moving, which is
+    // what a click on a dead button produces. Hover is excluded — no change is
+    // its normal outcome. The settle watched the page while the click landed,
+    // so its verdict says which case this is; no second probe is needed.
     //
-    // A native dialog is the third possibility, and it must be checked before
-    // the settling probe: the dialog pauses the renderer, so the probe's
-    // content-script call would hang forever instead of reporting anything.
+    // A native dialog is checked first: it pauses the renderer, and it is the
+    // one reaction the settle cannot see.
     const dlg = cdp.pendingDialog(tabId);
     const nothingHappened = !changed || fmt.isFocusOnly(changed);
-    let note = nothingHappened && action !== 'hover' && !dlg ? await settlingNote(tabId) : null;
-
-    // The settling probe waits another 500ms, which is long enough for a slow
-    // navigation to commit — check once more before calling the click
-    // unverified, or a click that worked is reported as one that may have
-    // missed and the agent retries it on a page that already changed.
-    if (note && /^UNVERIFIED/.test(note)) {
-      const nav = navSince(tabId, startedAt);
-      if (nav) note = `navigated to ${fmt.shortUrl(nav.url)}`;
-    }
+    const note = nothingHappened && action !== 'hover' && !dlg && !args._quiet ? settleVerdict(settled) : null;
 
     let label2 = label;
     if (dlg) {
@@ -1648,7 +1803,7 @@ const HANDLERS = {
     // The focus churn is replaced rather than appended: it is noise, and the
     // note carries the one fact worth having. pageMeta is dialog-aware and
     // falls back to tab metadata when the renderer is paused.
-    return fmt.actionResult(label2, { changed: note || changed, meta: await pageMeta(tabId), tabId });
+    return finishAction(label2, { changed: note || changed, expected, meta: await pageMeta(tabId), tabId });
   },
 
   // --------------------------------------------------------------- input ----
@@ -1658,7 +1813,9 @@ const HANDLERS = {
 
     const summary = [];
 
-    const { changed } = await withDelta(tabId, async () => {
+    let expected = null;
+    let settled = null;
+    const { changed } = await withDelta(tabId, async ({ startedAt }) => {
       // 1. Batch field fill. Grouped by frame so each frame gets one round trip.
       if (args.fields?.length) {
         const byFrame = new Map();
@@ -1760,25 +1917,34 @@ const HANDLERS = {
         summary.push('dispatched Enter');
       }
 
-      await settle(300);
-    });
+      // Typing fires input events the tree counts as activity, so a field
+      // that took the text settles the moment it goes quiet — typically well
+      // under the 300ms this used to sleep unconditionally.
+      settled = await awaitSettled(tabId, startedAt);
+      if (args.expect) expected = await expectAfter(tabId, args.expect);
+    }, { quiet: args._quiet });
 
     if (!summary.length) {
       throw new Error('nothing to do — pass `fields`, `text`, or `keys`.');
     }
 
     let done = summary.join('\n');
-    if (!changed && ((args.text != null && !args.ref) || args.keys?.length || args.submit)) {
+    if (!changed && settled?.navigated) {
+      done += `\nnavigated to ${fmt.shortUrl(settled.navigated.url)}`;
+    } else if (
+      !changed && !settled?.mutated && !args._quiet &&
+      ((args.text != null && !args.ref) || args.keys?.length || args.submit)
+    ) {
       done += '\nUNVERIFIED: the keystrokes were dispatched, but no target value or page change could be read back. ' +
         'Pass ref when typing, or verify the expected result with browser_wait/snapshot.';
     }
-    return fmt.actionResult(done, { changed, meta: await pageMeta(tabId), tabId });
+    return finishAction(done, { changed, expected, meta: await pageMeta(tabId), tabId });
   },
 
   // ---------------------------------------------------------- screenshot ----
   async browser_screenshot(args) {
     const tabId = await resolveTab(args);
-    await prepareTab(tabId, { needsScripts: !!args.ref || !!args.selector });
+    await prepareTab(tabId, { needsScripts: !!args.ref || !!args.selector || !!args.marks });
 
     const format = args.format || 'jpeg';
     const quality = args.quality ?? 70;
@@ -1800,12 +1966,38 @@ const HANDLERS = {
       clip = { x, y, width, height };
     }
 
-    const base64 = await cdp.captureScreenshot(tabId, {
-      format,
-      quality,
-      fullPage: args.mode === 'full_page',
-      clip,
-    });
+    // Set-of-Marks: paint a numbered badge on every clickable element, so the
+    // model reading the image clicks a number (browser_act mark:N) that resolves
+    // to a real ref — the whole coordinate-space problem below simply does not
+    // arise, because no pixel is ever passed back. Only for a whole-viewport
+    // shot: a clip frames one thing, and badges over it would be noise.
+    let markTable = null;
+    const doMarks = args.marks && !clip;
+    if (doMarks) {
+      try {
+        const got = await frames.sendToTab(tabId, 'markBoxes', { viewportOnly: true });
+        markTable = (got?.marks || []).map((m, i) => ({ n: i + 1, ...m }));
+        if (markTable.length) await frames.sendToTab(tabId, 'drawMarks', { marks: markTable });
+      } catch {
+        // Marks are an aid, not the capture. A page that refuses the overlay
+        // still gets its screenshot — just without badges.
+        markTable = null;
+      }
+    }
+
+    let base64;
+    try {
+      base64 = await cdp.captureScreenshot(tabId, {
+        format,
+        quality,
+        fullPage: args.mode === 'full_page',
+        clip,
+      });
+    } finally {
+      // Clear the badges before anything else reads the page, whether or not the
+      // capture threw — a leftover overlay would sit on top of the real UI.
+      if (markTable?.length) await frames.sendToTab(tabId, 'clearMarks', {}).catch(() => {});
+    }
 
     const resized = await downscale(base64, format, quality, maxWidth);
     const meta = await pageMeta(tabId).catch(() => ({}));
@@ -1829,9 +2021,27 @@ const HANDLERS = {
     // clicking reliable for local models that only have the picture to go on.
     const mapping = fmt.captureMapping(geometry);
     await saveCaptureGeometry(tabId, mapping, meta);
-    const hint = mapping
-      ? '\n→ to click a spot in this image: browser_act action:"click" coordinate:[imageX,imageY] space:"image"'
-      : '';
+
+    // With badges on the shot, the number IS the way to click — resolving to a
+    // ref, so no image↔CSS factor is ever in play. The legend names each badge
+    // so the model can pick "Bold" by its number without reading tiny digits off
+    // a downscaled JPEG. The image-space coordinate hint would only compete with
+    // it, so it is suppressed whenever marks are present.
+    let marksText = '';
+    if (markTable) {
+      await saveMarks(tabId, markTable, meta);
+      if (markTable.length) {
+        const legend = markTable.map((m) => `${m.n} ${m.label}`).join(' · ');
+        marksText = `\n${markTable.length} marks · click one with browser_act action:"click" mark:N\n${legend}`;
+      } else {
+        marksText = '\nmarks:true found no clickable elements in view';
+      }
+    }
+    const hint = markTable?.length
+      ? ''
+      : mapping
+        ? '\n→ to click a spot in this image: browser_act action:"click" coordinate:[imageX,imageY] space:"image"'
+        : '';
 
     // Nudge toward element mode when a chart/image dominates a wide-angle shot.
     // The failure this heads off is a model reading a value off a graphic that
@@ -1846,29 +2056,27 @@ const HANDLERS = {
     }
 
     return {
-      text: `${fmt.pageHeader(meta, tabId)}\n${line}${hint}${nudge}`,
+      text: `${fmt.pageHeader(meta, tabId)}\n${line}${hint}${marksText}${nudge}`,
       images: [{ data: resized.data, mimeType: format === 'png' ? 'image/png' : 'image/jpeg' }],
     };
   },
 
   // ---------------------------------------------------------------- wait ----
   async browser_wait(args) {
-    const tabId = await resolveTab(args);
     const timeout = args.timeout ?? 15_000;
     const kind = args.for;
 
+    // A job is a batch already running somewhere; it needs no tab of its own.
+    if (kind === 'job') return collectJob(args, timeout);
+
+    const tabId = await resolveTab(args);
+    const result = await waitCondition(tabId, { for: kind, value: args.value, timeout });
+
     if (kind === 'network_idle') {
-      // Idle is measured from the recorder's buffer, so capture has to be
-      // running before we can conclude anything from it being quiet.
-      await prepareTab(tabId, { needsScripts: false });
-      const idle = await waitForNetworkIdle(tabId, timeout);
-      return idle
+      return result.ok
         ? `network idle\n${fmt.pageHeader(await pageMeta(tabId), tabId)}`
         : `still had in-flight requests after ${timeout}ms — the page may poll continuously, which is normal for some apps`;
     }
-
-    await prepareTab(tabId);
-    const result = await frames.sendToTab(tabId, 'wait', { for: kind, value: args.value, timeout });
 
     if (result.error) {
       // Surface what the page *does* say, so a wrong expectation is diagnosable
@@ -2060,41 +2268,23 @@ const HANDLERS = {
     const steps = args.steps || [];
     if (!steps.length) throw new Error('batch needs at least one step');
 
-    // Fan the same steps across several tabs, concurrently.
-    if (args.parallel?.length) {
-      const runs = await Promise.allSettled(
-        args.parallel.map((tabId) =>
-          serializeTabMutation(tabId, () =>
-            runSteps(
-              steps.map((s) => ({ ...s, args: { ...s.args, tabId } })),
-              { ...args, _mutationLockHeld: true }
-            )
-          )
-        )
+    // Hand back a job id now and run in the background. The MCP round trip is
+    // the only thing an agent cannot overlap with anything else; this makes a
+    // long flow on one tab overlap with reading another, or with thinking.
+    if (args.async) {
+      const session = sessionIdOf(args);
+      const { id } = jobs.startJob(
+        { session, tool: 'browser_batch', steps: steps.length },
+        (progress) => runBatch({ ...args, async: false }, progress)
       );
-      return runs
-        .map((run, i) => {
-          const tabId = args.parallel[i];
-          if (run.status === 'fulfilled') return `--- tab ${tabId} ---\n${run.value}`;
-          return `--- tab ${tabId} FAILED ---\n${run.reason?.message || run.reason}`;
-        })
-        .join('\n\n');
+      return (
+        `${id} started — ${steps.length} step${steps.length === 1 ? '' : 's'} running in the background. ` +
+        `Collect it with browser_wait for:"job" value:"${id}" (progress is reported if it is not done yet); ` +
+        'every other tool stays available meanwhile.'
+      );
     }
 
-    // When every mutating step names the same tab, hold its queue for the whole
-    // batch. Locking each step separately lets another agent navigate or type
-    // between "open composer" and "fill composer", which is still a race even
-    // though each individual click is serialized correctly.
-    const mutationTabs = steps
-      .filter((step) => TAB_MUTATIONS.has(step.tool))
-      .map((step) => step.args?.tabId ?? args.tabId);
-    const explicitTabs = [...new Set(mutationTabs.filter((id) => id != null))];
-    if (mutationTabs.length && explicitTabs.length === 1 && mutationTabs.every((id) => id === explicitTabs[0])) {
-      const tabId = explicitTabs[0];
-      return serializeTabMutation(tabId, () => runSteps(steps, { ...args, _mutationLockHeld: true }));
-    }
-
-    return runSteps(steps, args);
+    return runBatch(args);
   },
 
   // -------------------------------------------------------------- upload ----
@@ -2367,18 +2557,76 @@ async function scrollAction(tabId, args) {
     y = target.point.y;
   }
 
+  const startedAt = Date.now();
   await cdp.scroll(tabId, x, y, dx, dy);
-  await settle(200);
+  // Lazy-loading pages react to a scroll; most pages do not. Either way this
+  // returns as soon as the page has said which.
+  await awaitSettled(tabId, startedAt, { idle: 150, max: 500 });
   return fmt.actionResult(`scrolled ${direction} ${Math.abs(dy || dx)}px`, {
     meta: await pageMeta(tabId),
     tabId,
   });
 }
 
-/** Run a step list sequentially, returning the last result (or all of them). */
-async function runSteps(steps, { stopOnError = true, returnEach = false, ...batchArgs } = {}) {
-  const outputs = [];
+/**
+ * The body of browser_batch, shared by the synchronous call and a background
+ * job. `onStep` reports progress for `browser_wait for:"job"`.
+ */
+async function runBatch(args, onStep) {
+  const steps = args.steps || [];
 
+  // Fan the same steps across several tabs, concurrently.
+  if (args.parallel?.length) {
+    const runs = await Promise.allSettled(
+      args.parallel.map((tabId) =>
+        serializeTabMutation(tabId, () =>
+          runSteps(
+            steps.map((s) => ({ ...s, args: { ...s.args, tabId } })),
+            { ...args, _mutationLockHeld: true, onStep }
+          )
+        )
+      )
+    );
+    return runs
+      .map((run, i) => {
+        const tabId = args.parallel[i];
+        if (run.status === 'fulfilled') return `--- tab ${tabId} ---\n${run.value.text ?? run.value}`;
+        return `--- tab ${tabId} FAILED ---\n${run.reason?.message || run.reason}`;
+      })
+      .join('\n\n');
+  }
+
+  // When every mutating step names the same tab, hold its queue for the whole
+  // batch. Locking each step separately lets another agent navigate or type
+  // between "open composer" and "fill composer", which is still a race even
+  // though each individual click is serialized correctly.
+  const mutationTabs = flattenSteps(steps)
+    .filter((step) => TAB_MUTATIONS.has(step.tool))
+    .map((step) => step.args?.tabId ?? args.tabId);
+  const explicitTabs = [...new Set(mutationTabs.filter((id) => id != null))];
+  if (mutationTabs.length && explicitTabs.length === 1 && mutationTabs.every((id) => id === explicitTabs[0])) {
+    const tabId = explicitTabs[0];
+    return serializeTabMutation(tabId, () => runSteps(steps, { ...args, _mutationLockHeld: true, onStep }));
+  }
+
+  return runSteps(steps, { ...args, onStep });
+}
+
+/** Every tool step in a plan, groups flattened. */
+function flattenSteps(steps, out = []) {
+  for (const step of steps || []) {
+    if (Array.isArray(step?.steps)) flattenSteps(step.steps, out);
+    else if (step) out.push(step);
+  }
+  return out;
+}
+
+/**
+ * Run a step list: in order, with `when`/`unless`/`repeat` control flow, and
+ * only the last step paying for a page delta. The planning lives in batch.js
+ * (pure, tested); this binds it to dispatch and to the page.
+ */
+async function runSteps(steps, { stopOnError = true, returnEach = false, onStep, ...batchArgs } = {}) {
   // A batch almost always runs against one tab, so `tabId` and `group` on the
   // batch itself act as defaults for every step. Writing them once is the shape
   // people reach for first, and repeating them on each step is easy to get
@@ -2391,36 +2639,105 @@ async function runSteps(steps, { stopOnError = true, returnEach = false, ...batc
   if (batchArgs._client) defaults._client = batchArgs._client;
   if (batchArgs._mutationLockHeld) defaults._mutationLockHeld = true;
 
-  for (const [i, step] of steps.entries()) {
-    if (step.tool === 'browser_batch') {
-      throw new Error('batch cannot nest — flatten the inner steps into this one list');
-    }
-    try {
-      const result = await dispatch(step.tool, { ...defaults, ...(step.args || {}) });
-      outputs.push({ i, tool: step.tool, ok: true, text: result.text ?? '', images: result.images });
-    } catch (err) {
-      outputs.push({ i, tool: step.tool, ok: false, text: err.message });
-      if (stopOnError) {
-        const trail = outputs.map((o) => `${o.ok ? '✓' : '✗'} ${o.tool}${o.ok ? '' : `: ${o.text}`}`).join('\n');
-        throw new Error(`step ${i + 1} (${step.tool}) failed: ${err.message}\n\nsteps run:\n${trail}`);
-      }
-    }
+  return runPlan(steps, {
+    defaults,
+    stopOnError,
+    returnEach,
+    onStep,
+    run: (tool, args) => dispatch(tool, args),
+    test: (cond, args) => checkCondition(args, cond),
+  });
+}
+
+/** Answer a step condition (`when`, `unless`, `repeat.until`) right now. */
+async function checkCondition(args, cond) {
+  if (['network_idle', 'time', 'job'].includes(cond.for)) {
+    throw new Error(`"${cond.for}" cannot be a step condition — use text, no_text, selector, no_selector, url, ref_gone or load`);
   }
+  const tabId = await resolveTab(args);
+  await prepareTab(tabId);
+  const r = await frames.sendToTab(tabId, 'check', { for: cond.for, value: cond.value });
+  if (r.error) throw new Error(r.error);
+  return r.ok;
+}
 
-  const images = outputs.flatMap((o) => o.images || []);
-
-  if (returnEach) {
-    return {
-      text: outputs.map((o) => `[${o.i + 1}] ${o.tool}${o.ok ? '' : ' FAILED'}\n${o.text}`).join('\n\n'),
-      ...(images.length ? { images } : {}),
-    };
+/**
+ * Block until a condition holds. Shared by browser_wait and by `expect`, so
+ * the two speak one vocabulary.
+ */
+async function waitCondition(tabId, { for: kind, value, timeout = 15_000 }) {
+  if (kind === 'network_idle') {
+    // Idle is measured from the recorder's buffer, so capture has to be
+    // running before we can conclude anything from it being quiet.
+    await prepareTab(tabId, { needsScripts: false });
+    const idle = await waitForNetworkIdle(tabId, timeout);
+    return idle ? { ok: true } : { ok: false, error: `still had in-flight requests after ${timeout}ms` };
   }
+  await prepareTab(tabId);
+  return frames.sendToTab(tabId, 'wait', { for: kind, value, timeout });
+}
 
-  // Default: the trail plus the final result. The intermediate steps are almost
-  // never interesting once they succeeded, but knowing they ran is.
-  const trail = outputs.map((o) => `${o.ok ? '✓' : '✗'} ${o.tool}`).join(' → ');
-  const last = outputs[outputs.length - 1];
-  return { text: `${trail}\n\n${last?.text ?? ''}`, ...(images.length ? { images } : {}) };
+/**
+ * Verify an action in the same call.
+ *
+ * "Did my click work?" used to be its own round trip — act, then wait, then
+ * snapshot — and a model turn sits between each. `expect` folds the wait into
+ * the action: the tool blocks until the condition holds (default 5s, shorter
+ * than browser_wait's 15s because this is a check, not a load) and reports a
+ * verdict with the result. A failed expectation is an error, so a batch stops
+ * on it — that is what makes it a verification gate rather than a note.
+ */
+async function expectAfter(tabId, expect) {
+  if (!expect || typeof expect !== 'object' || !expect.for) {
+    throw new Error('expect needs {for, value} — the same shape as browser_wait, e.g. expect:{for:"text", value:"Order placed"}');
+  }
+  if (['job', 'time'].includes(expect.for)) {
+    throw new Error(`expect cannot use "${expect.for}" — use text, no_text, selector, no_selector, url, ref_gone, load or network_idle`);
+  }
+  const timeout = expect.timeout ?? 5000;
+  const r = await waitCondition(tabId, { ...expect, timeout }).catch((err) => ({ ok: false, error: err.message }));
+  if (r.error && r.ok === undefined) return { ok: false, error: r.error, timeout, cond: expect };
+  return { ...r, timeout, cond: expect };
+}
+
+/**
+ * Compose an action result, honouring an `expect` verdict: appended when met,
+ * thrown when not — with everything the model needs to recover, including the
+ * fact that the action itself *was* dispatched.
+ */
+function finishAction(summary, { changed, expected, meta, tabId }) {
+  if (expected && !expected.ok) {
+    throw new Error(
+      `${summary.split('\n')[0]} — the action was dispatched, but ${fmt.expectLine(expected)}.` +
+        `${changed ? `\n${changed}` : ''}\nCurrently: ${fmt.pageHeader(meta, tabId)}`
+    );
+  }
+  const text = expected ? `${summary}\n${fmt.expectLine(expected)}` : summary;
+  return fmt.actionResult(text, { changed, meta, tabId });
+}
+
+/** `browser_wait for:"job"`: list this session's jobs, or collect one. */
+async function collectJob(args, timeout) {
+  const session = sessionIdOf(args);
+  if (!args.value) {
+    const list = jobs.listJobs(session);
+    return list.length ? list.map(jobs.describeJob).join('\n') : 'no jobs for this session — start one with browser_batch async:true';
+  }
+  const job = jobs.getJob(String(args.value), session);
+  if (!job) {
+    throw new Error(
+      `no job "${args.value}" for this session — browser_wait for:"job" with no value lists them. ` +
+        'A job is forgotten ten minutes after it finishes, or when the extension restarts.'
+    );
+  }
+  const done = await jobs.waitForJob(job, timeout);
+  if (done.status === 'running') {
+    return `${jobs.describeJob(done)} — still running after ${timeout}ms; call again to keep waiting, or carry on with other work`;
+  }
+  if (done.status === 'failed') throw new Error(`${jobs.describeJob(done)}:\n${done.error}`);
+  const r = done.result;
+  const text = typeof r === 'string' ? r : r?.text ?? '';
+  return { text: `${jobs.describeJob(done)}\n\n${text}`, ...(r?.images?.length ? { images: r.images } : {}) };
 }
 
 /**
@@ -2485,6 +2802,81 @@ async function loadCaptureGeometry(tabId) {
 }
 
 /**
+ * The last `marks:true` screenshot's number→ref table, so a later
+ * `browser_act mark:N` resolves the badge the model saw back to a real element.
+ * Same store, key shape and lifetime as the capture geometry above, and stamped
+ * with the URL and viewport it was taken against for the same freshness reason:
+ * a badge number means nothing once the page it was painted on has changed.
+ */
+function marksKey(tabId) {
+  return `ob_marks_${tabId}`;
+}
+
+async function clearMarks(tabId) {
+  try {
+    await chrome.storage.session.remove(marksKey(tabId));
+  } catch {
+    /* nothing to clear, or the worker took session storage with it */
+  }
+}
+
+async function saveMarks(tabId, marks, meta) {
+  if (!marks?.length) {
+    await clearMarks(tabId);
+    return;
+  }
+  try {
+    await chrome.storage.session.set({
+      [marksKey(tabId)]: {
+        marks, // [{ n, ref, box, label }]
+        url: meta?.url || '',
+        vw: meta?.viewport?.w || 0,
+        vh: meta?.viewport?.h || 0,
+        ts: Date.now(),
+      },
+    });
+  } catch {
+    /* session storage unavailable; mark clicks will report "take a shot first" */
+  }
+}
+
+async function loadMarks(tabId) {
+  try {
+    const key = marksKey(tabId);
+    const got = await chrome.storage.session.get(key);
+    return got[key] || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve `browser_act mark:N` to the ref that badge N stood for, refusing
+ * rather than guessing when there is no fresh table to read it against — the
+ * same "an error beats a silent wrong click" stance as image-space coordinates.
+ */
+async function markToRef(tabId, n) {
+  const record = await loadMarks(tabId);
+  const meta = record ? await pageMeta(tabId).catch(() => null) : null;
+  const d = fmt.markDecision(record, meta, n);
+  if (d.ref) return d.ref;
+  if (d.clear) await clearMarks(tabId);
+  if (d.error === 'no-record') {
+    throw new Error(
+      'mark:N needs a recent browser_screenshot marks:true of this tab to resolve against — ' +
+        'take one first, or use a ref from browser_snapshot.'
+    );
+  }
+  if (d.error === 'navigated' || d.error === 'resized') {
+    throw new Error(
+      `the page ${d.error === 'navigated' ? 'navigated' : 'was resized'} since that screenshot, so its badges no ` +
+        'longer map to it — take a fresh browser_screenshot marks:true before clicking with mark.'
+    );
+  }
+  throw new Error(`no badge ${n} in the last marks screenshot (it had 1–${d.max}) — re-shoot with marks:true if the page changed.`);
+}
+
+/**
  * Invert an image-pixel coordinate to a viewport CSS-pixel click point using
  * the mapping saved by the last screenshot of this tab.
  *
@@ -2538,6 +2930,13 @@ async function imageToViewport(tabId, [imgX, imgY]) {
  * Refreshes iframe offsets first so refs inside frames resolve correctly.
  */
 async function locateTarget(tabId, args) {
+  // A badge number from the last marks screenshot is just a ref the model did
+  // not have to read: resolve it to that ref and fall through to the ref path,
+  // so the click gets clickPoint's obstruction probe and fresh box like any
+  // other, not a stale coordinate baked in when the badge was painted.
+  if (typeof args.mark === 'number') {
+    args = { ...args, ref: await markToRef(tabId, args.mark), mark: undefined };
+  }
   if (args.coordinate) {
     // Coordinates read straight off a screenshot are in *image* pixels, which
     // the two rescalings (device pixel ratio, then the maxWidth downscale) put

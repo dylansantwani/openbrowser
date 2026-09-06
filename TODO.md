@@ -45,6 +45,35 @@ suite (73), and the overlay self-checks (12) all pass. Reload the extension at
   ids, and a call with no `group` resolves to the session's last tab across all
   its groups instead of opening a blank one.
 
+## 0b. Round-trip cutters (2026-09-05) ✅ built, 417 + 125 tests, verified live
+
+**What was wrong.** Per step, a click cost ~900ms of which ~850ms was two fixed
+sleeps (`settle(350)` + a 500ms probe) — and per task, every uncertain step
+("is there a banner?", "is Next still there?", "did that work?") forced its own
+model turn, which is seconds and re-sent context. The harness's own work was
+~70ms; the loop shape was the cost. Six changes, all verified against
+Wikipedia, Hacker News, httpbin and GitHub with the tab visible:
+
+| Feature | Where | Live result |
+|---|---|---|
+| Event-driven settle | `awaitSettled` (router), `settled` (main.js), settings `settle*Ms` | dead click 900 → ~295ms; hover 120ms; link click returns on commit |
+| Quiet intermediate steps | `batch.js` stamps `_quiet`; `withDelta` skips the diff | 4-click batch costs the same as 4 clicks on HN (tiny tree); saves up to 3s/step on Gmail-sized pages |
+| `expect` on act/input | `expectAfter`, `finishAction`, `fmt.expectLine` | type+submit+verify url 501ms; click Issues on GitHub + verify 725ms; a miss throws "was dispatched, but EXPECT FAILED" |
+| Batch `when`/`unless`/`repeat`/`steps` | `batch.js` (pure), `check` handler | navigate → skip banner → click More ×2 → outline: 1.8s, one call |
+| `async:true` + `for:"job"` | `jobs.js`, `collectJob` | returns in 1ms; another tab read while it ran; collected with progress |
+| `mode:"outline"`, budget 8000, outline on truncation | `renderOutline`, `snapshotText` | Wikipedia first look 20.2K → 9.8K chars incl. outline; outline alone 1.8K |
+
+**Learned along the way.** A hidden tab (not the visible tab of the agent
+window) acks trusted input ~3s late per event and mostly drops it — a click
+took 6s, a wheel event hung 90s. Pre-existing Chrome behaviour, now written
+down in CLAUDE.md; `browser_tabs action:"select"` before acting on a tab. Also
+new: an internal `__reload` hook for developer installs, because UI-scripting
+chrome://extensions took two minutes and clicked the wrong Reload.
+
+**Not done.** Cancelling a running job (session end lets it finish or fail);
+an explicit `ref` condition for steps (use `selector`); a quiet-step benchmark
+on a Gmail-sized page.
+
 ## 1. Native dialogs freeze everything ✅ fixed, verified live
 
 **What happened.** Reported from real use: leaving a page with unsaved changes
@@ -603,6 +632,23 @@ tree cache:
 
 Repeat reads not getting cheaper is the cache's whole target. Wikipedia is a
 mild case at ~140ms; the Gmail figure that motivated it was 3.6s, twice.
+
+### 2026-09-05, hub-side (everything a model waits on except its own turn)
+
+Wikipedia "Web browser", visible tab, before → after the round-trip cutters:
+
+| Call | Before | After |
+|---|---|---|
+| `browser_snapshot` interactive (default budget) | 72ms, 20,251 chars | 110ms, 9,831 chars incl. outline |
+| `browser_snapshot mode:"outline"` | — | 73ms, 1,807 chars |
+| `browser_find` | 7ms | 7ms |
+| `browser_act hover` | 140ms | 119ms |
+| `browser_act click`, page unchanged | 900ms | 295ms |
+| `browser_act click` on a link | 400ms | 202ms (+ `expect url` met) |
+| `browser_input` type + submit | 455ms | 501ms with `expect url` verified |
+| `browser_navigate` (load) | 830ms | 710ms |
+| `browser_batch` navigate + conditional + repeat×2 + outline (HN) | 5 turns | 1.8s, 1 turn |
+| `browser_batch async:true` | — | 1ms to return |
 
 ---
 

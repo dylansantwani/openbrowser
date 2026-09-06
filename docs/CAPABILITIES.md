@@ -184,10 +184,10 @@ transition or a bug actually looks like, this beats a wall of stills.
 
 ---
 
-## 9. Nine wait conditions instead of sleeps
+## 9. Ten wait conditions instead of sleeps
 
 `browser_wait for:` accepts `text`, `no_text`, `selector`, `no_selector`,
-`ref_gone`, `url`, `network_idle`, `load`, `time`.
+`ref_gone`, `url`, `network_idle`, `load`, `time`, `job`.
 
 `ref_gone` is the underrated one: "wait until the spinner I am looking at
 disappears" is exactly the condition you want after submitting a form, and it is
@@ -213,14 +213,54 @@ Less flashy, more valuable. The tool reports rather than silently failing:
   is everywhere in commerce and search results, and a click that appears to do
   nothing because the result is one tab over is a dead end an agent cannot
   reason its way out of. Popup windows count too.
-- **A click that changed nothing says which kind of nothing.** Either *"the page
-  is still changing — snapshot again in a moment"* or *"no change detected — the
-  click may have missed"*. Those need opposite responses, and they are
-  indistinguishable from the outside. A delta that is only the focus ring moving
-  counts as nothing, because that is what a dead button produces.
-- **Input reaches a hidden tab.** Chrome silently discards mouse and key events
-  aimed at a backgrounded tab, so the tab is foregrounded first rather than the
-  click being quietly thrown away.
+- **A click that changed nothing says which kind of nothing.** *"navigated to
+  …"*, *"the page is still changing — snapshot again in a moment"*, *"the page
+  reacted but no control changed"* (a text-only update), or *"UNVERIFIED: no
+  change detected — the click may have missed"*. Those need different responses,
+  and they are indistinguishable from the outside. A delta that is only the
+  focus ring moving counts as nothing, because that is what a dead button
+  produces.
+- **Input to a hidden tab is reported, not faked.** Chrome discards or delays
+  mouse and key events aimed at a tab that is not the visible one in its
+  window. The tool never steals focus to force it; the result says `UNVERIFIED`
+  so the agent verifies instead of clicking into the void. Make the tab visible
+  inside the agent window with `browser_tabs action:"select"`, which raises no
+  window.
+
+---
+
+## 11. Fewer round trips — the thing that actually makes an agent fast
+
+A model turn sits between every tool call, and it costs seconds and re-sent
+context. The tool's own latency is tens of milliseconds; the loop shape is
+everything. Six things cut the number of turns a task takes:
+
+- **Actions wait for the page, not for a timer.** Every click, keystroke and
+  scroll returns when the page has reacted and gone quiet, or has provably not
+  reacted — 250ms for a dead click, the moment the DOM settles for a live one,
+  the instant a navigation commits for a link. Measured: a click that does
+  nothing went from ~900ms to ~300ms, and no click is ever followed by a guess
+  at how long to sleep.
+- **`expect` verifies in the same call.** `browser_act … expect:{for:"url",
+  value:"/issues"}` blocks until the condition holds and reports it; a miss is
+  an error. Act → wait → snapshot was three turns; it is one.
+- **Batch steps have control flow.** `when` / `unless` gate a step on a
+  condition; `repeat` runs it `until`/`while` one holds, or a set number of
+  times; a step can hold sub-steps. "Dismiss the banner if there is one, click
+  Next until it disappears, snapshot" is one call — 1.8s live on Hacker News.
+  Conditions are browser_wait's vocabulary, checked instantly; nothing a model
+  writes is ever evaluated as code.
+- **Only the last step of a batch pays for a delta.** Intermediate deltas were
+  discarded anyway; on a large app each cost up to three seconds.
+- **A batch can run in the background.** `async:true` returns a job id in a
+  millisecond; `browser_wait for:"job"` collects it or reports progress. Read
+  another tab, or think, while a slow flow runs.
+- **The first look at a big page is an outline.** `mode:"outline"` lists every
+  landmark with its control count and the selector that scopes to it — 1.8K
+  characters for a Wikipedia article whose interactive tree is 20K — and a
+  truncated snapshot ends with the same outline, so the next call scopes
+  instead of paging. The default budget dropped from 20,000 to 8,000 characters
+  on the strength of that.
 
 ---
 
@@ -232,5 +272,5 @@ server silently does not work, and this cannot fail that way.
 
 The other constraint is token cost. A 6,000-element page becomes ~350 characters
 of accessibility tree. That ratio is what makes long multi-step tasks affordable,
-and it is guarded by tests: the tool schemas must stay under 13.5KB, and a login
+and it is guarded by tests: the tool schemas must stay under 17.4KB, and a login
 form must render in under 250 characters.

@@ -53,9 +53,9 @@ The primary way to see a page.
 
 | Param | Type | Notes |
 |---|---|---|
-| `mode` | `interactive` \| `full` \| `text` \| `diff` | default `interactive` |
+| `mode` | `interactive` \| `full` \| `text` \| `diff` \| `outline` | default `interactive` |
 | `selector` | string | scope to one region |
-| `maxChars` | number | default 20000 |
+| `maxChars` | number | default 8000 |
 | `frames` | boolean | include iframes, default `true` |
 | `viewportOnly` | boolean | only what is currently on screen |
 
@@ -65,6 +65,32 @@ The primary way to see a page.
 - `full` — adds static text. Use when you need to read content, not just act.
 - `text` — plain readable text, no refs. For extracting prose.
 - `diff` — only what changed since the last snapshot of this tab. Use in loops.
+- `outline` — the page as a table of contents: every landmark with how many
+  controls it holds and the selector that scopes a snapshot to it, plus the
+  headings between. Ten to forty lines for a page whose full tree is hundreds.
+  The cheap first look at a big page; the next call goes straight to
+  `selector:"…"`.
+
+```
+en.wikipedia.org/wiki/HTTP · tab 481 · 1512x720
+banner (1 link) selector:"#mw-head"
+  search selector:"#p-search"
+    form (1 searchbox, 1 button) selector:"#searchform"
+navigation "Contents" (11 links, 4 buttons) selector:"#mw-panel-toc"
+main (836 links) selector:"#content"
+  h1 "HTTP"
+  navigation "Views" (3 links) selector:"#right-navigation > nav:nth-of-type(1)"
+  h2 "Versions"
+  h2 "Use"
+895 controls on the page · next: browser_snapshot selector:"<one of the selectors above>", or viewportOnly:true
+```
+
+A landmark counts its own controls, not a nested landmark's, so nothing is
+counted twice.
+
+**Truncation.** The default budget is 8,000 characters. A whole-page read that
+runs out ends with the page's outline, so the next call can scope to the right
+region instead of paging; a scoped read is already scoped and gets no outline.
 
 **Output**
 
@@ -111,13 +137,49 @@ Cheaper than a full snapshot when you already know what you are looking for.
 | `promptText` | string | for `dialog`: text to type for `prompt()` |
 | `modifiers` | `Alt` \| `Control` \| `Meta` \| `Shift` | |
 | `force` | boolean | skip the visible/enabled precheck |
+| `expect` | `{for, value, timeout?}` | verify in the same call — see below |
 
 **Actions:** `click`, `double_click`, `right_click`, `middle_click`, `hover`,
 `focus`, `blur`, `scroll_to`, `scroll`, `drag`, `select_option`, `check`,
 `uncheck`, `clear`, `submit`, `dialog`
 
 Pointer actions dispatch trusted events through the debugger. The target is
-scrolled into view and allowed to settle first.
+scrolled into view first.
+
+**Settling.** After the input lands the tool waits for the page to react, or to
+prove it will not — not for a fixed time. It returns at the first of: the DOM
+changed and has been quiet for 120ms; nothing changed within 250ms; 700ms passed
+with the page still changing (the result says so). A click that starts a
+navigation is recognised the moment the browser starts it and waits for the new
+document to commit. A click that does nothing reports in about 300ms instead of
+900. Do not follow a click with `browser_wait for:"time"`; the wait already
+happened. The three windows are settings (`settleIdleMs`, `settleQuietMs`,
+`settleMaxMs`).
+
+**Verdicts.** When the interactive tree did not change, the result says which of
+four things happened: `navigated to …`; `the page is still changing`; `the page
+reacted (N DOM changes) but no control changed` (a text-only update — read it
+with `mode:"full"`); or `UNVERIFIED: no page change was detected`.
+
+### `expect` — verify in the same call
+
+```json
+{ "action": "click", "ref": "e14", "expect": { "for": "url", "value": "/issues" } }
+```
+
+`expect` is a `browser_wait` condition (`text`, `no_text`, `selector`,
+`no_selector`, `url`, `ref_gone`, `load`, `network_idle`) with an optional
+`timeout` (default 5000ms). The tool blocks until it holds and appends the
+verdict:
+
+> `dispatched click e14 ("Issues ( 44 )")`
+> `expect url "/issues": met after 412ms`
+
+A miss is an **error** — `dispatched click e14 — the action was dispatched, but
+EXPECT FAILED: url "/issues" not met after 5000ms. Currently: …` — so a batch
+stops there. That is what makes it a verification gate rather than a note, and
+it replaces the act → wait → snapshot round trip that used to sit between every
+click that mattered and the next step.
 
 If something covers the target, you get an error naming it:
 
@@ -157,6 +219,7 @@ dismissed returns `false`, exactly as if a user had clicked Cancel.
 | `newline` | `paragraph` \| `soft` | how a newline in `text` breaks lines |
 | `submit` | boolean | press Enter when done |
 | `delay` | number | ms between keystrokes |
+| `expect` | `{for, value, timeout?}` | verify in the same call — as on `browser_act` |
 
 `fields`, `text`, `keys`, `submit` run in that order, so one call can fill a
 form and submit it.
@@ -179,6 +242,14 @@ masking, character counters, or as-you-type validation, which need real
 per-character key events.
 
 Checkbox and radio values take a boolean.
+
+Like `browser_act`, the call returns as soon as the page has reacted to the
+typing and gone quiet — typically well under the 300ms it used to sleep — and
+`expect` verifies the outcome in the same call:
+
+```json
+{ "ref": "e3", "text": "latency", "submit": true, "expect": { "for": "url", "value": "/wiki/" } }
+```
 
 ---
 
@@ -212,7 +283,13 @@ readable information at four times the cost.
 | `timeout` | number | ms, default 15000 |
 
 **Conditions:** `text`, `no_text`, `selector`, `no_selector`, `ref_gone`, `url`,
-`network_idle`, `load`, `time`
+`network_idle`, `load`, `time`, `job`
+
+`for:"job"` collects a `browser_batch async:true` job by id (`value`). If it is
+not finished within `timeout` you get its progress (`job2 running 4s — at step
+3 (browser_navigate)`) and can call again or carry on with other work. With no
+`value` it lists this session's jobs. A session only sees its own jobs; a job
+is forgotten ten minutes after it finishes, or when the extension restarts.
 
 `value` accepts `/regex/flags` as well as a substring for `text` and `url`.
 
@@ -277,13 +354,69 @@ the request, or re-trigger it.
 
 | Param | Type | Notes |
 |---|---|---|
-| `steps` | `[{tool, args}]` | **required.** Any `browser_*` tool except `browser_batch` |
+| `steps` | `[{tool, args, when?, unless?, repeat?, steps?}]` | **required.** Any `browser_*` tool except `browser_batch` |
 | `parallel` | number[] | run `steps` concurrently against each tabId |
+| `async` | boolean | return a job id at once; collect with `browser_wait for:"job"` |
 | `stopOnError` | boolean | default `true` |
 | `returnEach` | boolean | default `false` — returns only the last result |
 
 The main token-saving tool. On failure you get the trail of what ran plus the
 step that broke, so a partial failure is still diagnosable.
+
+**Only the last step pays for a page delta.** Intermediate results are discarded
+unless `returnEach`, so their deltas are not computed — on a large app that is
+up to three seconds a step. Navigation and new-tab detection stay on for every
+step.
+
+### Control flow
+
+A step may carry:
+
+| Field | Meaning |
+|---|---|
+| `when` | run the step only if this condition holds now |
+| `unless` | run the step only if it does not |
+| `repeat` | `{until: cond}` / `{while: cond}` with optional `max` (default 10, cap 50), or a plain count |
+| `steps` | a sub-list run as one unit under this step's `when`/`unless`/`repeat` (no `tool` on such a step) |
+
+Conditions are `browser_wait`'s vocabulary — `{for, value}` with `text`,
+`no_text`, `selector`, `no_selector`, `url`, `ref_gone`, `load` — evaluated
+**instantly** against the step's tab, never waited for. Put a `browser_wait`
+step before a condition that depends on a load. `until` runs at least once
+(do/while); `while` may run zero times. Nothing here is evaluated code: a model
+gets loops and branches without the extension running a string it wrote.
+
+```json
+{
+  "tabId": 481,
+  "steps": [
+    { "tool": "browser_navigate", "args": { "url": "news.ycombinator.com" } },
+    { "tool": "browser_act", "args": { "action": "click", "selector": "#cookie-accept" },
+      "when": { "for": "selector", "value": "#cookie-accept" } },
+    { "repeat": { "until": { "for": "url", "value": "p=3" }, "max": 5 },
+      "steps": [
+        { "tool": "browser_act", "args": { "action": "click", "selector": "a.morelink" } },
+        { "tool": "browser_wait", "args": { "for": "load" } }
+      ] },
+    { "tool": "browser_snapshot", "args": { "mode": "outline" } }
+  ]
+}
+```
+
+> `✓ browser_navigate → – browser_act (skipped: selector "#cookie-accept" was false) → ✓ browser_act ×2 → ✓ browser_wait ×2 → ✓ browser_snapshot`
+
+Measured live: 1.8s for the whole flow, one round trip. A `repeat` whose
+condition is still unmet at `max` is an error naming the count and the
+condition; a batch is capped at 500 tool calls and groups nest three deep.
+
+### Background jobs
+
+`async: true` returns immediately with a job id and runs the batch in the
+background. Collect it with `browser_wait for:"job" value:"job2"`, which
+reports progress if it is not done. Every other tool stays usable meanwhile —
+read another tab, or think — and a client that issues independent calls
+concurrently gets real overlap. The job holds the tab's mutation lock for its
+duration, so another agent cannot interleave clicks with it.
 
 Fan the same steps across tabs:
 
