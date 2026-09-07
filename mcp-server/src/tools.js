@@ -32,7 +32,8 @@ const COORD = {
   items: { type: 'number' },
   minItems: 2,
   maxItems: 2,
-  description: 'Viewport CSS pixels [x,y]. Prefer ref; use coords only for canvas/maps/PDF.',
+  description:
+    'Viewport CSS pixels [x,y]. Prefer a ref when one cleanly identifies the target — it survives layout shifts and needs no pixel math. Otherwise reach for coordinates: any time no ref fits (canvas/maps/PDF, a precise spot inside an element, an overlay or custom-drawn widget), they are the right tool, not a last resort.',
 };
 
 /**
@@ -548,7 +549,7 @@ Reliability:
 - After anything that triggers a load, browser_wait rather than assuming.
 - If a ref is stale, re-snapshot; refs are invalidated when the DOM changes materially.
 
-Clicking by sight: prefer a ref. When only a screenshot shows the target (canvas, maps, PDF, a game), read the pixel off the image and click it with browser_act coordinate:[imageX,imageY] space:"image" — the extension converts image pixels to the page for you, so you never do the scale math. Plain coordinate:[x,y] (no space) is viewport CSS pixels.
+Clicking by sight: prefer a ref when one fits, but a ref is not required to click. When a screenshot is what shows the target (canvas, maps, PDF, a game, or any spot the accessibility tree misses), read the pixel off the image and click it with browser_act coordinate:[imageX,imageY] space:"image" — the extension converts image pixels to the page for you, so you never do the scale math. Plain coordinate:[x,y] (no space) is viewport CSS pixels, and is a fine way to click any spot you can locate — use it whenever a ref does not cleanly identify what you need.
 
 Who you are: one agent with a short name ("harbor"), shown on your tab group, on the pages you drive, and in every result. Your tabs live in a shared background "agent window" alongside other agents' tabs; the user's own windows are separate. A call with no tabId acts on your last-used tab, and opens one for you if you have none. browser_tabs action:"list" shows your tabs in full and everyone else as counts — other agents' tabs are never yours to use, and passing one of their tabIds is refused. To work on one of the user's pages, pass its tabId explicitly (see it with browser_tabs action:"list" windowId:<id>); it then becomes one of your tabs.
 
