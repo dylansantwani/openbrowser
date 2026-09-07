@@ -274,7 +274,7 @@ export const TOOLS = [
   {
     name: 'browser_screenshot',
     description:
-      'Capture the page as an image. Costs ~20x a snapshot; use it when stuck, for canvas/video/PDF, or visual verification. To read one element (chart/canvas/svg/image), use mode:"element" with a selector. Image coordinates work with browser_act space:"image".',
+      'Capture the page as an image. Costs ~20x a snapshot; use it when stuck, for canvas/video/PDF, or visual verification. To read one element (chart/canvas/svg/image), use mode:"element" with a selector. Image coordinates work with browser_act space:"image". A viewport, region, or full_page shot draws the pointer at its last position and reports it as "pointer at [x,y]" (page CSS px), so you can confirm where your mouse is before a coordinate click.',
     inputSchema: {
       type: 'object',
       properties: {

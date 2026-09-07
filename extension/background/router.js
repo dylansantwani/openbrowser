@@ -1954,6 +1954,16 @@ const HANDLERS = {
       return captureAnimation(tabId, { ...args, format, quality, maxWidth });
     }
 
+    // Where the pointer is, so the model can confirm it — both numerically (a
+    // reported [x,y]) and visually (the arrow in the shot). The position is the
+    // last point an action drove the cursor to; null until this session has
+    // acted on the tab, since there is no meaningful pointer before then.
+    const settings = await getSettings();
+    const pointer =
+      settings.showCursor === false
+        ? null
+        : ((await chrome.storage.session.get(CURSOR_POS_KEY))[CURSOR_POS_KEY] || {})[tabId] || null;
+
     let clip;
     if (args.mode === 'element' || args.ref || args.selector) {
       const target = await locateTarget(tabId, args);
@@ -1985,6 +1995,20 @@ const HANDLERS = {
       }
     }
 
+    // Put the arrow back at its remembered point before capturing, so the
+    // pointer is reliably in the shot even after a worker teardown or a fresh
+    // navigation dropped the overlay. Silent — no ripple, no label; nothing
+    // happened, the pointer is simply where it was. Awaited (unlike the action
+    // path, where the visual must not add latency): a still capture can spend
+    // one round-trip to guarantee the arrow is painted. Skipped for element
+    // reads, where a cursor over the framed element would be noise, not signal.
+    const drawPointer = pointer && args.mode !== 'element' && !args.ref && !args.selector;
+    if (drawPointer) {
+      await frames
+        .sendToTab(tabId, 'cursor', { x: pointer.x, y: pointer.y, action: '', click: false })
+        .catch(() => {});
+    }
+
     let base64;
     try {
       base64 = await cdp.captureScreenshot(tabId, {
@@ -2012,8 +2036,24 @@ const HANDLERS = {
       clip,
       meta,
       image: { width: resized.width, height: resized.height },
+      pointer,
     };
     const line = fmt.captureGeometry(geometry);
+
+    // Tell the model where its pointer is in page CSS px — the reliable channel,
+    // since the arrow in the image can be clipped or (after a teardown) missing.
+    // Flag when a clip does not contain the point, so "I see no cursor" reads as
+    // "it is off-frame" rather than "the tool is broken".
+    const pointerInFrame =
+      pointer &&
+      (!clip ||
+        (pointer.x >= clip.x &&
+          pointer.y >= clip.y &&
+          pointer.x <= clip.x + clip.width &&
+          pointer.y <= clip.y + clip.height));
+    const pointerLine = pointer
+      ? `\npointer at [${pointer.x},${pointer.y}]${pointerInFrame ? '' : ' (outside this frame)'}`
+      : '';
 
     // Remember how this image maps to the page, and tell the model the one call
     // that clicks a point it reads off the image — the extension does the factor
@@ -2056,7 +2096,7 @@ const HANDLERS = {
     }
 
     return {
-      text: `${fmt.pageHeader(meta, tabId)}\n${line}${hint}${marksText}${nudge}`,
+      text: `${fmt.pageHeader(meta, tabId)}\n${line}${pointerLine}${hint}${marksText}${nudge}`,
       images: [{ data: resized.data, mimeType: format === 'png' ? 'image/png' : 'image/jpeg' }],
     };
   },
