@@ -14,6 +14,7 @@
     "hub": "node mcp-server/src/index.js --hub --verbose",
     "icons": "node scripts/make-icons.mjs",
     "test": "node test/run.mjs",
+    "test:unit": "node test/keys.test.mjs",
     "preview": "node scripts/serve-preview.mjs",
     "deploy": "wrangler pages deploy site --project-name=openbrowser --branch=main"
   },

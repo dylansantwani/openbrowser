@@ -257,7 +257,7 @@ export const TOOLS = [
         keys: {
           type: 'array',
           items: { type: 'string' },
-          description: 'e.g. ["Enter"], ["Control+a"], ["Tab","Tab"]. Sent after text/fields; pass `ref` to focus first.',
+          description: 'e.g. ["Enter"], ["Mod+a"], ["Tab","Tab"]. Use "Mod" (or "Accel") for the platform accelerator — Cmd on macOS, Ctrl elsewhere — so editing shortcuts (select-all, bold, copy) fire on every OS; literal "Control"/"Meta" still mean those exact keys. Punctuation may be named ("period", "comma", "slash"). Sent after text/fields; pass `ref` to focus first.',
         },
         newline: {
           type: 'string',

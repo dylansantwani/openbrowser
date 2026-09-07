@@ -273,15 +273,43 @@ const KEYS = {
   F11: { code: 'F11', vk: 122 }, F12: { code: 'F12', vk: 123 },
 };
 
+/**
+ * True when the extension runs on macOS — where the accelerator for editing
+ * shortcuts (select-all, bold, copy…) is Cmd, not Ctrl. Read once at load from
+ * the host the extension runs on, which is the machine whose shortcuts the
+ * driven page obeys.
+ */
+export const IS_MAC = /mac/i.test(
+  (globalThis.navigator &&
+    (navigator.userAgentData?.platform || navigator.platform || navigator.userAgent)) ||
+    ''
+);
+
+/**
+ * The platform accelerator, so one chord is right everywhere: `Mod+a` is Cmd+a
+ * on macOS and Ctrl+a elsewhere. Literal `Control`/`Meta` still mean exactly
+ * those keys — some shortcuts genuinely are Ctrl even on macOS (Google Slides'
+ * Ctrl+M, say) — so this is opt-in, never an automatic remap.
+ */
+const ACCEL = IS_MAC ? 'Meta' : 'Control';
+
 /** Aliases people (and models) actually type. */
 const KEY_ALIASES = {
   esc: 'Escape', return: 'Enter', del: 'Delete', ins: 'Insert',
   up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight',
   pgup: 'PageUp', pgdn: 'PageDown', ctrl: 'Control', cmd: 'Meta',
   command: 'Meta', option: 'Alt', spacebar: 'Space', ' ': 'Space',
+  // Cross-platform accelerator — Cmd on macOS, Ctrl elsewhere.
+  mod: ACCEL, accel: ACCEL, cmdorctrl: ACCEL, commandorcontrol: ACCEL,
+  // Punctuation by name, so "Mod+Shift+period" is not an "unknown key".
+  period: '.', dot: '.', comma: ',', minus: '-', dash: '-', plus: '+',
+  equal: '=', equals: '=', slash: '/', backslash: '\\', semicolon: ';',
+  colon: ':', grave: '`', backtick: '`', tilde: '~', apostrophe: "'",
+  quote: "'", underscore: '_', question: '?', bracketleft: '[',
+  bracketright: ']',
 };
 
-function normalizeKeyName(name) {
+export function normalizeKeyName(name) {
   const alias = KEY_ALIASES[name.toLowerCase()];
   if (alias) return alias;
   // Accept any casing for the named keys: "enter", "ENTER", "Enter".
@@ -290,9 +318,11 @@ function normalizeKeyName(name) {
 }
 
 /**
- * Press a key or chord: "Enter", "Control+a", "Shift+Tab", "Meta+Shift+p".
- * Modifiers are pressed, the main key is struck, then modifiers are released —
- * the same order a physical keyboard produces.
+ * Press a key or chord: "Enter", "Mod+a", "Shift+Tab", "Meta+Shift+p".
+ * "Mod"/"Accel" is the platform accelerator (Cmd on macOS, Ctrl elsewhere);
+ * literal "Control"/"Meta" mean those exact keys. Modifiers are pressed, the
+ * main key is struck, then modifiers are released — the same order a physical
+ * keyboard produces.
  */
 export async function pressKey(tabId, combo) {
   const parts = String(combo).split('+').map((p) => p.trim()).filter(Boolean);

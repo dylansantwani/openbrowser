@@ -1938,6 +1938,20 @@ const HANDLERS = {
       done += '\nUNVERIFIED: the keystrokes were dispatched, but no target value or page change could be read back. ' +
         'Pass ref when typing, or verify the expected result with browser_wait/snapshot.';
     }
+
+    // macOS foot-gun: Ctrl+letter is not the editing accelerator here — Ctrl+A
+    // is caret-to-line-start, so a model reaching for select-all/bold/copy with
+    // Control gets a silent no-op. When that is exactly what just happened
+    // (nothing changed, on macOS, a Control+letter was sent), name it and point
+    // at the fix, rather than leaving the caller to rediscover it click by click.
+    if (cdp.IS_MAC && !changed && !settled?.mutated && args.keys?.length) {
+      const ctrlAccel = args.keys.find((k) => /^(control|ctrl)\+[a-z]$/i.test(String(k).trim()));
+      if (ctrlAccel) {
+        const asMod = String(ctrlAccel).trim().replace(/^(control|ctrl)/i, 'Mod');
+        done += `\nnote: on macOS ${ctrlAccel} is not the editing accelerator (Ctrl+letter ≠ select-all/bold/copy). ` +
+          `Use ${asMod} — "Mod" is Cmd here — if you meant the shortcut.`;
+      }
+    }
     return finishAction(done, { changed, expected, meta: await pageMeta(tabId), tabId });
   },
 
@@ -2295,6 +2309,14 @@ const HANDLERS = {
           lines.push(`links ${meta.counts.links} · forms ${meta.counts.forms} · images ${meta.counts.images} · iframes ${meta.counts.iframes}`);
         }
         if (meta.hasCaptcha) lines.push('CAPTCHA present — needs a human');
+        // Where the pointer is, without paying ~20x for a screenshot — the
+        // last point an action drove the cursor to on this tab.
+        const pointer = ((await chrome.storage.session.get(CURSOR_POS_KEY))[CURSOR_POS_KEY] || {})[tabId];
+        if (pointer) lines.push(`pointer at [${pointer.x},${pointer.y}]`);
+        // The running build, so "did my reload take effect?" is one call, not
+        // an inference from whether a new output line showed up.
+        const mf = chrome.runtime.getManifest();
+        lines.push(`extension: ${mf.name} v${mf.version_name || mf.version}`);
         return lines.join('\n');
       }
 
