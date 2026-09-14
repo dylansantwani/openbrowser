@@ -1964,6 +1964,15 @@ const HANDLERS = {
     const quality = args.quality ?? 70;
     const maxWidth = args.maxWidth ?? 1280;
 
+    // Magnify: re-rasterize the framed area at N× so tiny text/icons are legible
+    // (the Claude-in-Chrome "zoom in to inspect" behaviour), clamped to a sane
+    // range. Only worthwhile above 1; below it just downscales, which maxWidth
+    // already does. When magnifying, the maxWidth downscale would immediately
+    // undo the enlargement, so lift its ceiling by the same factor (bounded, so
+    // a huge region can't blow up the payload).
+    const magnify = Math.min(Math.max(Number(args.magnify) || 1, 1), 8);
+    const effectiveMaxWidth = magnify > 1 ? Math.min(Math.round(maxWidth * magnify), 4096) : maxWidth;
+
     if (args.animate) {
       return captureAnimation(tabId, { ...args, format, quality, maxWidth });
     }
@@ -2030,6 +2039,7 @@ const HANDLERS = {
         quality,
         fullPage: args.mode === 'full_page',
         clip,
+        scale: magnify,
       });
     } finally {
       // Clear the badges before anything else reads the page, whether or not the
@@ -2037,7 +2047,7 @@ const HANDLERS = {
       if (markTable?.length) await frames.sendToTab(tabId, 'clearMarks', {}).catch(() => {});
     }
 
-    const resized = await downscale(base64, format, quality, maxWidth);
+    const resized = await downscale(base64, format, quality, effectiveMaxWidth);
     const meta = await pageMeta(tabId).catch(() => ({}));
 
     // The image has been through two independent rescalings — the device pixel
@@ -2113,6 +2123,14 @@ const HANDLERS = {
       text: `${fmt.pageHeader(meta, tabId)}\n${line}${pointerLine}${hint}${marksText}${nudge}`,
       images: [{ data: resized.data, mimeType: format === 'png' ? 'image/png' : 'image/jpeg' }],
     };
+  },
+
+  // --------------------------------------------------------------- zoom ----
+  async browser_zoom(args) {
+    // Reuse the screenshot pipeline so framing, pointer mapping, marks, and
+    // image-space clicks behave identically. The public tool is separate so a
+    // model can discover zoom without carrying it as a hidden screenshot flag.
+    return HANDLERS.browser_screenshot({ ...args, magnify: args.magnify ?? 2 });
   },
 
   // ---------------------------------------------------------------- wait ----

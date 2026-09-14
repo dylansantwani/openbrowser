@@ -30,7 +30,8 @@ const SERVER = join(ROOT, 'mcp-server', 'src', 'index.js');
 const importFrom = (...segments) => import(pathToFileURL(join(ROOT, ...segments)).href);
 
 // A port well away from the default, so a running instance cannot interfere.
-const PORT = 8899;
+// Allow an override for development machines where another local test app owns it.
+const PORT = Number(process.env.OPENBROWSER_TEST_PORT) || 8899;
 
 let passed = 0;
 let failed = 0;
@@ -172,7 +173,7 @@ async function main() {
 
   const list = await server.request('tools/list');
   const tools = list.result?.tools || [];
-  check('lists 14 tools', tools.length === 14, `got ${tools.length}`);
+  check('lists 15 tools', tools.length === 15, `got ${tools.length}`);
   check('every tool has a description', tools.every((t) => t.description?.length > 20));
   check('every tool has an object schema', tools.every((t) => t.inputSchema?.type === 'object'));
   check(
@@ -182,7 +183,7 @@ async function main() {
 
   // Token budget is a real constraint: the whole tool list ships on every
   // request, so regressions here are expensive and easy to miss. 13.5KB is
-  // about 3,400 tokens for all 14 tools. Trimming below that starts cutting the
+  // about 3,400 tokens for the original tool surface. Trimming below that starts cutting the
   // guidance that stops models from misusing the tools, which costs more in
   // retried calls than it saves in schema.
   //
@@ -309,8 +310,13 @@ async function main() {
   // ten turns to two. The 1.4KB is ~350 tokens per request. Trimmed twice
   // before raising (17452 → 17295): descriptions shortened, the shared
   // condition fragment stripped to its type.
+  //
+  // Raised to 19.2KB for the separate `browser_zoom` tool: magnification is a
+  // distinct screenshot workflow, so the model can discover it without carrying
+  // a hidden flag on every ordinary screenshot call. Its implementation still
+  // uses the same CDP re-rasterization and image↔CSS mapping as screenshots.
   const schemaBytes = JSON.stringify(tools).length;
-  check('tool schemas stay under 17.4KB', schemaBytes < 17_400, `${schemaBytes} bytes`);
+  check('tool schemas stay under 19.2KB', schemaBytes < 19_200, `${schemaBytes} bytes`);
 
   // The round-trip cutters have to stay advertised: a capability the model
   // cannot name is one it cannot use, and each of these replaces a whole turn.
@@ -373,6 +379,18 @@ async function main() {
   check(
     'browser_screenshot advertises marks',
     shotTool?.inputSchema?.properties?.marks?.type === 'boolean',
+    JSON.stringify(Object.keys(shotTool?.inputSchema?.properties || {}))
+  );
+
+  const zoomTool = tools.find((t) => t.name === 'browser_zoom');
+  check(
+    'browser_zoom advertises magnify',
+    zoomTool?.inputSchema?.properties?.magnify?.type === 'number',
+    JSON.stringify(Object.keys(zoomTool?.inputSchema?.properties || {}))
+  );
+  check(
+    'browser_screenshot keeps zoom separate',
+    !shotTool?.inputSchema?.properties?.magnify,
     JSON.stringify(Object.keys(shotTool?.inputSchema?.properties || {}))
   );
   const actTool = tools.find((t) => t.name === 'browser_act');
@@ -438,6 +456,27 @@ async function main() {
   check(
     'screenshot forwards its element selector',
     ext.seen.find((c) => c.tool === 'browser_screenshot')?.args.selector === 'canvas'
+  );
+
+  // Zoom is its own tool, but it still has to reach the extension — it is
+  // applied there as the CDP clip scale, so a dropped value silently degrades
+  // to a 1x shot the model then reads the wrong detail off.
+  await server.request('tools/call', {
+    name: 'browser_zoom',
+    arguments: { mode: 'region', region: [0, 0, 100, 100], magnify: 3 },
+  });
+  check(
+    'browser_zoom forwards its magnify factor',
+    ext.seen.filter((c) => c.tool === 'browser_zoom').some((c) => c.args.magnify === 3)
+  );
+
+  const oldScreenshotZoom = await server.request('tools/call', {
+    name: 'browser_screenshot',
+    arguments: { magnify: 3 },
+  });
+  check(
+    'browser_screenshot rejects the old zoom parameter',
+    oldScreenshotZoom.result?.isError === true && !ext.seen.some((c) => c.tool === 'browser_screenshot' && c.args.magnify === 3)
   );
 
   // The guided Google sign-in lives behind `account`/`consent`; the strict

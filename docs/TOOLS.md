@@ -259,7 +259,7 @@ typing and gone quiet — typically well under the 300ms it used to sleep — an
 |---|---|---|
 | `mode` | `viewport` \| `full_page` \| `element` \| `region` | default `viewport` |
 | `ref` | string | for `element` |
-| `region` | `[x,y,w,h]` | for `region`; also use to zoom into detail |
+| `region` | `[x,y,w,h]` | for `region` |
 | `format` | `png` \| `jpeg` | default `jpeg` |
 | `quality` | number | jpeg, 1-100, default 70 |
 | `maxWidth` | number | downscale, default 1280 |
@@ -271,6 +271,30 @@ seeing — not to navigate.
 
 Captures are downscaled before sending: a retina capture carries no extra
 readable information at four times the cost.
+
+---
+
+## browser_zoom
+
+Capture a sharp, magnified screenshot for reading fine detail. This changes the
+returned image, not the page layout; use `browser_window` with `zoom` when you
+want the page itself to reflow.
+
+| Param | Type | Notes |
+|---|---|---|
+| `mode` | `viewport` \| `full_page` \| `element` \| `region` | default `viewport` |
+| `ref` | string | for `element` |
+| `selector` | string | CSS selector for `element` mode |
+| `region` | `[x,y,w,h]` | for `region` |
+| `magnify` | number | 1-8, default 2 |
+
+```json
+{ "mode": "element", "selector": "canvas", "magnify": 3 }
+```
+
+The framed area is re-rasterized at the requested scale, so it comes back
+sharp rather than as a blurry upscale. Coordinate clicks using
+`browser_act` `space: "image"` continue to work.
 
 ---
 

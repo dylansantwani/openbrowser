@@ -24,7 +24,7 @@ dashboard. The upload zip is `openbrowser-1.0.0.zip` at the repo root.
 > - **Real browser, real session** — agents use your existing Chrome tabs, cookies, and extensions. Nothing extra to sign in to.
 > - **Read pages as a compact accessibility tree** — a login page renders in ~350 characters, so agent context is spent on decisions, not page dumps.
 > - **Trusted input events** — clicks and keystrokes go through the Chrome debugger, so payment forms, login pages, and drag-and-drop all work.
-> - **Fourteen tools** — tabs, navigate, snapshot, find, act, input, screenshot, wait, eval, inspect, batch, upload, window, macro.
+> - **Fifteen tools** — tabs, navigate, snapshot, find, act, input, screenshot, zoom, wait, eval, inspect, batch, upload, window, macro.
 > - **Parallel by default** — every tool takes a `tabId`; read twenty tabs at once.
 > - **Zero dependencies** — no `npm install`. Node 18+ and Chrome 116+ is the whole requirement.
 > - **Entirely local** — binds loopback only. No telemetry, no analytics, no outbound calls.

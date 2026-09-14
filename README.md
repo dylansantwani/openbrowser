@@ -46,7 +46,7 @@ trusted input, and a compact accessibility tree that keeps token cost low.
 - 🪶 **Built for token cost.** Pages are read as a compact accessibility tree, not
   screenshots or raw DOM. A full login page costs ~350 characters.
 - ⚡ **Parallel by default.** Every tool takes a `tabId`. Read twenty tabs at once.
-- 🧩 **Fourteen composable tools.** Grouped by `action` enums rather than split
+- 🧩 **Fifteen composable tools.** Grouped by `action` enums rather than split
   into forty single-purpose ones — models pick an enum value far more reliably.
 - 🖥️ **Side-panel UI.** Run any tool by hand and see exactly what an agent would
   get back — the fastest way to debug a flow.
@@ -193,7 +193,7 @@ One round-trip instead of eight.
 
 ## The tools
 
-Fourteen tools, grouped by `action` enums rather than split into forty
+Fifteen tools, grouped by `action` enums rather than split into forty
 single-purpose ones — models pick an enum value far more reliably.
 
 | Tool | What it does |
@@ -205,6 +205,7 @@ single-purpose ones — models pick an enum value far more reliably.
 | `browser_act` | click, hover, drag, select, check, answer native dialogs — trusted input events, with `expect` to verify in the same call |
 | `browser_input` | type text, fill many fields at once, press keys, `expect` the result |
 | `browser_screenshot` | viewport / full page / element / region, or record a GIF |
+| `browser_zoom` | sharp magnified screenshot of a page or selected area |
 | `browser_wait` | block on text, selector, URL, network idle, load, or a background job |
 | `browser_eval` | run JavaScript in the page |
 | `browser_inspect` | console, network, cookies, storage, downloads, frames |
@@ -463,7 +464,7 @@ site/           the source of openbrowser.pulse-core.com (static, no build step)
 
 | Doc | What it is for |
 |---|---|
-| [docs/CAPABILITIES.md](docs/CAPABILITIES.md) | What the fourteen tools can do in combination — parallel tabs, macros, retroactive network capture, trusted input, iframe reach |
+| [docs/CAPABILITIES.md](docs/CAPABILITIES.md) | What the fifteen tools can do in combination — parallel tabs, macros, retroactive network capture, trusted input, iframe reach |
 | [docs/TOOLS.md](docs/TOOLS.md) | Full parameter reference |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Why the pieces are split this way |
 | [docs/TESTING.md](docs/TESTING.md) | Manual checklist for the parts that need a real browser |

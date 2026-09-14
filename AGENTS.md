@@ -60,7 +60,7 @@ positional (`role "name" [ref] =value href states`); do not add keys.
 
 ## Adding a tool
 
-Prefer not to — fourteen is deliberate; prefer an `action` enum on an existing
+Prefer not to — fifteen is deliberate; prefer an `action` enum on an existing
 tool. If you must: schema in `mcp-server/src/tools.js`, handler in
 `extension/background/router.js`, use `resolveTab(args)`, wrap mutations in
 `withDelta()`, then re-run `npm test`.

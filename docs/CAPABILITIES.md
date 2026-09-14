@@ -1,6 +1,6 @@
 # What this can actually do
 
-Fourteen tools is a small surface. The interesting things come from how they
+Fifteen tools is a small surface. The interesting things come from how they
 combine, and most of them are not obvious from reading the tool list.
 
 Everything below is real behaviour in the current build, not a roadmap.

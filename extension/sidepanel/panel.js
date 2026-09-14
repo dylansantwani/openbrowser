@@ -19,6 +19,7 @@ const TOOLS = {
   browser_act: { hint: 'Click, hover, drag, select — with trusted input events.', example: { action: 'click', ref: 'e1' } },
   browser_input: { hint: 'Type text, fill many fields, or press keys.', example: { fields: [{ ref: 'e1', value: 'hello' }] } },
   browser_screenshot: { hint: 'Capture the page as an image.', example: { mode: 'viewport' } },
+  browser_zoom: { hint: 'Capture a sharp magnified screenshot.', example: { mode: 'element', magnify: 2 } },
   browser_wait: { hint: 'Block until a condition holds.', example: { for: 'text', value: 'Welcome' } },
   browser_eval: { hint: 'Run JavaScript in the page.', example: { code: 'document.title' } },
   browser_inspect: { hint: 'Console, network, cookies, storage, downloads.', example: { what: 'console' } },

@@ -4,7 +4,7 @@
  * Design rules, because these descriptions are re-sent on every single request
  * and are the largest fixed token cost of the whole integration:
  *
- *  1. Fourteen tools, not forty. Related verbs collapse into one tool with an
+ *  1. Fifteen tools, not forty. Related verbs collapse into one tool with an
  *     `action` enum. A model picks an enum value more reliably than it picks
  *     between `click_element` and `element_click`.
  *  2. Descriptions state what the tool does and the one thing that is easy to
@@ -312,6 +312,39 @@ export const TOOLS = [
             frames: { type: 'number', description: 'Default 12.' },
             intervalMs: { type: 'number', description: 'Default 400.' },
           },
+        },
+      },
+    },
+  },
+
+  {
+    name: 'browser_zoom',
+    description:
+      'Capture a sharp magnified screenshot for reading fine detail. This enlarges the returned image without changing page layout; use browser_window zoom when you want to reflow the page itself.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: TAB,
+        mode: {
+          type: 'string',
+          enum: ['viewport', 'full_page', 'element', 'region'],
+          description: 'Default "viewport". Use "element" with ref/selector or "region" with coordinates to zoom into one area.',
+        },
+        ref: REF,
+        selector: {
+          type: 'string',
+          description: 'For "element": CSS selector such as "canvas", "svg", or "img".',
+        },
+        region: {
+          type: 'array',
+          items: { type: 'number' },
+          minItems: 4,
+          maxItems: 4,
+          description: 'For "region": [x,y,width,height] in viewport pixels.',
+        },
+        magnify: {
+          type: 'number',
+          description: 'Magnification factor, 1–8. Default 2. The image is re-rasterized sharply rather than blurry-upscaled.',
         },
       },
     },

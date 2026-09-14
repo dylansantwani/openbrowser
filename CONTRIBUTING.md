@@ -60,7 +60,7 @@ needs a real browser.
 
 ## Adding a tool
 
-Prefer not to. Fourteen tools is deliberate — models pick an `action` enum on an
+Prefer not to. Fifteen tools is deliberate — models pick an `action` enum on an
 existing tool more reliably than they pick between similarly named tools, and
 every new tool taxes every request forever. If you genuinely need one, follow the
 steps in `CLAUDE.md` (schema in `mcp-server/src/tools.js`, handler in

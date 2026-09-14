@@ -488,11 +488,22 @@ export async function typeText(tabId, text, { delay = 0, newline } = {}) {
  * Screenshot. `fullPage` uses captureBeyondViewport, which grabs the whole
  * scrollable page in one shot without the seams that stitching produces.
  */
-export async function captureScreenshot(tabId, { format = 'jpeg', quality = 70, fullPage = false, clip } = {}) {
+export async function captureScreenshot(
+  tabId,
+  { format = 'jpeg', quality = 70, fullPage = false, clip, scale = 1 } = {}
+) {
   const params = { format, ...(format === 'jpeg' ? { quality } : {}) };
 
+  // `scale` is CDP's page-scale factor for the clip: at 2 the region is
+  // re-rasterized at twice the resolution, so small text and icons come back
+  // sharp rather than upscaled and blurry — this is the "magnify to read it"
+  // knob, distinct from browser_window's page zoom (which reflows the page).
+  // It multiplies the returned pixel dimensions, so the caller's image↔CSS
+  // mapping (format.captureMapping, derived from the actual image width) picks
+  // it up for free and coordinate clicks keep landing.
+
   if (clip) {
-    params.clip = { x: clip.x, y: clip.y, width: clip.width, height: clip.height, scale: 1 };
+    params.clip = { x: clip.x, y: clip.y, width: clip.width, height: clip.height, scale };
     // An element or region can extend past the fold — a chart taller than the
     // viewport, or one scrolled so its lower half is below it. Without this the
     // off-screen part of the clip comes back blank (the exact half-a-graph a
@@ -505,16 +516,31 @@ export async function captureScreenshot(tabId, { format = 'jpeg', quality = 70, 
     // Chrome allocates the capture as one GPU texture; past the max texture
     // size (commonly 16384 device px) it stalls for ~15s and then fails with a
     // bare protocol error that reads like a retryable glitch. Refuse up front
-    // with the way out instead.
+    // with the way out instead. `scale` multiplies the device pixels, so it
+    // counts against the same ceiling.
     const dpr = metrics.cssDeviceScaleFactor || 1;
-    if (Math.round(content.height * dpr) > MAX_FULL_PAGE_DEVICE_PX) {
+    if (Math.round(content.height * dpr * scale) > MAX_FULL_PAGE_DEVICE_PX) {
       throw new Error(
         `the page is ${Math.round(content.height).toLocaleString()}px tall — too tall to capture in one image; ` +
           `use mode:"region" over the part you need, or scroll and take viewport shots`
       );
     }
-    params.clip = { x: 0, y: 0, width: content.width, height: content.height, scale: 1 };
+    params.clip = { x: 0, y: 0, width: content.width, height: content.height, scale };
     params.captureBeyondViewport = true;
+  } else if (scale !== 1) {
+    // Magnifying a plain viewport shot: CDP only applies `scale` to a clip, so
+    // frame the visible viewport as one. Its origin is the current scroll
+    // offset, but the image's top-left still maps to viewport (0,0) — exactly
+    // what the viewport-mode mapping and browser_act space:"image" assume.
+    const metrics = await send(tabId, 'Page.getLayoutMetrics');
+    const vv = metrics.cssVisualViewport || {};
+    const lv = metrics.cssLayoutViewport || {};
+    const width = vv.clientWidth || lv.clientWidth;
+    const height = vv.clientHeight || lv.clientHeight;
+    if (width && height) {
+      params.clip = { x: vv.pageX || 0, y: vv.pageY || 0, width, height, scale };
+      params.captureBeyondViewport = true;
+    }
   }
 
   const { data } = await send(tabId, 'Page.captureScreenshot', params);

@@ -885,7 +885,7 @@ browser. Work through it after changing `content/` or `background/cdp.js`.
 
 ## Adding a tool
 
-Don't, if you can avoid it. Fourteen is deliberate — prefer an `action` enum on
+Don't, if you can avoid it. Fifteen is deliberate — prefer an `action` enum on
 an existing tool. Models pick enum values more reliably than they pick between
 similarly-named tools, and every new tool taxes every request forever.
 
